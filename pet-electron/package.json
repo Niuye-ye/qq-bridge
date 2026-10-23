@@ -1,0 +1,9 @@
+{
+  "name": "whale-pet",
+  "version": "0.1.0",
+  "main": "main.js",
+  "private": true,
+  "dependencies": {
+    "electron": "^45.0.0"
+  }
+}

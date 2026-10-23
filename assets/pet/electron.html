@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>小鲸鱼</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; width: 100%;
+    background: transparent; overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+    cursor: default;
+  }
+  #stage { position: absolute; inset: 0; }
+  #err {
+    position: absolute; left: 4px; top: 4px; right: 4px; color: #c00;
+    font: 11px/1.35 Consolas, monospace; white-space: pre-wrap;
+    pointer-events: none; z-index: 99;
+  }
+  /* M3 会挂载的 UI 层，先占位，M1 保持空 */
+  #ui { position: absolute; inset: 0; pointer-events: none; z-index: 50; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="ui"></div>
+<div id="err"></div>
+<script type="module">
+const errEl = document.getElementById('err');
+const DEBUGMODE = new URLSearchParams(location.search).has('debug');
+const say = (...a) => {
+  const s = a.map(x => (typeof x === 'string' ? x : safe(x))).join(' ');
+  window.pet?.log(s);
+  if (DEBUGMODE && errEl) errEl.textContent = s;
+};
+const safe = (x) => { try { return JSON.stringify(x); } catch (_) { return String(x); } };
+window.addEventListener('error', (e) => say('ERR', e.message || String(e)));
+window.addEventListener('unhandledrejection', (e) => say('REJ', (e.reason && e.reason.message) || String(e.reason)));
+
+import { createWhaleBody } from './whale/figure.js';
+import { createRig, createBody } from './kit/body.js';
+
+// ── 尺寸：由主进程给，必须是正方形（VIEW 280x280），否则 figure/body 两套坐标系对不上
+let CFG = { size: 420, k: 420 / 280, floorY: 264 * (420 / 280), key: 'private:1946431105' };
+try { CFG = { ...CFG, ...(await (window.pet?.config?.() ?? null) || {}) }; } catch (e) { say('config 失败', e.message); }
+const W = CFG.size, H = CFG.size, S = CFG.k, FLOOR = CFG.floorY;
+
+let api = null;
+let ui = { mood: '', doing: '', lastLine: '', status: null, pending: false };
+
+// ── 命中区：只覆盖角色本体，窗口其余部分（上方气泡区、四角）一律让鼠标穿过去
+const CHAR_HALF = Math.min(112 * S, W * 0.44);
+const HIT = {
+  x0: W / 2 - CHAR_HALF,
+  x1: W / 2 + CHAR_HALF,
+  y0: Math.max(0, FLOOR * 0.24),
+  y1: Math.min(H, FLOOR + 14),
+};
+const inBody = (x, y) => x >= HIT.x0 && x <= HIT.x1 && y >= HIT.y0 && y <= HIT.y1;
+
+async function boot() {
+  const stage = document.getElementById('stage');
+  const base = new URL('./whale/', location.href);
+
+  api = await createWhaleBody(base, {
+    kit: { createRig, createBody },
+    host: {
+      root: stage,
+      start: { skin: 'deepseek-maid', x: 0, facing: 1 },
+      bounds: () => ({ W, H, floorY: FLOOR, S }),
+      emit: (kind, detail) => { window.pet?.emit(kind, detail ?? null); if (kind !== 'mode') say('emit', kind, detail?.kind ?? detail?.mode ?? ''); },
+      sound: () => {},
+    },
+  });
+
+  api.layout();
+  say('ready | words=' + (api.words || []).length + ' | ' + W + 'x' + H + ' S=' + S.toFixed(3) + ' floor=' + FLOOR.toFixed(0));
+
+  let last = performance.now();
+  const loop = (t) => {
+    const dt = Math.min((t - last) / 1000, 0.05);
+    last = t;
+    try { api.step(dt); } catch (e) { say('step 崩', e.message); return; }
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
+
+  window.__petApi = api;
+  window.pet?.emit('ready', { words: (api.words || []).length });
+
+  const q = new URLSearchParams(location.search);
+  const delay = Number(q.get('delay') || 300);
+  if (q.get('do')) setTimeout(() => api.do(q.get('do')), delay);
+  if (q.get('walk')) setTimeout(() => api.walk(Number(q.get('walk')), q.get('run') === '1', 'w'), delay);
+  if (q.get('set')) setTimeout(() => { const o = {}; o[q.get('set')] = true; api.set(o); }, delay);
+}
+
+// ── 鼠标：窗口默认整块穿透(forward)，只有指针进入角色矩形才让主进程收回穿透
+let down = false;
+let lastInside = null;
+function sendHit(inside) {
+  if (inside === lastInside) return;
+  lastInside = inside;
+  window.pet?.setHit(inside);
+}
+
+window.addEventListener('mousemove', (e) => {
+  const x = e.clientX, y = e.clientY;
+  if (down) {
+    try { api.pointer('move', { x, y, t: performance.now() }); } catch (err) { say('pointer move', err.message); }
+    return;
+  }
+  sendHit(inBody(x, y));
+}, { passive: true });
+
+window.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  if (!inBody(e.clientX, e.clientY)) return;
+  e.preventDefault();
+  down = true;
+  lastInside = true;
+  window.pet?.setDragging(true);
+  try { api.pointer('down', { x: e.clientX, y: e.clientY }); } catch (err) { say('pointer down', err.message); }
+});
+
+function release(x, y) {
+  if (!down) return;
+  down = false;
+  try { api.pointer('up', { x, y }); } catch (err) { say('pointer up', err.message); }
+  window.pet?.setDragging(false);
+  lastInside = null;
+  sendHit(inBody(x, y));
+}
+window.addEventListener('mouseup', (e) => release(e.clientX, e.clientY));
+window.addEventListener('mouseleave', () => { if (down) release(HIT.x0 - 1, HIT.y0 - 1); else sendHit(false); });
+window.addEventListener('blur', () => { if (down) release(-1, -1); });
+
+document.addEventListener('contextmenu', (e) => { e.preventDefault(); window.pet?.action('menu'); });
+document.addEventListener('dragstart', (e) => e.preventDefault());
+
+// ── 主进程推过来的状态（M3 用，M1 只记着）
+window.pet?.onState?.((s) => {
+  ui = { ...ui, ...s };
+  try { api?.set(s.pet || {}); } catch (_) {}
+  if (s.mood && api) { try { api.set({ mood: s.mood }); } catch (_) {} }
+  document.dispatchEvent(new CustomEvent('pet:state', { detail: ui }));
+});
+
+boot().catch((e) => say('boot 崩', e.message || String(e)));
+</script>
+</body>
+</html>
