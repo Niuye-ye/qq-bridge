@@ -124,6 +124,14 @@ let api = null;
 let state = { mood: '', affinity: null, doing: '', lastLine: '', lastLineAt: 0, links: {}, paused: null, activityAt: 0 };
 let pendingUntil = 0;   // 发完话等回复的时间窗
 let bubbleSticky = '';  // 临时气泡（发送回执等）
+let bubbleTimer = 0;
+/** 临时占住气泡 text 毫秒，到点恢复成她最近说的话 / 正在干嘛 */
+function flashBubble(text, ms) {
+  bubbleSticky = text || '';
+  if (bubbleTimer) clearTimeout(bubbleTimer);
+  renderBubble();
+  bubbleTimer = setTimeout(() => { bubbleSticky = ''; bubbleTimer = 0; renderBubble(); }, ms || 4000);
+}
 
 // ── 命中区：只覆盖角色本体，窗口其余部分一律让鼠标穿过去
 const CHAR_HALF = Math.min(112 * S, W * 0.44);
@@ -153,9 +161,11 @@ async function boot() {
 
   api = await createWhaleBody(base, {
     kit: { createRig, createBody },
+    // figure 在 createWhaleBody 里就已经按这个 scheme 建好了，host.start.skin 是给 body 自己用的
+    scheme: (CFG.petState && CFG.petState.skin) || 'deepseek-maid',
     host: {
       root: stage,
-      start: { skin: 'deepseek-maid', x: 0, facing: 1 },
+      start: { skin: (CFG.petState && CFG.petState.skin) || 'deepseek-maid', x: 0, facing: 1 },
       bounds: () => ({ W, H, floorY: FLOOR, S }),
       emit: (kind, detail) => {
         window.pet?.emit(kind, detail ?? null);
@@ -334,9 +344,16 @@ window.pet?.onUi?.((m) => {
   if (!m) return;
   if (m.t === 'do') { try { api?.do(m.word); } catch (e) { say('do 失败', m.word); } }
   else if (m.t === 'seq') playSeq(m.words || []);
+  else if (m.t === 'scheme') {
+    try {
+      Promise.resolve(api?.setScheme(m.id))
+        .then(() => say('换样子', m.id))
+        .catch((e) => say('换样子失败', m.id, e && e.message));
+    } catch (e) { say('换样子失败', m.id); }
+  }
   else if (m.t === 'chat') openChat();
   else if (m.t === 'blur') closeChat();
-  else if (m.t === 'bubble') { bubbleSticky = m.text || ''; renderBubble(); setTimeout(() => { bubbleSticky = ''; renderBubble(); }, 4000); }
+  else if (m.t === 'bubble') flashBubble(m.text, m.ms || 4000);
 });
 
 window.pet?.onState?.(applyState);

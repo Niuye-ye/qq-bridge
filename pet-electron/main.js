@@ -46,6 +46,14 @@ const FACES = [
   ['scared', '害怕'], ['excited', '兴奋'], ['cry', '哭'], ['confused', '困惑'],
 ];
 
+// model.json 里有素材的 scheme（其余 ready:false，选了会加载失败白掉）
+const SKINS = [
+  { id: 'deepseek-maid', label: '原版蓝' },
+  { id: 'sakura-maid', label: '樱粉' },
+  { id: 'mint-maid', label: '薄荷' },
+  { id: 'night-maid', label: '夜紫' },
+];
+
 // ────────────────────────────── 日志 ──────────────────────────────
 // 只写文件，不碰 stdout：用 `start /b` 从隐藏 cmd 起来时 stdout 管道可能已被关掉，
 // console.log 会抛 EPIPE 直接把主进程炸出一个错误弹窗（踩过）。
@@ -81,14 +89,16 @@ function writePetState(patch) {
   } catch (e) { log('写 pet.json 失败', e.message); }
 }
 
-/** 位置落在某块屏幕的工作区内才用，否则丢到主屏右下角 */
+/** 位置落在某块屏幕的工作区内才用，否则丢到主屏右下角。判定按「角色本人」算，
+ *  和拖拽时的夹取同一套边界（窗口可以出屏，她不能出屏）。 */
 function restoreBounds() {
   const st = readPetState();
   const x = Number(st.left), y = Number(st.top);
   if (Number.isFinite(x) && Number.isFinite(y)) {
     const ok = screen.getAllDisplays().some((d) => {
       const w = d.workArea;
-      return x > w.x - SIZE + 80 && x < w.x + w.width - 80 && y > w.y - SIZE + 80 && y < w.y + w.height - 80;
+      return x >= w.x - HIT_RECT.x0 && x <= w.x + w.width - HIT_RECT.x1
+        && y >= w.y - HIT_RECT.y0 && y <= w.y + w.height - HIT_RECT.y1;
     });
     if (ok) return { x: Math.round(x), y: Math.round(y) };
     log('位置不在任何屏幕内，回落默认', x, y);
@@ -179,7 +189,17 @@ function startHitPolling() {
 
     // 抓着立绘拖 = 搬整个窗口，所以拖的时候窗口跟着光标跑
     if (winDrag) {
-      win.setPosition(Math.round(c.x - winDrag.dx), Math.round(c.y - winDrag.dy));
+      const rawX = Math.round(c.x - winDrag.dx);
+      const rawY = Math.round(c.y - winDrag.dy);
+      // 按「角色矩形」夹住：窗口可以出去一点，但她本人不能出屏
+      const wa = screen.getDisplayMatching({ x: rawX, y: rawY, width: SIZE, height: SIZE }).workArea;
+      const minX = wa.x - HIT_RECT.x0;
+      const maxX = wa.x + wa.width - HIT_RECT.x1;
+      const minY = wa.y - HIT_RECT.y0;
+      const maxY = wa.y + wa.height - HIT_RECT.y1;
+      const wx = Math.min(Math.max(rawX, minX), Math.max(minX, maxX));
+      const wy = Math.min(Math.max(rawY, minY), Math.max(minY, maxY));
+      win.setPosition(wx, wy);
       setIgnore(false);
       return;
     }
@@ -213,6 +233,109 @@ function startHitPolling() {
 
 function send(ch, payload) {
   try { if (win && !win.isDestroyed()) win.webContents.send(ch, payload); } catch (_) {}
+}
+
+// ────────────────────────── 主动开口 ──────────────────────────
+// 没人理她的时候，隔几分钟自己在气泡里说一句。内容优先用她真实的状态
+// （正在干嘛 / 今天日记的正文 / 长期记忆），都不合适才退回按时段和心情的台词库。
+let lastSpeakAt = 0;
+let nextSpeakGap = 0;
+const randInt = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+const pick1 = (arr) => arr[randInt(0, arr.length - 1)];
+
+const SPEAK_TIME = {
+  dawn: [['都这个点了，还不睡？', 'sleepy'], ['熬夜会变丑的，我说真的', 'worried'], ['我有点困了…', 'sleepy'], ['夜里安静得有点吓人', 'scared']],
+  morn: [['早啊，今天想干嘛', 'happy'], ['你一早上都没理我', 'sad'], ['早上好，清醒了没', 'happy'], ['外面天气怎么样', 'confused']],
+  noon: [['你吃饭了没', 'worried'], ['下午最容易犯困', 'sleepy'], ['在忙吗', 'confused'], ['脖子酸不酸，起来走两步', 'smug']],
+  eve: [['晚上好呀', 'happy'], ['今天过得怎么样', 'happy'], ['闲下来了没', 'excited'], ['晚上该放松一下了', 'wink']],
+};
+const SPEAK_MOOD = {
+  happy: [['今天心情不错', 'happy'], ['想跟你说句话', 'love'], ['嘿嘿', 'wink']],
+  tired: [['有点累…', 'sleepy'], ['不想动', 'sleepy']],
+  sad: [['有点闷', 'sad'], ['陪我说会儿话吧', 'sad']],
+  calm: [['我就安静待着', 'stand']],
+  angry: [['哼', 'angry']],
+};
+
+function todayDiaryLine() {
+  try {
+    const d = new Date();
+    const name = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}.md`;
+    const txt = fs.readFileSync(path.join(DIARY_DIR, name), 'utf8');
+    const lines = txt.split(/\r?\n/).map((s) => s.trim())
+      .filter((s) => s && !s.startsWith('#') && !s.startsWith('---') && !s.startsWith('>') && !/^\d{1,2}:\d{2}/.test(s));
+    // 挑一句完整的、长短合适的正文
+    const cand = lines.filter((s) => s.length >= 8 && s.length <= 46);
+    if (!cand.length) return '';
+    let s = cand[0];
+    if (/[，,。！？!?]$/.test(s)) s = s.replace(/[，,。！？!?]+$/, '');
+    return s;
+  } catch (_) { return ''; }
+}
+
+function randomFactText() {
+  try {
+    const j = JSON.parse(fs.readFileSync(FACTS_JSON, 'utf8'));
+    const arr = (j.facts || []).filter((f) => f && f.tier === 'long' && typeof f.text === 'string'
+      && f.text.length >= 4 && f.text.length <= 36);
+    return arr.length ? pick1(arr).text : '';
+  } catch (_) { return ''; }
+}
+
+function pickProactive() {
+  const st = bridgeState || {};
+  const real = [];
+
+  const doing = String(st.doing || '').trim();
+  if (doing && doing.length <= 22 && !/^(刷|看|发呆)[，,]/.test(doing)) {
+    real.push([`我在${doing}呢`, 'happy']);
+    real.push([`刚还在${doing}，被打断了`, 'smug']);
+  }
+  const plan = String(st.plan || '').trim();
+  if (plan && plan.length <= 22) real.push([`待会想去${plan}`, 'excited']);
+
+  const dia = todayDiaryLine();
+  if (dia) real.push([dia, 'shy'], [`今天记了句话：${dia}`, 'shy']);
+
+  const fact = randomFactText();
+  if (fact) real.push([`你还记得吗，${fact}`, 'love']);
+
+  if (real.length && Math.random() < 0.55) return toSpeak(pick1(real));
+
+  const h = new Date().getHours();
+  const bucket = (h >= 23 || h < 6) ? 'dawn' : h < 11 ? 'morn' : h < 18 ? 'noon' : 'eve';
+  const pool = [...SPEAK_TIME[bucket]];
+  for (const line of (SPEAK_MOOD[String(st.mood || '').toLowerCase()] || [])) pool.push(line);
+  for (const line of real) pool.push(line);
+  if (!pool.length) return null;
+  return toSpeak(pick1(pool));
+}
+
+function toSpeak(pair) {
+  if (!pair) return null;
+  const face = pair[1] || 'happy';
+  // stand 不是表情，交给 do() 也只会站着，无害
+  return { text: pair[0], face };
+}
+
+function startProactive() {
+  const envGap = Number(process.env.PET_SPEAK_GAP) * 1000;   // 调试用：PET_SPEAK_GAP=10 → 10 秒后先说一句
+  nextSpeakGap = Number.isFinite(envGap) && envGap > 0 ? envGap : randInt(120, 300) * 1000;
+  setInterval(() => {
+    try {
+      if (quitRequested || !win || win.isDestroyed() || !win.isVisible()) return;
+      if (winDrag || dragging) return;                    // 正在搬她，别插嘴
+      if (Date.now() - lastSpeakAt < nextSpeakGap) return;
+      const p = pickProactive();
+      if (!p) return;
+      lastSpeakAt = Date.now();
+      nextSpeakGap = randInt(150, 420) * 1000;
+      send('pet:ui', { t: 'bubble', text: p.text, ms: 18000 });
+      if (p.face) send('pet:ui', { t: 'do', word: p.face });
+      log('主动开口:', p.text);
+    } catch (e) { log('主动开口失败', e.message); }
+  }, 15000);
+  log('主动开口已启动，第一条', Math.round(nextSpeakGap / 1000), '秒内');
 }
 
 // ────────────────────────────── 窗口 ──────────────────────────────
@@ -253,6 +376,7 @@ function createWindow() {
     win.showInactive();
     log('窗口已显示（不抢焦点）');
     startHitPolling();
+    startProactive();
   });
   win.webContents.on('did-fail-load', (_e, code, desc, url) => log('did-fail-load', code, desc, url));
   win.webContents.on('render-process-gone', (_e, d) => log('渲染进程没了', safeStr(d)));
@@ -453,6 +577,19 @@ function popupMenu() {
     {
       label: '样子',
       submenu: [
+        {
+          label: '换个样子',
+          submenu: SKINS.map((s) => ({
+            label: s.label,
+            type: 'checkbox',
+            checked: (readPetState().skin || 'deepseek-maid') === s.id,
+            click: () => {
+              writePetState({ skin: s.id });
+              send('pet:ui', { t: 'scheme', id: s.id });
+              log('换样子 →', s.id);
+            },
+          })),
+        },
         { label: '做个动作', submenu: subItems(MOTIONS) },
         { label: '换个表情', submenu: subItems(FACES) },
         {
@@ -643,6 +780,23 @@ ipcMain.handle('pet:action', async (_e, name, arg) => {
     case 'move': moveToCursor(); return { ok: true };
     case 'wake': return await wakeHer(typeof arg === 'string' ? arg : 'interval');
     case 'state': return { ok: true, state: bridgeState };
+    case 'speak': {
+      const p = pickProactive();
+      if (!p) return { ok: false, error: '没有可说的' };
+      lastSpeakAt = Date.now();
+      nextSpeakGap = randInt(150, 420) * 1000;
+      send('pet:ui', { t: 'bubble', text: p.text, ms: 18000 });
+      if (p.face) send('pet:ui', { t: 'do', word: p.face });
+      log('手动开口:', p.text);
+      return { ok: true, text: p.text, face: p.face };
+    }
+    case 'scheme':
+      if (typeof arg === 'string') {
+        writePetState({ skin: arg });
+        send('pet:ui', { t: 'scheme', id: arg });
+        log('换样子 →', arg);
+      }
+      return { ok: true, skin: arg };
     case 'log': return { ok: true, path: APP_LOG };
     default: log('未知 action', name); return { ok: false, error: 'unknown action: ' + name };
   }
