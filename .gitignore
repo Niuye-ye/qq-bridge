@@ -66,3 +66,15 @@ docs/guides/VOICE.md
 # 语音库（用户个人音频素材，config.json 的 socialV2.voice.dir 指向此处）
 audio/
 
+
+# ── 运行时数据与个人内容（部署时各自生成，不进公开仓库）──────────────────────
+# 日记 / 长期回忆 / 本机人格卡：都是随使用长出来的私人内容。
+# 想让别人也能用：roles/README.md 讲格式，roles/傲娇助手.md 当示例，自己写自己的。
+/diary/
+/memory/
+/roles/小鲸鱼.md
+
+# Electron 桌宠的本地调试残留（崩溃日志、npm 安装日志）
+/pet-electron/err.txt
+/pet-electron/out.txt
+/pet-electron/install.log

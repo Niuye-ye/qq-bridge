@@ -17,6 +17,8 @@ const ACTIVITY_JSON = path.join(STATE_DIR, 'activity.json');
 const MOOD_JSON = path.join(STATE_DIR, 'mood.json');
 const TOKEN_FILE = path.join(STATE_DIR, 'console-token');
 const FACTS_JSON = path.join(STATE_DIR, 'facts.json');
+// 用户主动退出时留的标记：pet-guard 看到它就收手，不会把桌宠又拉回来
+const QUIT_MARK = path.join(STATE_DIR, 'pet-quit');
 const BRIDGE_CFG = 'D:\\qq-bridge\\config.json';
 const TRAY_PNG = path.join(PET_ROOT, 'pet-tray.png');
 const FACE_PNG = path.join(PET_ROOT, 'whale', 'tex', 'face.png');
@@ -532,6 +534,13 @@ function clock(ms) {
   return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
 }
 
+function markQuit() {
+  try { fs.writeFileSync(QUIT_MARK, String(Date.now())); } catch (_) {}
+}
+function clearQuit() {
+  try { fs.unlinkSync(QUIT_MARK); } catch (_) {}
+}
+
 let pollRound = 0;
 let pollBusy = false;
 async function pollBridge() {
@@ -567,11 +576,6 @@ async function pollBridge() {
       }
     }
   } catch (_) {}
-  try {
-    const a = await getJson('/api/socialV2/activity');
-    if (a && typeof a.paused === 'boolean') s.paused = a.paused;
-  } catch (_) {}
-
   // 端口 9 秒探一次就够
   if (pollRound++ % 3 === 0) {
     const [sluma, web, br] = await Promise.all([probePort(3000), probePort(3080), probePort(3100)]);
@@ -901,6 +905,7 @@ if (!app.requestSingleInstanceLock()) {
   app.on('second-instance', () => showPet());
 
   app.whenReady().then(() => {
+    clearQuit();
     log('=== 桌宠启动', safeStr({ SIZE, K, FLOOR_Y }));
     registerAppProtocol();
     createWindow();
@@ -935,6 +940,7 @@ if (!app.requestSingleInstanceLock()) {
 
   app.on('window-all-closed', () => { quitRequested = true; app.quit(); });
   app.on('before-quit', () => {
+    markQuit();
     quitRequested = true;
     if (win && !win.isDestroyed()) {
       const [x, y] = win.getPosition();
