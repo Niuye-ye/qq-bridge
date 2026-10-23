@@ -817,6 +817,13 @@ if (!app.requestSingleInstanceLock()) {
     if (process.env.PET_DEBUG_CURSOR) {
       setTimeout(() => { moveToCursor(); log('debug: 窗口已挪到光标处'); }, 3000);
     }
+    if (process.env.PET_TEST_SCHEME) {
+      // 调试用：验证运行时换配色这条路（菜单走的是同一个 pet:ui scheme）
+      setTimeout(() => {
+        log('测试换样子 →', process.env.PET_TEST_SCHEME);
+        send('pet:ui', { t: 'scheme', id: process.env.PET_TEST_SCHEME });
+      }, 6000);
+    }
   });
 
   app.on('window-all-closed', () => { quitRequested = true; app.quit(); });
