@@ -25,6 +25,17 @@ contextBridge.exposeInMainWorld('pet', {
     return () => ipcRenderer.removeListener('pet:ui', h);
   },
 
+  /** 光标进出窗口附近时主进程推 true/false，按钮靠它显形 */
+  onHover: (cb) => {
+    const h = (_e, near) => cb(!!near);
+    ipcRenderer.on('pet:hover', h);
+    return () => ipcRenderer.removeListener('pet:hover', h);
+  },
+
+  /** 拖着立绘走 = 搬整个窗口（屏幕上任意位置都能放） */
+  winDragStart: () => ipcRenderer.send('pet:win-drag-start'),
+  winDragEnd: () => ipcRenderer.send('pet:win-drag-end'),
+
   /** 桌面聊天框发一句话 → 桥的 desk-message */
   send: (text) => ipcRenderer.invoke('pet:send', String(text ?? '')),
 

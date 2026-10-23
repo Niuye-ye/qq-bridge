@@ -19,11 +19,16 @@
   #ui { position: absolute; inset: 0; pointer-events: none; z-index: 50; }
 
   /* 左上角竖排三颗圆钮（不压立绘：角色左边界约 x=100） */
-  #btns { position: absolute; left: 6px; top: 46px; display: flex; flex-direction: column; gap: 6px; }
+  #btns {
+    position: absolute; left: 6px; top: 46px; display: flex; flex-direction: column; gap: 6px;
+    opacity: 0; visibility: hidden; transition: opacity .16s ease;
+  }
+  #btns.on { opacity: 1; visibility: visible; }
   #btns button {
     width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255,255,255,.85);
     background: rgba(255,255,255,.62); backdrop-filter: blur(6px);
-    font-size: 16px; line-height: 1; cursor: pointer; padding: 0;
+    font-size: 13px; font-weight: 600; line-height: 1; cursor: pointer; padding: 0;
+    font-family: inherit;
     color: #1f2937; opacity: .72; transition: transform .12s, opacity .12s, background .12s;
     pointer-events: auto; box-shadow: 0 1px 4px rgba(0,0,0,.18);
   }
@@ -84,9 +89,9 @@
 <div id="ui">
   <div id="dots" title="链路"><i data-k="sluma"></i><i data-k="web"></i><i data-k="bridge"></i></div>
   <div id="btns">
-    <button data-a="chat" title="打字">⌨</button>
-    <button data-a="pat" title="摸头">✋</button>
-    <button data-a="play" title="去玩会儿">📱</button>
+    <button data-a="chat" title="打字">打</button>
+    <button data-a="pat" title="摸头">摸</button>
+    <button data-a="play" title="去玩会儿">玩</button>
   </div>
   <div id="bubble"></div>
   <div id="chat">
@@ -133,8 +138,10 @@ const inBody = (x, y) => x >= HIT.x0 && x <= HIT.x1 && y >= HIT.y0 && y <= HIT.y
 // ── UI 命中矩形：上报给主进程，让它把这几块从穿透里挖出来
 const BTN_RECT = { x0: 2, y0: 42, x1: 46, y1: 168 };
 const CHAT_RECT = { x0: 36, y0: 4, x1: 384, y1: 112 };
+let hoverNear = false;
 function pushUiRects() {
-  const rects = [BTN_RECT];
+  const rects = [];
+  if (hoverNear) rects.push(BTN_RECT);
   if (chat.classList.contains('on')) rects.push(CHAT_RECT);
   window.pet?.setUiRects(rects);
 }
@@ -211,7 +218,10 @@ function renderDots() {
 }
 
 function applyState(s) {
+  const prevAt = state.lastLineAt || 0;
   state = { ...state, ...s };
+  // 她回了新的 → 立刻撤掉「她想一下…」，别让占位干等 60 秒
+  if (s.lastLineAt && s.lastLineAt > prevAt) pendingUntil = 0;
   renderBubble();
   renderDots();
   // 心情 → 表情（她心情好就笑）
@@ -321,33 +331,45 @@ window.pet?.onUi?.((m) => {
 
 window.pet?.onState?.(applyState);
 
-// ── 鼠标：穿透完全由主进程轮询决定（main.js startHitPolling，已并入 uiRects），
-//    渲染进程只把拖拽手势喂给 body。两边都调 setIgnore 会互相打架，实测抖成一片。
-let down = false;
+// 光标靠近窗口才让三颗纽扣浮出来（判定在主进程，渲染进程收不到穿透时的 mousemove）
+const btnsEl = document.getElementById('btns');
+window.pet?.onHover?.((near) => {
+  hoverNear = near;
+  btnsEl.classList.toggle('on', near);
+  pushUiRects();
+});
 
-window.addEventListener('mousemove', (e) => {
-  if (!down) return;
-  try { api.pointer('move', { x: e.clientX, y: e.clientY, t: performance.now() }); } catch (err) { say('pointer move', err.message); }
-}, { passive: true });
+// ── 鼠标：穿透完全由主进程轮询决定（main.js startHitPolling，已并入 uiRects）。
+//    抓着立绘走 = 搬整个窗口，屏幕上爱放哪放哪。
+let down = false, moved = false, dragging = false, downX = 0, downY = 0;
 
 window.addEventListener('mousedown', (e) => {
   if (e.button !== 0) return;
   if (!inBody(e.clientX, e.clientY)) return;
   e.preventDefault();
-  down = true;
-  window.pet?.setDragging(true);
-  try { api.pointer('down', { x: e.clientX, y: e.clientY }); } catch (err) { say('pointer down', err.message); }
+  down = true; moved = false; dragging = false;
+  downX = e.clientX; downY = e.clientY;
 });
 
-function release(x, y) {
+// 只有真移动了才搬窗口；原地按一下算「戳她」
+window.addEventListener('mousemove', (e) => {
+  if (!down || dragging) return;
+  if (Math.abs(e.clientX - downX) + Math.abs(e.clientY - downY) < 5) return;
+  dragging = true; moved = true;
+  window.pet?.winDragStart();
+}, { passive: true });
+
+function finishDrag() {
   if (!down) return;
   down = false;
-  try { api.pointer('up', { x, y }); } catch (err) { say('pointer up', err.message); }
-  window.pet?.setDragging(false);
+  if (dragging) { dragging = false; window.pet?.winDragEnd(); }
+  else if (!moved) {
+    try { api.do(['happy', 'wink', 'love', 'shy'][Math.floor(Math.random() * 4)]); } catch (_) {}
+  }
+  moved = false;
 }
-window.addEventListener('mouseup', (e) => release(e.clientX, e.clientY));
-window.addEventListener('mouseleave', () => { if (down) release(HIT.x0 - 1, HIT.y0 - 1); });
-window.addEventListener('blur', () => { if (down) release(-1, -1); });
+window.addEventListener('mouseup', () => finishDrag());
+window.addEventListener('blur', () => finishDrag());
 
 window.addEventListener('dblclick', (e) => {
   if (inBody(e.clientX, e.clientY)) { e.preventDefault(); openChat(); }

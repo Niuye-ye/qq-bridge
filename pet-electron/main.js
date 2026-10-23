@@ -165,23 +165,51 @@ function setIgnore(on) {
 
 let pollTimer = null;
 let dbgTicks = 0;
+let hoverIn = null;   // 光标是否在窗口附近（决定三颗按钮显不显形）
+let winDrag = null;   // 拖整窗时的抓取偏移 {dx,dy}
+
+const HOVER_PAD = 26; // 「附近」= 窗口边缘再往外扩这么多像素
+
 function startHitPolling() {
   if (pollTimer) return;
   pollTimer = setInterval(() => {
     if (!win || win.isDestroyed()) return;
-    if (process.env.PET_DEBUG_CURSOR && dbgTicks < 900 && dbgTicks++ % 60 === 1) {
-      const c0 = screen.getCursorScreenPoint();
-      const b0 = win.getBounds();
-      log('dbg cur=', c0.x, c0.y, 'bounds=', b0.x, b0.y, b0.width, b0.height,
-        'vis=', win.isVisible(), 'inside=', hitTest(c0.x - b0.x, c0.y - b0.y), 'ignoring=', ignoring);
-    }
-    if (dragging) { setIgnore(false); return; }      // 拖拽/甩出期间整窗可点
-    if (!win.isVisible()) { setIgnore(true); return; }
     const c = screen.getCursorScreenPoint();
     const b = win.getBounds();
-    setIgnore(!hitTest(c.x - b.x, c.y - b.y));
+
+    // 抓着立绘拖 = 搬整个窗口，所以拖的时候窗口跟着光标跑
+    if (winDrag) {
+      win.setPosition(Math.round(c.x - winDrag.dx), Math.round(c.y - winDrag.dy));
+      setIgnore(false);
+      return;
+    }
+
+    if (process.env.PET_DEBUG_CURSOR && dbgTicks < 900 && dbgTicks++ % 60 === 1) {
+      log('dbg cur=', c.x, c.y, 'bounds=', b.x, b.y, b.width, b.height,
+        'vis=', win.isVisible(), 'inside=', hitTest(c.x - b.x, c.y - b.y), 'ignoring=', ignoring);
+    }
+    if (!win.isVisible()) {
+      if (hoverIn !== false) { hoverIn = false; send('pet:hover', false); }
+      setIgnore(true);
+      return;
+    }
+
+    const lx = c.x - b.x, ly = c.y - b.y;
+    const near = lx > -HOVER_PAD && ly > -HOVER_PAD && lx < b.width + HOVER_PAD && ly < b.height + HOVER_PAD;
+    if (near !== hoverIn) {
+      hoverIn = near;
+      send('pet:hover', near);
+      log('悬停 →', near);
+    }
+
+    if (dragging) { setIgnore(false); return; }      // body 内部拖拽/甩出期间整窗可点
+    setIgnore(!hitTest(lx, ly));
   }, 30);
   log('穿透轮询已启动 hitRect=', safeStr(HIT_RECT));
+}
+
+function send(ch, payload) {
+  try { if (win && !win.isDestroyed()) win.webContents.send(ch, payload); } catch (_) {}
 }
 
 // ────────────────────────────── 窗口 ──────────────────────────────
@@ -385,8 +413,8 @@ function startBridgePolling() {
   if (bridgeTimer) return;
   readToken();
   pollBridge().catch((e) => log('首次轮询失败', e.message));
-  bridgeTimer = setInterval(() => { pollBridge().catch((e) => log('轮询失败', e.message)); }, 3000);
-  log('桥轮询已启动（3s）');
+  bridgeTimer = setInterval(() => { pollBridge().catch((e) => log('轮询失败', e.message)); }, 2000);
+  log('桥轮询已启动（2s）');
 }
 
 // ────────────────────────────── 右键菜单（五组）──────────────────────────────
@@ -441,6 +469,16 @@ function popupMenu() {
     {
       label: '系统',
       submenu: [
+        {
+          label: '总在最前（打游戏时可关）',
+          type: 'checkbox',
+          checked: true,
+          click: (mi) => {
+            if (!win || win.isDestroyed()) return;
+            win.setAlwaysOnTop(!!mi.checked);
+            log('置顶 =', !!mi.checked);
+          },
+        },
         { label: '挪到鼠标这边', click: moveToCursor },
         { label: '退出', click: () => { quitRequested = true; app.quit(); } },
       ],
@@ -520,6 +558,25 @@ ipcMain.on('pet:hit', (_e, inside) => {
 ipcMain.on('pet:drag', (_e, on) => {
   dragging = !!on;
   if (dragging) setIgnore(false); // 松手后由命中判定决定，不在这里强行穿透
+});
+
+// 拖整窗：渲染进程按下立绘 → 这里记下「光标相对窗口左上角」的偏移，轮询里每 30ms 跟一次
+ipcMain.on('pet:win-drag-start', () => {
+  if (!win || win.isDestroyed()) return;
+  const c = screen.getCursorScreenPoint();
+  const b = win.getBounds();
+  winDrag = { dx: c.x - b.x, dy: c.y - b.y };
+  setIgnore(false);
+  log('拖窗开始 offset=', safeStr(winDrag));
+});
+
+ipcMain.on('pet:win-drag-end', () => {
+  if (!win || win.isDestroyed() || !winDrag) { winDrag = null; return; }
+  winDrag = null;
+  const b = win.getBounds();
+  writePetState({ left: b.x, top: b.y });
+  hoverIn = null; // 强制下一轮重推 hover
+  log('拖窗结束', b.x, b.y);
 });
 
 ipcMain.on('pet:ui-rects', (_e, rects) => {
