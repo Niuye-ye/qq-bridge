@@ -1,26 +1,50 @@
 // 小鲸鱼桌宠 · Electron 主进程
-// M1：透明正方形窗口 + app:// 协议 + 位置记忆 + 穿透骨架 + 托盘
-// 轮询/菜单五组/聊天在 M2-M3 补，接口已经占好位。
+// 窗口/协议/穿透见 M1；桥状态轮询、聊天、右键菜单见 M3。
 const {
-  app, BrowserWindow, ipcMain, protocol, Menu, Tray, nativeImage, screen,
+  app, BrowserWindow, ipcMain, protocol, Menu, Tray, nativeImage, screen, shell, dialog,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const net = require('net');
+const { spawn } = require('child_process');
 
 // ────────────────────────────── 常量 ──────────────────────────────
 const PET_ROOT = 'D:\\qq-bridge\\assets\\pet';
 const STATE_DIR = 'D:\\qq-bridge\\state';
+const DIARY_DIR = 'D:\\qq-bridge\\diary';
 const PET_JSON = path.join(STATE_DIR, 'pet.json');
+const ACTIVITY_JSON = path.join(STATE_DIR, 'activity.json');
+const MOOD_JSON = path.join(STATE_DIR, 'mood.json');
+const TOKEN_FILE = path.join(STATE_DIR, 'console-token');
+const FACTS_JSON = path.join(STATE_DIR, 'facts.json');
+const BRIDGE_CFG = 'D:\\qq-bridge\\config.json';
 const TRAY_PNG = path.join(PET_ROOT, 'pet-tray.png');
 const FACE_PNG = path.join(PET_ROOT, 'whale', 'tex', 'face.png');
 const APP_LOG = 'F:\\项目\\手机上使用dsh\\logs\\pet-app.log';
+const ONECLICK = 'F:\\项目\\手机上使用dsh\\一键启动.ps1';
 
 // VIEW = [-12, -8, 268, 272] → 280 x 280。窗口必须是正方形，理由见 桌宠改造-最终方案.md §2
 const SIZE = 420;
 const K = SIZE / 280;
 const FLOOR_Y = 264 * K; // 地面在 rig y=256，VIEW 顶是 -8
 const KEY = 'private:1946431105';
+const BRIDGE = 'http://127.0.0.1:3100';
 const CONFIG = { size: SIZE, k: K, floorY: FLOOR_Y, key: KEY };
+
+// body.js 的 KIT_MOTIONS / KIT_EXPRESSIONS，原样喂给 api.do()
+const MOTIONS = [
+  ['stand', '站着'], ['jump', '跳一下'], ['hop', '蹦'], ['look', '看看'],
+  ['turn', '转身'], ['nod', '点头'], ['shake', '摇头'], ['spin', '转圈'],
+  ['sit', '坐下'], ['sleep', '睡觉'], ['dizzy', '晕'], ['walk', '走两步'],
+  ['run', '跑'], ['wave', '招手'], ['bow', '鞠躬'], ['shiver', '抖'],
+  ['flap', '扑腾'], ['dance', '跳舞'],
+];
+const FACES = [
+  ['happy', '开心'], ['wink', '眨眼'], ['love', '喜欢'], ['surprised', '惊讶'],
+  ['angry', '生气'], ['sad', '难过'], ['shy', '害羞'], ['sleepy', '困'],
+  ['smug', '得意'], ['worried', '担心'], ['determined', '坚定'], ['flustered', '慌'],
+  ['scared', '害怕'], ['excited', '兴奋'], ['cry', '哭'], ['confused', '困惑'],
+];
 
 // ────────────────────────────── 日志 ──────────────────────────────
 // 只写文件，不碰 stdout：用 `start /b` 从隐藏 cmd 起来时 stdout 管道可能已被关掉，
@@ -42,6 +66,9 @@ let win = null, tray = null;
 let ignoring = true; // 当前是否穿透
 let dragging = false;
 let quitRequested = false;
+let uiRects = [];    // 渲染进程上报的、需要吃鼠标的 UI 矩形
+let consoleToken = '';
+let bridgeState = null;
 
 function readPetState() {
   try { return JSON.parse(fs.readFileSync(PET_JSON, 'utf8')); } catch (_) { return {}; }
@@ -125,7 +152,8 @@ const HIT_RECT = {
   y0: Math.max(0, FLOOR_Y * 0.24),
   y1: Math.min(SIZE, FLOOR_Y + 14),
 };
-const hitTest = (wx, wy) => wx >= HIT_RECT.x0 && wx <= HIT_RECT.x1 && wy >= HIT_RECT.y0 && wy <= HIT_RECT.y1;
+const inRect = (r, x, y) => x >= r.x0 && x <= r.x1 && y >= r.y0 && y <= r.y1;
+const hitTest = (wx, wy) => inRect(HIT_RECT, wx, wy) || uiRects.some((r) => inRect(r, wx, wy));
 
 function setIgnore(on) {
   if (!win || win.isDestroyed()) return;
@@ -153,7 +181,7 @@ function startHitPolling() {
     const b = win.getBounds();
     setIgnore(!hitTest(c.x - b.x, c.y - b.y));
   }, 30);
-  log('穿透轮询已启动 hitRect=', JSON.stringify(HIT_RECT));
+  log('穿透轮询已启动 hitRect=', safeStr(HIT_RECT));
 }
 
 // ────────────────────────────── 窗口 ──────────────────────────────
@@ -196,10 +224,10 @@ function createWindow() {
     startHitPolling();
   });
   win.webContents.on('did-fail-load', (_e, code, desc, url) => log('did-fail-load', code, desc, url));
-  win.webContents.on('render-process-gone', (_e, d) => log('渲染进程没了', JSON.stringify(d)));
+  win.webContents.on('render-process-gone', (_e, d) => log('渲染进程没了', safeStr(d)));
   win.webContents.on('console-message', (e) => {
-    const msg = e?.message ?? arguments[2] ?? '';
-    if (msg) log('[page]', String(msg).slice(0, 400));
+    const msg = e?.message ?? '';
+    if (msg && !/Security Warning/.test(msg)) log('[page]', String(msg).slice(0, 400));
   });
 
   win.on('move', () => {
@@ -223,29 +251,263 @@ function buildTray() {
   tray = new Tray(trayImage());
   tray.setToolTip('小鲸鱼');
   const menu = Menu.buildFromTemplate([
-    { label: '显示小鲸鱼', click: () => { win?.show(); win?.setAlwaysOnTop(true, 'floating'); } },
+    { label: '显示小鲸鱼', click: () => showPet() },
+    { label: '跟她说句话', click: () => openChat() },
     { type: 'separator' },
-    { label: '藏起来（10 秒）', click: () => { win?.hide(); setTimeout(() => { if (!quitRequested) win?.showInactive(); }, 10000); } },
+    { label: '藏起来（10 秒）', click: () => hideForAWhile() },
     { label: '挪到鼠标这边', click: moveToCursor },
-    { label: '重载立绘', click: () => { win?.webContents.reload(); } },
+    { label: '重载立绘', click: () => win?.webContents.reload() },
     { type: 'separator' },
-    { label: '打开日志', click: () => { try { require('electron').shell.openPath(APP_LOG); } catch (_) {} } },
+    { label: '打开日志', click: () => openPath(APP_LOG) },
     { label: '退出', click: () => { quitRequested = true; app.quit(); } },
   ]);
   tray.setContextMenu(menu);
-  tray.on('double-click', () => { win?.show(); win?.setAlwaysOnTop(true, 'floating'); });
+  tray.on('double-click', () => showPet());
 }
 
+function showPet() {
+  if (!win) return;
+  win.show();
+  win.setAlwaysOnTop(true, 'floating');
+}
 function moveToCursor() {
   if (!win) return;
   const c = screen.getCursorScreenPoint();
   win.setPosition(Math.round(c.x - SIZE / 2), Math.round(c.y - SIZE / 2));
 }
+let hideTimer = null;
+function hideForAWhile(ms = 10000) {
+  if (!win) return;
+  win.hide();
+  clearTimeout(hideTimer);
+  hideTimer = setTimeout(() => { if (!quitRequested) showPet(); }, ms);
+}
+function openChat() { showPet(); win?.webContents.send('pet:ui', { t: 'chat' }); }
+function openPath(p) { try { shell.openPath(p); } catch (e) { log('openPath 失败', p, e.message); } }
+function todayDiary() {
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, '0');
+  return path.join(DIARY_DIR, `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}.md`);
+}
+
+// ────────────────────────────── 桥 ──────────────────────────────
+function readToken() {
+  try { consoleToken = fs.readFileSync(TOKEN_FILE, 'utf8').trim(); } catch (_) {}
+  if (!consoleToken) {
+    try { consoleToken = String(JSON.parse(fs.readFileSync(BRIDGE_CFG, 'utf8')).consoleToken || '').trim(); } catch (_) {}
+  }
+  log('token', consoleToken ? '已读到(' + consoleToken.slice(0, 6) + '…)' : '没读到');
+}
+
+async function getJson(p, opt) {
+  const r = await fetch(BRIDGE + p, {
+    ...(opt || {}),
+    signal: AbortSignal.timeout(3500),
+    headers: { 'x-console-token': consoleToken, ...((opt && opt.headers) || {}) },
+  });
+  return r.json();
+}
+async function postJson(p, body) {
+  return getJson(p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+}
+
+function probePort(port, timeout = 400) {
+  return new Promise((resolve) => {
+    const s = net.connect({ host: '127.0.0.1', port });
+    let done = false;
+    const fin = (v) => { if (done) return; done = true; try { s.destroy(); } catch (_) {} resolve(v); };
+    s.setTimeout(timeout, () => fin(false));
+    s.on('connect', () => fin(true));
+    s.on('error', () => fin(false));
+  });
+}
+
+const p2 = (n) => String(n).padStart(2, '0');
+function clock(ms) {
+  if (!ms) return '';
+  const d = new Date(ms);
+  return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
+}
+
+let pollRound = 0;
+async function pollBridge() {
+  const s = {
+    at: Date.now(), paused: null, mood: '', affinity: null,
+    doing: '', note: '', plan: '', activityAt: 0,
+    lastLine: '', lastLineAt: 0,
+    links: (bridgeState && bridgeState.links) || { sluma: null, web: null, bridge: null },
+  };
+
+  try {
+    const a = JSON.parse(fs.readFileSync(ACTIVITY_JSON, 'utf8'));
+    s.doing = String(a.doing || '');
+    s.note = String(a.note || '');
+    s.plan = String(a.plan || '');
+    s.activityAt = Date.parse(a.updatedAt || a.since || '') || 0;
+  } catch (_) {}
+  try {
+    const m = JSON.parse(fs.readFileSync(MOOD_JSON, 'utf8'));
+    s.mood = String(m.mood || '');
+    s.affinity = typeof m.affinity === 'number' ? m.affinity : null;
+  } catch (_) {}
+
+  try {
+    const r = await getJson(`/api/socialV2/my-recent?key=${encodeURIComponent(KEY)}&limit=3`);
+    if (r && r.ok) {
+      if (typeof r.paused === 'boolean') s.paused = r.paused;
+      const ms = Array.isArray(r.messages) ? r.messages : [];
+      const last = ms[ms.length - 1];
+      if (last) {
+        s.lastLine = String(last.plain || last.text || '').replace(/\s+/g, ' ').trim().slice(0, 220);
+        s.lastLineAt = Number(last.time) || 0;
+      }
+    }
+  } catch (_) {}
+  try {
+    const a = await getJson('/api/socialV2/activity');
+    if (a && typeof a.paused === 'boolean') s.paused = a.paused;
+  } catch (_) {}
+
+  // 端口 9 秒探一次就够
+  if (pollRound++ % 3 === 0) {
+    const [sluma, web, br] = await Promise.all([probePort(3000), probePort(3080), probePort(3100)]);
+    s.links = { sluma, web, bridge: br };
+  }
+
+  const prev = bridgeState;
+  bridgeState = s;
+  const changed = !prev || safeStr(prev) !== safeStr(s);
+  if (changed && win && !win.isDestroyed()) win.webContents.send('pet:state', s);
+}
+
+let bridgeTimer = null;
+function startBridgePolling() {
+  if (bridgeTimer) return;
+  readToken();
+  pollBridge().catch((e) => log('首次轮询失败', e.message));
+  bridgeTimer = setInterval(() => { pollBridge().catch((e) => log('轮询失败', e.message)); }, 3000);
+  log('桥轮询已启动（3s）');
+}
+
+// ────────────────────────────── 右键菜单（五组）──────────────────────────────
+function subItems(list) {
+  return list.map(([word, name]) => ({ label: name, click: () => win?.webContents.send('pet:ui', { t: 'do', word }) }));
+}
+
+function popupMenu() {
+  if (!win) return;
+  const st = bridgeState || {};
+  const tpl = [
+    { label: '跟她说句话…', click: () => openChat() },
+    { type: 'separator' },
+    {
+      label: '她',
+      submenu: [
+        { label: '她在干嘛', click: showActivity },
+        { label: '今天的日记', click: () => openPath(todayDiary()) },
+        { label: '长期记忆', click: () => openPath(FACTS_JSON) },
+        { type: 'separator' },
+        { label: '让她去玩会儿手机', click: () => wakeHer('interval') },
+        { label: st.paused ? '恢复她的自主时间' : '暂停她的自主时间', click: () => togglePause() },
+      ],
+    },
+    {
+      label: '样子',
+      submenu: [
+        { label: '做个动作', submenu: subItems(MOTIONS) },
+        { label: '换个表情', submenu: subItems(FACES) },
+        {
+          label: '连播',
+          submenu: [
+            { label: '动作 × 8', click: () => win?.webContents.send('pet:ui', { t: 'seq', words: ['nod', 'wave', 'jump', 'spin', 'bow', 'dance', 'sit', 'happy'] }) },
+            { label: '表情 × 6', click: () => win?.webContents.send('pet:ui', { t: 'seq', words: ['happy', 'wink', 'love', 'shy', 'surprised', 'smug'] }) },
+          ],
+        },
+        { type: 'separator' },
+        { label: '重新加载立绘', click: () => win?.webContents.reload() },
+        { label: '藏起来（10 秒）', click: () => hideForAWhile() },
+      ],
+    },
+    {
+      label: 'QQ 链路',
+      submenu: [
+        { label: '看链路状态', click: showLinkStatus },
+        { label: '一键修复 · 启动', click: runOneClick },
+        { label: '打开桥控制台', click: () => openPath(`${BRIDGE}/?token=${encodeURIComponent(consoleToken)}`) },
+        { type: 'separator' },
+        { label: '打开桌宠日志', click: () => openPath(APP_LOG) },
+      ],
+    },
+    {
+      label: '系统',
+      submenu: [
+        { label: '挪到鼠标这边', click: moveToCursor },
+        { label: '退出', click: () => { quitRequested = true; app.quit(); } },
+      ],
+    },
+  ];
+  Menu.buildFromTemplate(tpl).popup({ window: win });
+}
+
+function showActivity() {
+  const st = bridgeState || {};
+  const lines = [
+    `在干嘛：${st.doing || '（没记）'}`,
+    `心里想：${st.note || '—'}`,
+    `接下来：${st.plan || '—'}`,
+    '',
+    `更新时间：${clock(st.activityAt) || '—'}`,
+    `心情：${st.mood || '—'}　亲密：${st.affinity ?? '—'}`,
+    `她最后说：${st.lastLine || '—'}`,
+  ];
+  dialog.showMessageBox({ type: 'info', title: '她', message: '她现在这样', detail: lines.join('\n'), buttons: ['知道了'] });
+}
+
+function showLinkStatus() {
+  const l = (bridgeState && bridgeState.links) || {};
+  const mark = (v) => (v === true ? '✅' : v === false ? '❌' : '…');
+  const lines = [
+    `SnowLuma 3000　${mark(l.sluma)}`,
+    `dsh web 3080　　${mark(l.web)}`,
+    `qq-bridge 3100　${mark(l.bridge)}`,
+    '',
+    `她说了 ${(bridgeState && bridgeState.lastLine) ? '话' : '…'}`,
+  ];
+  dialog.showMessageBox({ type: 'info', title: 'QQ 链路', message: '现在的链路', detail: lines.join('\n'), buttons: ['知道了'] });
+}
+
+async function wakeHer(reason) {
+  try {
+    const r = await postJson('/api/socialV2/wake', { key: KEY, reason });
+    log('唤醒', reason, safeStr(r));
+    if (r && r.ok) win?.webContents.send('pet:ui', { t: 'bubble', text: '（她自己去忙了…）' });
+    return r;
+  } catch (e) { log('唤醒失败', e.message); return { ok: false, error: e.message }; }
+}
+
+async function togglePause() {
+  const next = !(bridgeState && bridgeState.paused);
+  try {
+    await postJson('/api/socialV2/activity', { paused: next });
+    log('暂停切换 →', next);
+    pollBridge().catch(() => {});
+  } catch (e) { log('暂停切换失败', e.message); }
+}
+
+function runOneClick() {
+  try {
+    const child = spawn('powershell.exe', [
+      '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ONECLICK, '-Quiet',
+    ], { detached: true, stdio: 'ignore', windowsHide: true });
+    child.unref();
+    log('已拉起一键启动.ps1 -Quiet');
+  } catch (e) { log('一键启动失败', e.message); }
+}
 
 // ────────────────────────────── IPC ──────────────────────────────
 ipcMain.on('pet:log', (_e, msg) => log('[hud]', String(msg).slice(0, 400)));
 ipcMain.on('pet:event', (_e, kind, detail) => {
-  // 穿透只由 pet:hit / pet:drag 决定，这里纯记录，避免两套状态互相打架
+  // 穿透只由 pet:hit / pet:drag / 光标轮询决定，这里纯记录，避免两套状态互相打架
   if (kind === 'touch' && detail) log('touch', detail.kind ?? '', detail.x ?? '');
   else if (kind === 'mode') log('mode', detail?.mode ?? '');
 });
@@ -257,12 +519,18 @@ ipcMain.on('pet:hit', (_e, inside) => {
 
 ipcMain.on('pet:drag', (_e, on) => {
   dragging = !!on;
-  if (dragging) setIgnore(false); // 松手后由 pet:hit 决定，不在这里强行穿透
+  if (dragging) setIgnore(false); // 松手后由命中判定决定，不在这里强行穿透
+});
+
+ipcMain.on('pet:ui-rects', (_e, rects) => {
+  uiRects = (Array.isArray(rects) ? rects : [])
+    .filter((r) => r && Number.isFinite(r.x0) && Number.isFinite(r.y0) && Number.isFinite(r.x1) && Number.isFinite(r.y1))
+    .slice(0, 8);
 });
 
 ipcMain.handle('pet:config', () => ({
   ...CONFIG,
-  hasToken: fs.existsSync(path.join(STATE_DIR, 'console-token')),
+  hasToken: fs.existsSync(TOKEN_FILE),
   petState: readPetState(),
 }));
 
@@ -271,40 +539,59 @@ ipcMain.handle('pet:pos', (_e, { x, y }) => {
   return { ok: true };
 });
 
-ipcMain.handle('pet:action', async (_e, name) => {
-  log('action', name);
-  switch (name) {
-    case 'reload': win?.webContents.reload(); return { ok: true };
-    case 'hide': win?.hide(); setTimeout(() => { if (!quitRequested) win?.showInactive(); }, 10000); return { ok: true };
-    case 'quit': quitRequested = true; app.quit(); return { ok: true };
-    case 'move': moveToCursor(); return { ok: true };
-    case 'log': return { ok: true, path: APP_LOG };
-    default: return { ok: false, error: 'unknown action: ' + name };
+ipcMain.handle('pet:send', async (_e, text) => {
+  const t = String(text || '').trim();
+  if (!t) return { ok: false, error: '空的' };
+  if (t.length > 500) return { ok: false, error: '太长了（最多 500 字）' };
+  try {
+    const r = await postJson('/api/socialV2/desk-message', { key: KEY, text: t });
+    if (r && r.ok) {
+      log('desk-message 已投递：', t.slice(0, 40));
+      pollBridge().catch(() => {});
+      return { ok: true, firstWake: !!r.firstWake };
+    }
+    log('desk-message 失败', safeStr(r));
+    return { ok: false, error: (r && r.error) || '桥返回异常' };
+  } catch (e) {
+    log('desk-message 异常', e.message);
+    return { ok: false, error: e.message };
   }
 });
 
-ipcMain.handle('pet:send', async () => ({ ok: false, error: 'M3 未接' }));
+ipcMain.handle('pet:action', async (_e, name, arg) => {
+  switch (name) {
+    case 'menu': popupMenu(); return { ok: true };
+    case 'reload': win?.webContents.reload(); return { ok: true };
+    case 'hide': hideForAWhile(Number(arg) || 10000); return { ok: true };
+    case 'quit': quitRequested = true; app.quit(); return { ok: true };
+    case 'move': moveToCursor(); return { ok: true };
+    case 'wake': return await wakeHer(typeof arg === 'string' ? arg : 'interval');
+    case 'state': return { ok: true, state: bridgeState };
+    case 'log': return { ok: true, path: APP_LOG };
+    default: log('未知 action', name); return { ok: false, error: 'unknown action: ' + name };
+  }
+});
 
 // ────────────────────────────── 生命周期 ──────────────────────────────
 if (!app.requestSingleInstanceLock()) {
   app.quit();
 } else {
-  app.on('second-instance', () => { win?.show(); win?.setAlwaysOnTop(true, 'floating'); });
+  app.on('second-instance', () => showPet());
 
   app.whenReady().then(() => {
     log('=== 桌宠启动', safeStr({ SIZE, K, FLOOR_Y }));
     registerAppProtocol();
     createWindow();
     buildTray();
-    // 调试：把窗口挪到当前光标处，用来验证穿透命中框（PET_DEBUG_CURSOR=1）
+    startBridgePolling();
     if (process.env.PET_DEBUG_CURSOR) {
       setTimeout(() => { moveToCursor(); log('debug: 窗口已挪到光标处'); }, 3000);
-      setTimeout(() => { log('debug: 3s 后状态 ignoring=', ignoring); }, 6000);
     }
   });
 
   app.on('window-all-closed', () => { quitRequested = true; app.quit(); });
   app.on('before-quit', () => {
+    quitRequested = true;
     if (win && !win.isDestroyed()) {
       const [x, y] = win.getPosition();
       writePetState({ left: x, top: y });

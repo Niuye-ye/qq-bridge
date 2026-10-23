@@ -2,6 +2,8 @@
 <html lang="zh">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' app: 'unsafe-inline'; style-src 'self' app: 'unsafe-inline'; img-src app: data: blob:; font-src app: data:; connect-src app:">
 <title>小鲸鱼</title>
 <style>
   html, body {
@@ -9,30 +11,99 @@
     background: transparent; overflow: hidden;
     -webkit-user-select: none; user-select: none;
     cursor: default;
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif;
   }
   #stage { position: absolute; inset: 0; }
-  #err {
-    position: absolute; left: 4px; top: 4px; right: 4px; color: #c00;
-    font: 11px/1.35 Consolas, monospace; white-space: pre-wrap;
-    pointer-events: none; z-index: 99;
-  }
-  /* M3 会挂载的 UI 层，先占位，M1 保持空 */
+
+  /* ── UI 层：默认整块不吃鼠标，需要点的元素单独放开 ── */
   #ui { position: absolute; inset: 0; pointer-events: none; z-index: 50; }
+
+  /* 左上角竖排三颗圆钮（不压立绘：角色左边界约 x=100） */
+  #btns { position: absolute; left: 6px; top: 46px; display: flex; flex-direction: column; gap: 6px; }
+  #btns button {
+    width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(255,255,255,.85);
+    background: rgba(255,255,255,.62); backdrop-filter: blur(6px);
+    font-size: 16px; line-height: 1; cursor: pointer; padding: 0;
+    color: #1f2937; opacity: .72; transition: transform .12s, opacity .12s, background .12s;
+    pointer-events: auto; box-shadow: 0 1px 4px rgba(0,0,0,.18);
+  }
+  #btns button:hover { opacity: 1; transform: scale(1.12); background: rgba(255,255,255,.95); }
+
+  /* 气泡：底边钉在角色头顶线上（y≈54），向上生长，最多两行 */
+  #bubble {
+    position: absolute; left: 50%; bottom: calc(100% - 54px); transform: translateX(-50%);
+    max-width: 342px; padding: 7px 11px; border-radius: 12px;
+    background: rgba(255,255,255,.94); color: #1f2937;
+    font-size: 12.5px; line-height: 1.42; text-align: center;
+    box-shadow: 0 2px 10px rgba(0,0,0,.16); border: 1px solid rgba(148,163,184,.35);
+    display: none; pointer-events: none;
+    overflow: hidden;
+    word-break: break-word;
+  }
+  #bubble.on { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  #bubble.thin { color: #64748b; font-style: italic; }
+
+  /* 聊天框：和气泡同一个位置，打开时顶上去一点 */
+  #chat {
+    position: absolute; left: 50%; bottom: calc(100% - 104px); transform: translateX(-50%);
+    width: 344px; padding: 8px; border-radius: 14px; display: none;
+    background: rgba(255,255,255,.96); box-shadow: 0 4px 18px rgba(0,0,0,.22);
+    border: 1px solid rgba(148,163,184,.4); gap: 6px; align-items: center;
+  }
+  #chat.on { display: flex; }
+  #chat input {
+    flex: 1; border: 1px solid #cbd5e1; border-radius: 9px; padding: 7px 9px;
+    font-size: 13px; outline: none; font-family: inherit; background: #fff; color: #0f172a;
+    pointer-events: auto; -webkit-user-select: text; user-select: text;
+  }
+  #chat input:focus { border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,.18); }
+  #chat button {
+    border: 0; border-radius: 9px; padding: 7px 13px; font-size: 13px; cursor: pointer;
+    background: #2563eb; color: #fff; font-family: inherit; pointer-events: auto;
+  }
+  #chat button:hover { background: #1d4ed8; }
+  #chat button:disabled { background: #94a3b8; cursor: default; }
+
+  /* 右上角三个链路点 */
+  #dots { position: absolute; right: 8px; top: 8px; display: flex; gap: 4px; opacity: .8; }
+  #dots i {
+    width: 7px; height: 7px; border-radius: 50%; background: #cbd5e1; display: block;
+    box-shadow: 0 0 0 1px rgba(255,255,255,.7);
+  }
+  #dots i.ok { background: #22c55e; }
+  #dots i.bad { background: #ef4444; }
+
+  #err {
+    position: absolute; left: 4px; bottom: 4px; right: 4px; color: #dc2626;
+    font: 10px/1.3 Consolas, monospace; white-space: pre-wrap; pointer-events: none; z-index: 99;
+  }
 </style>
 </head>
 <body>
 <div id="stage"></div>
-<div id="ui"></div>
+<div id="ui">
+  <div id="dots" title="链路"><i data-k="sluma"></i><i data-k="web"></i><i data-k="bridge"></i></div>
+  <div id="btns">
+    <button data-a="chat" title="打字">⌨</button>
+    <button data-a="pat" title="摸头">✋</button>
+    <button data-a="play" title="去玩会儿">📱</button>
+  </div>
+  <div id="bubble"></div>
+  <div id="chat">
+    <input id="chatIn" maxlength="500" placeholder="跟她说句话…" autocomplete="off">
+    <button id="chatSend">发</button>
+  </div>
+</div>
 <div id="err"></div>
 <script type="module">
 const errEl = document.getElementById('err');
 const DEBUGMODE = new URLSearchParams(location.search).has('debug');
+const safe = (x) => { try { return JSON.stringify(x); } catch (_) { return String(x); } };
 const say = (...a) => {
-  const s = a.map(x => (typeof x === 'string' ? x : safe(x))).join(' ');
+  const s = a.map((x) => (typeof x === 'string' ? x : safe(x))).join(' ');
   window.pet?.log(s);
   if (DEBUGMODE && errEl) errEl.textContent = s;
 };
-const safe = (x) => { try { return JSON.stringify(x); } catch (_) { return String(x); } };
 window.addEventListener('error', (e) => say('ERR', e.message || String(e)));
 window.addEventListener('unhandledrejection', (e) => say('REJ', (e.reason && e.reason.message) || String(e.reason)));
 
@@ -45,9 +116,11 @@ try { CFG = { ...CFG, ...(await (window.pet?.config?.() ?? null) || {}) }; } cat
 const W = CFG.size, H = CFG.size, S = CFG.k, FLOOR = CFG.floorY;
 
 let api = null;
-let ui = { mood: '', doing: '', lastLine: '', status: null, pending: false };
+let state = { mood: '', affinity: null, doing: '', lastLine: '', lastLineAt: 0, links: {}, paused: null, activityAt: 0 };
+let pendingUntil = 0;   // 发完话等回复的时间窗
+let bubbleSticky = '';  // 临时气泡（发送回执等）
 
-// ── 命中区：只覆盖角色本体，窗口其余部分（上方气泡区、四角）一律让鼠标穿过去
+// ── 命中区：只覆盖角色本体，窗口其余部分一律让鼠标穿过去
 const CHAR_HALF = Math.min(112 * S, W * 0.44);
 const HIT = {
   x0: W / 2 - CHAR_HALF,
@@ -57,6 +130,16 @@ const HIT = {
 };
 const inBody = (x, y) => x >= HIT.x0 && x <= HIT.x1 && y >= HIT.y0 && y <= HIT.y1;
 
+// ── UI 命中矩形：上报给主进程，让它把这几块从穿透里挖出来
+const BTN_RECT = { x0: 2, y0: 42, x1: 46, y1: 168 };
+const CHAT_RECT = { x0: 36, y0: 4, x1: 384, y1: 112 };
+function pushUiRects() {
+  const rects = [BTN_RECT];
+  if (chat.classList.contains('on')) rects.push(CHAT_RECT);
+  window.pet?.setUiRects(rects);
+}
+
+// ── 启动
 async function boot() {
   const stage = document.getElementById('stage');
   const base = new URL('./whale/', location.href);
@@ -67,13 +150,16 @@ async function boot() {
       root: stage,
       start: { skin: 'deepseek-maid', x: 0, facing: 1 },
       bounds: () => ({ W, H, floorY: FLOOR, S }),
-      emit: (kind, detail) => { window.pet?.emit(kind, detail ?? null); if (kind !== 'mode') say('emit', kind, detail?.kind ?? detail?.mode ?? ''); },
+      emit: (kind, detail) => {
+        window.pet?.emit(kind, detail ?? null);
+        if (kind === 'touch' && detail) onTouch(detail);
+      },
       sound: () => {},
     },
   });
 
   api.layout();
-  say('ready | words=' + (api.words || []).length + ' | ' + W + 'x' + H + ' S=' + S.toFixed(3) + ' floor=' + FLOOR.toFixed(0));
+  say('ready | words=' + (api.words || []).length + ' | ' + W + 'x' + H + ' S=' + S.toFixed(3));
 
   let last = performance.now();
   const loop = (t) => {
@@ -83,33 +169,165 @@ async function boot() {
     requestAnimationFrame(loop);
   };
   requestAnimationFrame(loop);
-
   window.__petApi = api;
   window.pet?.emit('ready', { words: (api.words || []).length });
-
-  const q = new URLSearchParams(location.search);
-  const delay = Number(q.get('delay') || 300);
-  if (q.get('do')) setTimeout(() => api.do(q.get('do')), delay);
-  if (q.get('walk')) setTimeout(() => api.walk(Number(q.get('walk')), q.get('run') === '1', 'w'), delay);
-  if (q.get('set')) setTimeout(() => { const o = {}; o[q.get('set')] = true; api.set(o); }, delay);
+  pushUiRects();
+  renderBubble();
 }
 
-// ── 鼠标：窗口默认整块穿透(forward)，只有指针进入角色矩形才让主进程收回穿透
-let down = false;
-let lastInside = null;
-function sendHit(inside) {
-  if (inside === lastInside) return;
-  lastInside = inside;
-  window.pet?.setHit(inside);
+// ── 气泡 ──
+const bubble = document.getElementById('bubble');
+const chat = document.getElementById('chat');
+const chatIn = document.getElementById('chatIn');
+const chatSend = document.getElementById('chatSend');
+const dots = [...document.querySelectorAll('#dots i')];
+
+function mainLine() {
+  const now = Date.now();
+  if (pendingUntil > now) return { text: '（她想一下…）', thin: true };
+  if (bubbleSticky) return { text: bubbleSticky, thin: false };
+  if (state.lastLine && state.lastLineAt && now - state.lastLineAt < 45 * 60 * 1000) {
+    return { text: state.lastLine, thin: false };
+  }
+  if (state.doing) return { text: state.doing, thin: true };
+  if (state.lastLine) return { text: state.lastLine, thin: false };
+  return { text: '', thin: true };
 }
 
-window.addEventListener('mousemove', (e) => {
-  const x = e.clientX, y = e.clientY;
-  if (down) {
-    try { api.pointer('move', { x, y, t: performance.now() }); } catch (err) { say('pointer move', err.message); }
+function renderBubble() {
+  const m = mainLine();
+  if (!m.text) { bubble.classList.remove('on'); return; }
+  if (bubble.textContent !== m.text) bubble.textContent = m.text;
+  bubble.classList.toggle('thin', m.thin);
+  bubble.classList.add('on');
+}
+
+function renderDots() {
+  for (const el of dots) {
+    const v = state.links ? state.links[el.dataset.k] : null;
+    el.classList.toggle('ok', v === true);
+    el.classList.toggle('bad', v === false);
+  }
+}
+
+function applyState(s) {
+  state = { ...state, ...s };
+  renderBubble();
+  renderDots();
+  // 心情 → 表情（她心情好就笑）
+  try {
+    if (s.mood === 'happy') api?.do('happy');
+    else if (s.paused === true) api?.do('sleep');
+  } catch (_) {}
+}
+
+// ── 她的动作 ──
+let seqTimer = null;
+function playSeq(words) {
+  clearTimeout(seqTimer);
+  let i = 0;
+  const step = () => {
+    if (i >= words.length) return;
+    try { api?.do(words[i]); } catch (e) { say('do 失败', words[i], e.message); }
+    i++;
+    seqTimer = setTimeout(step, 900);
+  };
+  step();
+}
+
+function onTouch(detail) {
+  // body 内部的抓/放/甩事件：给点情绪反馈
+  if (detail.kind === 'grab') { try { api.do('surprised'); } catch (_) {} }
+  if (detail.kind === 'throw' || detail.kind === 'crash') { try { api.do('dizzy'); } catch (_) {} }
+  if (detail.kind === 'drop') { try { api.do('happy'); } catch (_) {} }
+}
+
+// ── 聊天框 ──
+function openChat() {
+  chat.classList.add('on');
+  if (bubble.textContent) bubble.classList.remove('on');
+  chatIn.value = '';
+  chatSend.disabled = false;
+  pushUiRects();
+  setTimeout(() => chatIn.focus(), 30);
+}
+function closeChat() {
+  if (!chat.classList.contains('on')) return;
+  chat.classList.remove('on');
+  pushUiRects();
+  renderBubble();
+}
+
+async function sendChat() {
+  const text = chatIn.value.trim();
+  if (!text) return;
+  chatSend.disabled = true;
+  chatSend.textContent = '…';
+  let r;
+  try { r = await window.pet.send(text); } catch (e) { r = { ok: false, error: e.message }; }
+  chatSend.disabled = false;
+  chatSend.textContent = '发';
+  if (r && r.ok) {
+    chatIn.value = '';
+    pendingUntil = Date.now() + 60000;
+    closeChat();
+    try { api.do('happy'); } catch (_) {}
+  } else {
+    bubbleSticky = '没送到：' + ((r && r.error) || '未知错误');
+    bubble.classList.add('on', 'thin');
+    bubble.textContent = bubbleSticky;
+    setTimeout(() => { bubbleSticky = ''; renderBubble(); }, 4000);
+  }
+}
+
+chatSend.addEventListener('click', sendChat);
+chatIn.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); sendChat(); }
+  if (e.key === 'Escape') { e.preventDefault(); closeChat(); }
+});
+
+// ── 三颗圆钮 ──
+document.getElementById('btns').addEventListener('click', async (e) => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  const a = b.dataset.a;
+  if (a === 'chat') { openChat(); return; }
+  if (a === 'pat') {
+    try { api.do('flustered'); } catch (_) {}
+    bubbleSticky = '嘿嘿…别摸啦';
+    bubble.textContent = bubbleSticky;
+    bubble.classList.add('on');
+    setTimeout(() => { bubbleSticky = ''; renderBubble(); }, 2600);
     return;
   }
-  sendHit(inBody(x, y));
+  if (a === 'play') {
+    bubbleSticky = '（她去刷手机了…）';
+    bubble.textContent = bubbleSticky;
+    bubble.classList.add('on');
+    try { api.do('wave'); } catch (_) {}
+    await window.pet.action('wake', 'interval');
+    setTimeout(() => { bubbleSticky = ''; renderBubble(); }, 5000);
+  }
+});
+
+// ── 主进程 → UI ──
+window.pet?.onUi?.((m) => {
+  if (!m) return;
+  if (m.t === 'do') { try { api?.do(m.word); } catch (e) { say('do 失败', m.word); } }
+  else if (m.t === 'seq') playSeq(m.words || []);
+  else if (m.t === 'chat') openChat();
+  else if (m.t === 'bubble') { bubbleSticky = m.text || ''; renderBubble(); setTimeout(() => { bubbleSticky = ''; renderBubble(); }, 4000); }
+});
+
+window.pet?.onState?.(applyState);
+
+// ── 鼠标：穿透完全由主进程轮询决定（main.js startHitPolling，已并入 uiRects），
+//    渲染进程只把拖拽手势喂给 body。两边都调 setIgnore 会互相打架，实测抖成一片。
+let down = false;
+
+window.addEventListener('mousemove', (e) => {
+  if (!down) return;
+  try { api.pointer('move', { x: e.clientX, y: e.clientY, t: performance.now() }); } catch (err) { say('pointer move', err.message); }
 }, { passive: true });
 
 window.addEventListener('mousedown', (e) => {
@@ -117,7 +335,6 @@ window.addEventListener('mousedown', (e) => {
   if (!inBody(e.clientX, e.clientY)) return;
   e.preventDefault();
   down = true;
-  lastInside = true;
   window.pet?.setDragging(true);
   try { api.pointer('down', { x: e.clientX, y: e.clientY }); } catch (err) { say('pointer down', err.message); }
 });
@@ -127,23 +344,16 @@ function release(x, y) {
   down = false;
   try { api.pointer('up', { x, y }); } catch (err) { say('pointer up', err.message); }
   window.pet?.setDragging(false);
-  lastInside = null;
-  sendHit(inBody(x, y));
 }
 window.addEventListener('mouseup', (e) => release(e.clientX, e.clientY));
-window.addEventListener('mouseleave', () => { if (down) release(HIT.x0 - 1, HIT.y0 - 1); else sendHit(false); });
+window.addEventListener('mouseleave', () => { if (down) release(HIT.x0 - 1, HIT.y0 - 1); });
 window.addEventListener('blur', () => { if (down) release(-1, -1); });
 
+window.addEventListener('dblclick', (e) => {
+  if (inBody(e.clientX, e.clientY)) { e.preventDefault(); openChat(); }
+});
 document.addEventListener('contextmenu', (e) => { e.preventDefault(); window.pet?.action('menu'); });
 document.addEventListener('dragstart', (e) => e.preventDefault());
-
-// ── 主进程推过来的状态（M3 用，M1 只记着）
-window.pet?.onState?.((s) => {
-  ui = { ...ui, ...s };
-  try { api?.set(s.pet || {}); } catch (_) {}
-  if (s.mood && api) { try { api.set({ mood: s.mood }); } catch (_) {} }
-  document.dispatchEvent(new CustomEvent('pet:state', { detail: ui }));
-});
 
 boot().catch((e) => say('boot 崩', e.message || String(e)));
 </script>
