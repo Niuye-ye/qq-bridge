@@ -1,0 +1,621 @@
+{
+ "source": "Coopanion whale figure (AGPL-3.0), converted from model.json",
+ "canvas": {
+  "x0": -12,
+  "y0": -8,
+  "x1": 268,
+  "y1": 272,
+  "w": 280,
+  "h": 280
+ },
+ "ground": 256,
+ "units": {
+  "S": 0.19,
+  "X0": 650,
+  "FEET": 1363,
+  "DS": 0.6,
+  "featDS": 1
+ },
+ "pivots": {
+  "body": [
+   128.0,
+   256.0
+  ],
+  "waist": [
+   128.0,
+   188.93
+  ],
+  "neck": [
+   129.9,
+   154.73
+  ],
+  "armNear": [
+   113.18,
+   166.13
+  ],
+  "armFar": [
+   153.65,
+   168.98
+  ],
+  "legBack": [
+   112.42,
+   203.18
+  ],
+  "legFront": [
+   144.15,
+   203.18
+  ],
+  "tail": [
+   88.1,
+   206.03
+  ],
+  "finNear": [
+   80.88,
+   128.13
+  ],
+  "finFar": [
+   173.22,
+   126.23
+  ],
+  "ahoge": [
+   118.5,
+   54.03
+  ],
+  "head": [
+   137.5,
+   114.83
+  ]
+ },
+ "parts": [
+  {
+   "name": "hair_back",
+   "tex": "hair_back.png",
+   "z": 1,
+   "parent": "hairSway",
+   "pivotName": "neck",
+   "box": [
+    39.46,
+    48.33,
+    183.67,
+    221.99
+   ],
+   "pivot": [
+    129.9,
+    154.73
+   ],
+   "grid": [
+    8,
+    12
+   ],
+   "lag": 1.0
+  },
+  {
+   "name": "tail",
+   "tex": "tail.png",
+   "z": 1.5,
+   "parent": "tailBend",
+   "pivotName": "tail",
+   "box": [
+    24.26,
+    172.21,
+    107.29,
+    212.68
+   ],
+   "pivot": [
+    88.1,
+    206.03
+   ],
+   "grid": [
+    10,
+    4
+   ],
+   "lag": 1.0
+  },
+  {
+   "name": "hair_back_curl",
+   "tex": "hair_back_curl.png",
+   "z": 1.75,
+   "parent": "hairSway",
+   "pivotName": "neck",
+   "box": [
+    74.23,
+    171.83,
+    115.46,
+    219.71
+   ],
+   "pivot": [
+    129.9,
+    154.73
+   ],
+   "grid": [
+    4,
+    8
+   ],
+   "lag": 1.0
+  },
+  {
+   "name": "leg_front",
+   "tex": "leg_front.png",
+   "z": 3,
+   "parent": "legFront",
+   "pivotName": "legFront",
+   "box": [
+    120.21,
+    168.79,
+    163.91,
+    255.62
+   ],
+   "pivot": [
+    144.15,
+    203.18
+   ],
+   "grid": [
+    3,
+    10
+   ],
+   "lag": 0.0
+  },
+  {
+   "name": "leg_back",
+   "tex": "leg_back.png",
+   "z": 4,
+   "parent": "legBack",
+   "pivotName": "legBack",
+   "box": [
+    96.08,
+    173.16,
+    136.36,
+    257.71
+   ],
+   "pivot": [
+    112.42,
+    203.18
+   ],
+   "grid": [
+    3,
+    10
+   ],
+   "lag": 0.0
+  },
+  {
+   "name": "arm_far",
+   "tex": "arm_far.png",
+   "z": 4.5,
+   "parent": "armFar",
+   "pivotName": "armFar",
+   "box": [
+    144.91,
+    163.28,
+    173.41,
+    202.99
+   ],
+   "pivot": [
+    153.65,
+    168.98
+   ],
+   "grid": [
+    3,
+    5
+   ],
+   "lag": 0.0
+  },
+  {
+   "name": "torso_up",
+   "tex": "torso_up.png",
+   "z": 5,
+   "parent": "body",
+   "pivotName": "body",
+   "box": [
+    106.15,
+    147.89,
+    154.98,
+    194.44
+   ],
+   "pivot": [
+    128.0,
+    256.0
+   ],
+   "grid": [
+    6,
+    6
+   ],
+   "lag": 0.0
+  },
+  {
+   "name": "hair_front_right",
+   "tex": "hair_front_right.png",
+   "z": 5.05,
+   "parent": "hairSway",
+   "pivotName": "neck",
+   "box": [
+    146.62,
+    148.27,
+    176.83,
+    191.02
+   ],
+   "pivot": [
+    129.9,
+    154.73
+   ],
+   "grid": [
+    4,
+    6
+   ],
+   "lag": 1.0
+  },
+  {
+   "name": "arm_far_end_front",
+   "tex": "arm_far_end_front.png",
+   "z": 5.1,
+   "parent": "armFar",
+   "pivotName": "armFar",
+   "box": [
+    156.88,
+    183.99,
+    173.41,
+    202.99
+   ],
+   "pivot": [
+    153.65,
+    168.98
+   ],
+   "grid": [
+    3,
+    3
+   ],
+   "lag": 0.0
+  },
+  {
+   "name": "skirt",
+   "tex": "skirt.png",
+   "z": 5.2,
+   "parent": "skirt",
+   "pivotName": "waist",
+   "box": [
+    79.55,
+    168.41,
+    177.59,
+    229.59
+   ],
+   "pivot": [
+    128.0,
+    188.93
+   ],
+   "grid": [
+    8,
+    6
+   ],
+   "lag": 0.85
+  },
+  {
+   "name": "skirt_sit",
+   "tex": "skirt_sit.png",
+   "z": 5.3,
+   "parent": "skirtSit",
+   "pivotName": "waist",
+   "box": [
+    47.44,
+    168.98,
+    199.25,
+    237.95
+   ],
+   "pivot": [
+    128.0,
+    188.93
+   ],
+   "grid": [
+    8,
+    4
+   ],
+   "lag": 0.85
+  },
+  {
+   "name": "hair_front_left",
+   "tex": "hair_front_left.png",
+   "z": 5.4,
+   "parent": "hairSway",
+   "pivotName": "neck",
+   "box": [
+    60.93,
+    118.63,
+    105.77,
+    195.2
+   ],
+   "pivot": [
+    129.9,
+    154.73
+   ],
+   "grid": [
+    4,
+    8
+   ],
+   "lag": 1.0
+  },
+  {
+   "name": "waist_bow_front",
+   "tex": "waist_bow_front.png",
+   "z": 5.5,
+   "parent": "skirt",
+   "pivotName": "waist",
+   "box": [
+    84.87,
+    168.41,
+    114.7,
+    201.47
+   ],
+   "pivot": [
+    128.0,
+    188.93
+   ],
+   "grid": [
+    4,
+    4
+   ],
+   "lag": 0.85
+  },
+  {
+   "name": "waist_bow_sit_front",
+   "tex": "waist_bow_sit_front.png",
+   "z": 5.55,
+   "parent": "skirtSit",
+   "pivotName": "waist",
+   "box": [
+    79.74,
+    168.98,
+    119.26,
+    197.86
+   ],
+   "pivot": [
+    128.0,
+    188.93
+   ],
+   "grid": [
+    4,
+    4
+   ],
+   "lag": 0.85
+  },
+  {
+   "name": "arm_near",
+   "tex": "arm_near.png",
+   "z": 6,
+   "parent": "armNear",
+   "pivotName": "armNear",
+   "box": [
+    93.8,
+    157.96,
+    122.49,
+    212.49
+   ],
+   "pivot": [
+    113.18,
+    166.13
+   ],
+   "grid": [
+    4,
+    6
+   ],
+   "lag": 0.0
+  },
+  {
+   "name": "fin_far",
+   "tex": "fin_far.png",
+   "z": 7,
+   "parent": "finFar",
+   "pivotName": "finFar",
+   "box": [
+    166.0,
+    103.62,
+    204.76,
+    142.76
+   ],
+   "pivot": [
+    173.22,
+    126.23
+   ],
+   "grid": [
+    4,
+    3
+   ],
+   "lag": 0.6
+  },
+  {
+   "name": "sidelocks",
+   "tex": "sidelocks.png",
+   "z": 7.5,
+   "parent": "bangsSway",
+   "pivotName": "neck",
+   "box": [
+    87.72,
+    124.14,
+    185.95,
+    173.35
+   ],
+   "pivot": [
+    129.9,
+    154.73
+   ],
+   "grid": [
+    4,
+    8
+   ],
+   "lag": 0.7
+  },
+  {
+   "name": "face",
+   "tex": "face_ready.png",
+   "z": 8,
+   "parent": "headMid",
+   "pivotName": "head",
+   "box": [
+    100.26,
+    73.98,
+    175.88,
+    156.06
+   ],
+   "pivot": [
+    137.5,
+    114.83
+   ],
+   "grid": [
+    6,
+    6
+   ],
+   "lag": 0.0
+  },
+  {
+   "name": "eye_creases",
+   "tex": "eye_creases.png",
+   "z": 8.5,
+   "parent": "headFeat",
+   "pivotName": "head",
+   "box": [
+    126.29,
+    108.94,
+    170.75,
+    118.82
+   ],
+   "pivot": [
+    137.5,
+    114.83
+   ],
+   "grid": [
+    4,
+    2
+   ],
+   "lag": 0.0
+  },
+  {
+   "name": "brows",
+   "tex": "brows.png",
+   "z": 8.6,
+   "parent": "headFeat",
+   "pivotName": "head",
+   "box": [
+    117.74,
+    97.35,
+    176.07,
+    106.47
+   ],
+   "pivot": [
+    137.5,
+    114.83
+   ],
+   "grid": [
+    12,
+    2
+   ],
+   "lag": 0.0
+  },
+  {
+   "name": "fin_near",
+   "tex": "fin_near.png",
+   "z": 11,
+   "parent": "finNear",
+   "pivotName": "finNear",
+   "box": [
+    37.37,
+    100.39,
+    97.22,
+    143.14
+   ],
+   "pivot": [
+    80.88,
+    128.13
+   ],
+   "grid": [
+    5,
+    3
+   ],
+   "lag": 0.6
+  },
+  {
+   "name": "headdress",
+   "tex": "headdress.png",
+   "z": 12.5,
+   "parent": "headMid",
+   "pivotName": "head",
+   "box": [
+    72.71,
+    38.64,
+    187.47,
+    110.84
+   ],
+   "pivot": [
+    137.5,
+    114.83
+   ],
+   "grid": [
+    8,
+    4
+   ],
+   "lag": 0.0
+  },
+  {
+   "name": "bangs",
+   "tex": "bangs.png",
+   "z": 13,
+   "parent": "bangsSway",
+   "pivotName": "neck",
+   "box": [
+    80.69,
+    51.75,
+    192.98,
+    151.5
+   ],
+   "pivot": [
+    129.9,
+    154.73
+   ],
+   "grid": [
+    8,
+    10
+   ],
+   "lag": 0.7
+  },
+  {
+   "name": "bow",
+   "tex": "bow.png",
+   "z": 13.8,
+   "parent": "headMid",
+   "pivotName": "head",
+   "box": [
+    66.06,
+    94.5,
+    94.94,
+    118.82
+   ],
+   "pivot": [
+    137.5,
+    114.83
+   ],
+   "grid": [
+    3,
+    3
+   ],
+   "lag": 0.0
+  },
+  {
+   "name": "ahoge",
+   "tex": "ahoge.png",
+   "z": 14,
+   "parent": "ahoge",
+   "pivotName": "ahoge",
+   "box": [
+    87.15,
+    20.4,
+    140.35,
+    56.69
+   ],
+   "pivot": [
+    118.5,
+    54.03
+   ],
+   "grid": [
+    5,
+    4
+   ],
+   "lag": 1.0
+  }
+ ]
+}

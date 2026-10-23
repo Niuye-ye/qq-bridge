@@ -12,11 +12,13 @@
 </style>
 </head>
 <body>
+<div id="dbg" style="position:fixed;left:2px;top:2px;font:10px monospace;color:#e11;z-index:99;pointer-events:none"></div>
+<script>window.DEBUGMODE=new URLSearchParams(location.search).has('debug');</script>
 <div id="stage"></div>
 <div id="err"></div>
 <script type="module">
-const errEl = document.getElementById('err');
-const say = (...a) => { errEl.textContent = a.join(' '); console.log(...a); };
+const errEl = document.getElementById('dbg');
+const say = (...a) => { console.log(...a); if (!window.DEBUGMODE || !errEl) return; errEl.textContent = a.join(' '); };
 const post = (m) => { try { window.chrome && window.chrome.webview && window.chrome.webview.postMessage(m); } catch (_) {} };
 window.addEventListener('error', (e) => say('ERR', e.message));
 window.addEventListener('unhandledrejection', (e) => say('REJ', e.reason && e.reason.message || e.reason));
