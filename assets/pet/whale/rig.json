@@ -288,28 +288,6 @@
    "lag": 0.85
   },
   {
-   "name": "skirt_sit",
-   "tex": "skirt_sit.png",
-   "z": 5.3,
-   "parent": "skirtSit",
-   "pivotName": "waist",
-   "box": [
-    47.44,
-    168.98,
-    199.25,
-    237.95
-   ],
-   "pivot": [
-    128.0,
-    188.93
-   ],
-   "grid": [
-    8,
-    4
-   ],
-   "lag": 0.85
-  },
-  {
    "name": "hair_front_left",
    "tex": "hair_front_left.png",
    "z": 5.4,
@@ -342,28 +320,6 @@
     168.41,
     114.7,
     201.47
-   ],
-   "pivot": [
-    128.0,
-    188.93
-   ],
-   "grid": [
-    4,
-    4
-   ],
-   "lag": 0.85
-  },
-  {
-   "name": "waist_bow_sit_front",
-   "tex": "waist_bow_sit_front.png",
-   "z": 5.55,
-   "parent": "skirtSit",
-   "pivotName": "waist",
-   "box": [
-    79.74,
-    168.98,
-    119.26,
-    197.86
    ],
    "pivot": [
     128.0,
