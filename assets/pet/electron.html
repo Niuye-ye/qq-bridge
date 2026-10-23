@@ -199,25 +199,35 @@ const chatIn = document.getElementById('chatIn');
 const chatSend = document.getElementById('chatSend');
 const dots = [...document.querySelectorAll('#dots i')];
 
+// 气泡不常显：只有她刚说过话 / 在等她回 / 鼠标靠过来 才冒出来
+const BUBBLE_FRESH_MS = 120 * 1000;
+
 function mainLine() {
   const now = Date.now();
   if (pendingUntil > now) return { text: '（她想一下…）', thin: true };
   if (bubbleSticky) return { text: bubbleSticky, thin: false };
-  if (state.lastLine && state.lastLineAt && now - state.lastLineAt < 45 * 60 * 1000) {
+  if (state.lastLine && state.lastLineAt && now - state.lastLineAt < BUBBLE_FRESH_MS) {
     return { text: state.lastLine, thin: false };
   }
-  if (state.doing) return { text: state.doing, thin: true };
-  if (state.lastLine) return { text: state.lastLine, thin: false };
+  if (hoverNear) {
+    if (state.doing) return { text: state.doing, thin: true };
+    if (state.lastLine) return { text: state.lastLine, thin: false };
+  }
   return { text: '', thin: true };
 }
 
 function renderBubble() {
   const m = mainLine();
-  if (!m.text) { bubble.classList.remove('on'); return; }
+  if (!m.text) {
+    if (bubble.classList.contains('on')) bubble.classList.remove('on');
+    return;
+  }
   if (bubble.textContent !== m.text) bubble.textContent = m.text;
   bubble.classList.toggle('thin', m.thin);
   bubble.classList.add('on');
 }
+// 让她说过的话到点自己收起来（2 分钟），不用等下一次状态推送
+setInterval(renderBubble, 1000);
 
 function renderDots() {
   for (const el of dots) {
@@ -270,12 +280,14 @@ function openChat() {
   chatIn.value = '';
   chatSend.disabled = false;
   pushUiRects();
+  window.pet?.emit('chatOpen', true);
   setTimeout(() => chatIn.focus(), 30);
 }
 function closeChat() {
   if (!chat.classList.contains('on')) return;
   chat.classList.remove('on');
   pushUiRects();
+  window.pet?.emit('chatOpen', false);
   renderBubble();
 }
 function toggleChat() { if (chat.classList.contains('on')) closeChat(); else openChat(); }

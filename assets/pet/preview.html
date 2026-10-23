@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;">
+<title>小鲸鱼 · 预览</title>
+<style>
+  :root {
+    --bg: #1b1f2a; --panel: #232936; --fg: #e8ecf4; --dim: #98a3b8; --line: #313949; --accent: #7aa2ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif; }
+  header { position: sticky; top: 0; display: flex; align-items: center; gap: 10px;
+    padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  #name { font-size: 13px; color: var(--fg); font-weight: 600; }
+  #sub { font-size: 11.5px; color: var(--dim); }
+  .sp { flex: 1; }
+  button { font: inherit; font-size: 12px; color: var(--fg); background: #2c3446;
+    border: 1px solid var(--line); border-radius: 7px; padding: 5px 11px; cursor: pointer; }
+  button:hover { background: #353f56; border-color: #46506a; }
+  main { padding: 18px 26px 60px; max-width: 900px; margin: 0 auto; font-size: 14px; line-height: 1.85; }
+  main h2 { font-size: 17px; margin: 26px 0 8px; color: #cfe0ff; border-left: 3px solid var(--accent);
+    padding-left: 10px; }
+  main h3 { font-size: 15px; margin: 20px 0 6px; color: #cfe0ff; }
+  main h4, main h5 { font-size: 14px; margin: 16px 0 4px; color: var(--dim); }
+  main p { margin: 9px 0; }
+  main ul { margin: 8px 0; padding-left: 22px; }
+  main li { margin: 4px 0; }
+  main code { background: #2a3142; padding: 1px 5px; border-radius: 4px; font-size: 12.5px;
+    font-family: Consolas, "Cascadia Mono", monospace; color: #a8d8ff; }
+  main strong { color: #fff; }
+  main pre { background: #161a23; border: 1px solid var(--line); border-radius: 10px;
+    padding: 14px 16px; overflow: auto; font-size: 12.5px; line-height: 1.65;
+    font-family: Consolas, "Cascadia Mono", monospace; white-space: pre-wrap; word-break: break-word; }
+  .tip { color: var(--dim); font-size: 13px; }
+  .err { color: #ff9a9a; }
+  .fact { display: flex; gap: 10px; padding: 7px 0; border-bottom: 1px dashed var(--line); }
+  .fact b { flex: 0 0 auto; font-size: 11px; padding: 1px 7px; border-radius: 20px;
+    background: #2c3446; color: var(--dim); font-weight: 500; height: 19px; line-height: 17px; }
+  .fact b.long { background: #3a2f4d; color: #d7c2ff; }
+  .fact span { flex: 1; }
+  .fact em { font-style: normal; color: var(--dim); font-size: 11.5px; }
+</style>
+</head>
+<body>
+<header>
+  <span id="name">…</span><span id="sub"></span>
+  <span class="sp"></span>
+  <button id="btnReload">刷新</button>
+  <button id="btnOs">记事本打开</button>
+</header>
+<main id="body"><p class="tip">读着呢…</p></main>
+
+<script>
+const q = new URLSearchParams(location.search);
+const FILE = q.get('file') || '';
+const KIND = q.get('kind') || '';       // facts / diary / text
+const bodyEl = document.getElementById('body');
+const nameEl = document.getElementById('name');
+const subEl = document.getElementById('sub');
+
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const inline = (s) => esc(s)
+  .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+  .replace(/`([^`]+)`/g, '<code>$1</code>')
+  .replace(/\[([^\]]{1,40})\]\((https?:[^)]+)\)/g, '<span>$1</span>');
+
+function renderMd(text) {
+  const out = [];
+  let inList = false;
+  const closeList = () => { if (inList) { out.push('</ul>'); inList = false; } };
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.replace(/\s+$/, '');
+    if (!line.trim()) { closeList(); continue; }
+    const h = line.match(/^(#{1,5})\s+(.*)$/);
+    if (h) { closeList(); const lv = Math.min(5, h[1].length + 1); out.push(`<h${lv}>${inline(h[2])}</h${lv}>`); continue; }
+    if (/^\s*[-*+]\s+/.test(line)) {
+      if (!inList) { out.push('<ul>'); inList = true; }
+      out.push(`<li>${inline(line.replace(/^\s*[-*+]\s+/, ''))}</li>`);
+      continue;
+    }
+    if (/^\s*>\s?/.test(line)) { closeList(); out.push(`<p class="tip">${inline(line.replace(/^\s*>\s?/, ''))}</p>`); continue; }
+    closeList();
+    out.push(`<p>${inline(line)}</p>`);
+  }
+  closeList();
+  return out.join('\n');
+}
+
+function renderFacts(j) {
+  const arr = Array.isArray(j.facts) ? j.facts : [];
+  if (!arr.length) return '<p class="tip">还没有长期记忆。</p>';
+  const order = { long: 0, normal: 1 };
+  const rows = arr.slice().sort((a, b) => (order[a.tier] ?? 9) - (order[b.tier] ?? 9));
+  const head = `<p class="tip">共 ${arr.length} 条 · 长记忆 ${arr.filter((f) => f.tier === 'long').length} 条</p>`;
+  return head + rows.map((f) => {
+    const when = f.at ? new Date(f.at).toLocaleString('zh-CN', { hour12: false }).slice(0, 16) : '';
+    const kind = f.kind || '';
+    return `<div class="fact"><b class="${esc(f.tier || '')}">${esc(f.tier === 'long' ? '长' : '常')}</b>`
+      + `<span>${esc(f.text || '')}<br><em>${esc(kind)}${kind && when ? ' · ' : ''}${esc(when)}</em></span></div>`;
+  }).join('');
+}
+
+async function load() {
+  bodyEl.innerHTML = '<p class="tip">读着呢…</p>';
+  if (!FILE) { bodyEl.innerHTML = '<p class="err">没给文件路径。</p>'; return; }
+  let r;
+  try { r = await window.pet.readText(FILE); } catch (e) { r = { ok: false, error: e.message }; }
+  if (!r || !r.ok) {
+    bodyEl.innerHTML = `<p class="err">打不开：${esc((r && r.error) || '未知错误')}</p>`;
+    nameEl.textContent = FILE.split(/[\\/]/).pop();
+    return;
+  }
+  nameEl.textContent = r.name || FILE.split(/[\\/]/).pop();
+  subEl.textContent = `${(r.bytes / 1024).toFixed(1)} KB`;
+  document.title = nameEl.textContent + ' · 小鲸鱼';
+  let html;
+  if (KIND === 'facts' || /\.json$/i.test(FILE)) {
+    try {
+      const j = JSON.parse(r.text);
+      html = (j && Array.isArray(j.facts)) ? renderFacts(j) : `<pre>${esc(JSON.stringify(j, null, 2))}</pre>`;
+    } catch (_) { html = `<pre>${esc(r.text)}</pre>`; }
+  } else if (/\.(md|markdown|txt|log)$/i.test(FILE)) {
+    html = renderMd(r.text);
+  } else {
+    html = `<pre>${esc(r.text)}</pre>`;
+  }
+  bodyEl.innerHTML = html;
+}
+
+document.getElementById('btnReload').addEventListener('click', load);
+document.getElementById('btnOs').addEventListener('click', () => {
+  try { window.pet.action('openText', FILE); } catch (_) {}
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') window.close();
+  if (e.key === 'F5') { e.preventDefault(); load(); }
+});
+load();
+</script>
+</body>
+</html>

@@ -45,6 +45,9 @@ contextBridge.exposeInMainWorld('pet', {
   /** 启动时拿一次配置（尺寸、key、token 是否存在、位置） */
   config: () => ipcRenderer.invoke('pet:config'),
 
+  /** 读一个文本文件（日记/长期记忆的预览窗用） */
+  readText: (p) => ipcRenderer.invoke('pet:read-text', String(p ?? '')),
+
   /** 记住窗口位置 */
   savePos: (x, y) => ipcRenderer.invoke('pet:pos', { x, y }),
 

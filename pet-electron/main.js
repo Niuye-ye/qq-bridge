@@ -65,6 +65,10 @@ function log(...a) {
   writeLog(`[${STAMP()}] ${a.map((x) => (typeof x === 'string' ? x : safeStr(x))).join(' ')}`);
 }
 function safeStr(x) { try { return JSON.stringify(x); } catch (_) { return String(x); } }
+function trimTo(s, n) {
+  const t = String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  return t.length > n ? t.slice(0, n - 1) + '…' : t;
+}
 
 process.on('uncaughtException', (e) => writeLog(`[${STAMP()}] !!! uncaught ${(e && e.stack) || e}`));
 process.on('unhandledRejection', (e) => writeLog(`[${STAMP()}] !!! rejection ${(e && e.stack) || e}`));
@@ -73,6 +77,7 @@ process.on('unhandledRejection', (e) => writeLog(`[${STAMP()}] !!! rejection ${(
 let win = null, tray = null;
 let ignoring = true; // 当前是否穿透
 let dragging = false;
+let chatOpen = false;   // 桌面聊天框开着时不要主动插嘴
 let quitRequested = false;
 let uiRects = [];    // 渲染进程上报的、需要吃鼠标的 UI 矩形
 let consoleToken = '';
@@ -325,6 +330,7 @@ function startProactive() {
     try {
       if (quitRequested || !win || win.isDestroyed() || !win.isVisible()) return;
       if (winDrag || dragging) return;                    // 正在搬她，别插嘴
+      if (chatOpen) return;                               // 正在跟她打字，别插嘴
       if (Date.now() - lastSpeakAt < nextSpeakGap) return;
       const p = pickProactive();
       if (!p) return;
@@ -439,6 +445,48 @@ function hideForGood() {
 }
 function openChat() { showPet(); win?.webContents.send('pet:ui', { t: 'chat' }); }
 function openPath(p) { try { shell.openPath(p); } catch (e) { log('openPath 失败', p, e.message); } }
+
+// 「看一件东西」走内置窗口，不交给系统文件关联（这台机器 .md/.json 默认被 Visual Studio 抢走了）
+let previewWin = null;
+function openPreview(file, title, kind) {
+  const qs = 'file=' + encodeURIComponent(file) + (kind ? '&kind=' + encodeURIComponent(kind) : '');
+  const url = 'app://pet/preview.html?' + qs;
+  try {
+    if (previewWin && !previewWin.isDestroyed()) {
+      previewWin.loadURL(url);
+      if (title) previewWin.setTitle(title);
+      previewWin.show();
+      previewWin.focus();
+      return;
+    }
+    previewWin = new BrowserWindow({
+      width: 780, height: 800, minWidth: 520, minHeight: 420,
+      title: title || '小鲸鱼', backgroundColor: '#1b1f2a', autoHideMenuBar: true, show: false,
+      webPreferences: {
+        preload: path.join(__dirname, 'preload.js'),
+        contextIsolation: true, nodeIntegration: false, sandbox: false,
+      },
+    });
+    previewWin.loadURL(url);
+    previewWin.webContents.on('did-fail-load', (_e, code, desc, u) => log('预览加载失败', code, desc, u));
+    previewWin.webContents.on('did-finish-load', () => log('预览已加载', file));
+    previewWin.webContents.on('console-message', (_e, level, msg) => { if (level >= 2) log('[预览]', msg); });
+    const showIt = () => { if (previewWin && !previewWin.isDestroyed()) { previewWin.show(); previewWin.focus(); } };
+    previewWin.once('ready-to-show', showIt);
+    previewWin.webContents.once('did-finish-load', showIt);
+    previewWin.on('closed', () => { previewWin = null; });
+  } catch (e) { log('openPreview 失败', file, e.message); }
+}
+
+// 想用外部程序看的时候走记事本，别落到 IDE 上
+function openText(p) {
+  try {
+    if (!p || !fs.existsSync(p)) { log('openText 文件不存在', String(p)); return; }
+    spawn('notepad.exe', [p], { detached: true, stdio: 'ignore' }).unref();
+    log('用记事本打开', p);
+  } catch (e) { log('openText 失败', e.message); }
+}
+
 function todayDiary() {
   const d = new Date();
   const p2 = (n) => String(n).padStart(2, '0');
@@ -566,9 +614,9 @@ function popupMenu() {
     {
       label: '她',
       submenu: [
-        { label: '她在干嘛', click: showActivity },
-        { label: '今天的日记', click: () => openPath(todayDiary()) },
-        { label: '长期记忆', click: () => openPath(FACTS_JSON) },
+        { label: st.doing ? `她在干嘛：${trimTo(st.doing, 12)}` : '她在干嘛', click: showActivity },
+        { label: '今天的日记', click: () => openPreview(todayDiary(), '今天的日记', 'diary') },
+        { label: '长期记忆', click: () => openPreview(FACTS_JSON, '长期记忆', 'facts') },
         { type: 'separator' },
         { label: '让她去玩会儿手机', click: () => wakeHer('interval') },
         { label: st.paused ? '恢复她的自主时间' : '暂停她的自主时间', click: () => togglePause() },
@@ -635,6 +683,30 @@ function popupMenu() {
 
 function showActivity() {
   const st = bridgeState || {};
+  let line;
+  if (st.doing) {
+    line = trimTo(st.doing, 22);
+    // 气泡最多两行，doing + 计划拼起来控制在 34 字内，超了只留 doing
+    const plan = trimTo(String(st.plan || '').replace(/^[，,。；;\s]+/, ''), 12);
+    if (plan && plan !== line) {
+      const cand = line + '，等会儿' + plan;
+      if (cand.length <= 34) line = cand;
+    }
+  } else {
+    line = '没记着在干嘛，大概在发呆';
+  }
+  const d = st.doing || '';
+  const face = /睡|困|歇|躺/.test(d) ? 'sleepy'
+    : /刷|玩|游戏|看|听/.test(d) ? 'happy'
+      : /写|学|想|研/.test(d) ? 'determined' : 'smug';
+  send('pet:ui', { t: 'do', word: face });
+  send('pet:ui', { t: 'bubble', text: line, ms: 22000 });
+  log('她在干嘛 →', line);
+  return line;
+}
+
+function showActivityBox() {
+  const st = bridgeState || {};
   const lines = [
     `在干嘛：${st.doing || '（没记）'}`,
     `心里想：${st.note || '—'}`,
@@ -693,6 +765,7 @@ ipcMain.on('pet:log', (_e, msg) => log('[hud]', String(msg).slice(0, 400)));
 ipcMain.on('pet:event', (_e, kind, detail) => {
   // 穿透只由 pet:hit / pet:drag / 光标轮询决定，这里纯记录，避免两套状态互相打架
   if (kind === 'touch' && detail) log('touch', detail.kind ?? '', detail.x ?? '');
+  else if (kind === 'chatOpen') { chatOpen = !!detail; return; }
   else if (kind === 'mode') log('mode', detail?.mode ?? '');
 });
 
@@ -739,6 +812,18 @@ ipcMain.on('pet:ui-rects', (_e, rects) => {
   uiRects = (Array.isArray(rects) ? rects : [])
     .filter((r) => r && Number.isFinite(r.x0) && Number.isFinite(r.y0) && Number.isFinite(r.x1) && Number.isFinite(r.y1))
     .slice(0, 8);
+});
+
+ipcMain.handle('pet:read-text', (_e, p) => {
+  try {
+    const abs = path.resolve(String(p || ''));
+    const st = fs.statSync(abs);
+    if (!st.isFile()) return { ok: false, error: '不是一个文件' };
+    if (st.size > 2 * 1024 * 1024) return { ok: false, error: '文件太大 ' + (st.size / 1048576).toFixed(1) + 'MB' };
+    return { ok: true, path: abs, name: path.basename(abs), bytes: st.size, text: fs.readFileSync(abs, 'utf8') };
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
 });
 
 ipcMain.handle('pet:config', () => ({
@@ -790,6 +875,13 @@ ipcMain.handle('pet:action', async (_e, name, arg) => {
       log('手动开口:', p.text);
       return { ok: true, text: p.text, face: p.face };
     }
+    case 'openText': openText(typeof arg === 'string' ? arg : ''); return { ok: true };
+    case 'openPreview': {
+      const f = arg && arg.file;
+      if (typeof f !== 'string' || !f) return { ok: false, error: 'no file' };
+      openPreview(f, arg.title, arg.kind);
+      return { ok: true };
+    }
     case 'scheme':
       if (typeof arg === 'string') {
         writePetState({ skin: arg });
@@ -816,6 +908,21 @@ if (!app.requestSingleInstanceLock()) {
     startBridgePolling();
     if (process.env.PET_DEBUG_CURSOR) {
       setTimeout(() => { moveToCursor(); log('debug: 窗口已挪到光标处'); }, 3000);
+    }
+    if (process.env.PET_TEST_ACT === 'activity') {
+      setTimeout(() => { log('debug: 试一次「她在干嘛」'); showActivity(); }, 4000);
+    }
+    if (process.env.PET_TEST_PREVIEW) {
+      // 调试用：验证内置预览窗（diary=日记 / facts=长期记忆）
+      setTimeout(() => {
+        if (process.env.PET_TEST_PREVIEW === 'facts') {
+          log('debug: 打开长期记忆预览');
+          openPreview(FACTS_JSON, '长期记忆', 'facts');
+        } else {
+          log('debug: 打开日记预览');
+          openPreview(todayDiary(), '今天的日记', 'diary');
+        }
+      }, 5000);
     }
     if (process.env.PET_TEST_SCHEME) {
       // 调试用：验证运行时换配色这条路（菜单走的是同一个 pet:ui scheme）
