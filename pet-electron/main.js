@@ -197,8 +197,11 @@ function startHitPolling() {
     const lx = c.x - b.x, ly = c.y - b.y;
     const near = lx > -HOVER_PAD && ly > -HOVER_PAD && lx < b.width + HOVER_PAD && ly < b.height + HOVER_PAD;
     if (near !== hoverIn) {
+      const wasIn = hoverIn;
       hoverIn = near;
       send('pet:hover', near);
+      // 只有「本来在窗口里、现在走了」才收聊天框；从托盘叫出来的那一刻不算
+      if (!near && wasIn === true) send('pet:ui', { t: 'blur' });
       log('悬停 →', near);
     }
 
@@ -277,38 +280,38 @@ function trayImage() {
 
 function buildTray() {
   tray = new Tray(trayImage());
-  tray.setToolTip('小鲸鱼');
+  tray.setToolTip('小鲸鱼（右键我，随时叫她出来）');
   const menu = Menu.buildFromTemplate([
     { label: '显示小鲸鱼', click: () => showPet() },
     { label: '跟她说句话', click: () => openChat() },
     { type: 'separator' },
-    { label: '藏起来（10 秒）', click: () => hideForAWhile() },
-    { label: '挪到鼠标这边', click: moveToCursor },
-    { label: '重载立绘', click: () => win?.webContents.reload() },
+    { label: '藏起来（要她出现就右键这里）', click: () => hideForGood() },
     { type: 'separator' },
     { label: '打开日志', click: () => openPath(APP_LOG) },
     { label: '退出', click: () => { quitRequested = true; app.quit(); } },
   ]);
   tray.setContextMenu(menu);
   tray.on('double-click', () => showPet());
+  tray.on('click', () => showPet());
 }
 
 function showPet() {
-  if (!win) return;
-  win.show();
-  win.setAlwaysOnTop(true, 'floating');
+  if (!win || win.isDestroyed()) return;
+  clearTimeout(hideTimer);
+  if (!win.isVisible()) win.show();
+  hoverIn = null; // 强制下一轮重推悬停，按钮才会浮出来
 }
 function moveToCursor() {
-  if (!win) return;
+  if (!win || win.isDestroyed()) return;
   const c = screen.getCursorScreenPoint();
   win.setPosition(Math.round(c.x - SIZE / 2), Math.round(c.y - SIZE / 2));
 }
 let hideTimer = null;
-function hideForAWhile(ms = 10000) {
-  if (!win) return;
-  win.hide();
+function hideForGood() {
+  if (!win || win.isDestroyed()) return;
   clearTimeout(hideTimer);
-  hideTimer = setTimeout(() => { if (!quitRequested) showPet(); }, ms);
+  win.hide();
+  log('藏进托盘（托盘右键 → 显示小鲸鱼）');
 }
 function openChat() { showPet(); win?.webContents.send('pet:ui', { t: 'chat' }); }
 function openPath(p) { try { shell.openPath(p); } catch (e) { log('openPath 失败', p, e.message); } }
@@ -358,6 +361,7 @@ function clock(ms) {
 }
 
 let pollRound = 0;
+let pollBusy = false;
 async function pollBridge() {
   const s = {
     at: Date.now(), paused: null, mood: '', affinity: null,
@@ -413,7 +417,14 @@ function startBridgePolling() {
   if (bridgeTimer) return;
   readToken();
   pollBridge().catch((e) => log('首次轮询失败', e.message));
-  bridgeTimer = setInterval(() => { pollBridge().catch((e) => log('轮询失败', e.message)); }, 2000);
+  // 防重入：桥卡住时上一次还没回来就别再发，免得请求越堆越多
+  bridgeTimer = setInterval(() => {
+    if (pollBusy) return;
+    pollBusy = true;
+    pollBridge()
+      .catch((e) => log('轮询失败', e.message))
+      .finally(() => { pollBusy = false; });
+  }, 2000);
   log('桥轮询已启动（2s）');
 }
 
@@ -452,8 +463,7 @@ function popupMenu() {
           ],
         },
         { type: 'separator' },
-        { label: '重新加载立绘', click: () => win?.webContents.reload() },
-        { label: '藏起来（10 秒）', click: () => hideForAWhile() },
+        { label: '藏起来（托盘里叫她出来）', click: () => hideForGood() },
       ],
     },
     {
@@ -479,7 +489,6 @@ function popupMenu() {
             log('置顶 =', !!mi.checked);
           },
         },
-        { label: '挪到鼠标这边', click: moveToCursor },
         { label: '退出', click: () => { quitRequested = true; app.quit(); } },
       ],
     },
@@ -573,10 +582,20 @@ ipcMain.on('pet:win-drag-start', () => {
 ipcMain.on('pet:win-drag-end', () => {
   if (!win || win.isDestroyed() || !winDrag) { winDrag = null; return; }
   winDrag = null;
+  // 别把窗口扔到屏幕外面去（拖太远、拔显示器、改分辨率都会出现这种情况）
   const b = win.getBounds();
-  writePetState({ left: b.x, top: b.y });
+  const wa = screen.getDisplayMatching(b).workArea;
+  const visible =
+    b.x < wa.x + wa.width - 40 && b.x + b.width > wa.x + 40 &&
+    b.y < wa.y + wa.height - 60 && b.y + b.height > wa.y + 40;
+  if (!visible) {
+    win.setPosition(Math.round(wa.x + wa.width - SIZE - 24), Math.round(wa.y + wa.height - SIZE - 8));
+    log('位置落在屏幕外，拉回右下角');
+  }
+  const nb = win.getBounds();
+  writePetState({ left: nb.x, top: nb.y });
   hoverIn = null; // 强制下一轮重推 hover
-  log('拖窗结束', b.x, b.y);
+  log('拖窗结束', nb.x, nb.y);
 });
 
 ipcMain.on('pet:ui-rects', (_e, rects) => {
@@ -619,7 +638,7 @@ ipcMain.handle('pet:action', async (_e, name, arg) => {
   switch (name) {
     case 'menu': popupMenu(); return { ok: true };
     case 'reload': win?.webContents.reload(); return { ok: true };
-    case 'hide': hideForAWhile(Number(arg) || 10000); return { ok: true };
+    case 'hide': hideForGood(); return { ok: true };
     case 'quit': quitRequested = true; app.quit(); return { ok: true };
     case 'move': moveToCursor(); return { ok: true };
     case 'wake': return await wakeHer(typeof arg === 'string' ? arg : 'interval');

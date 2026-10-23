@@ -219,15 +219,16 @@ function renderDots() {
 
 function applyState(s) {
   const prevAt = state.lastLineAt || 0;
+  const prevMood = state.mood, prevPaused = state.paused;
   state = { ...state, ...s };
   // 她回了新的 → 立刻撤掉「她想一下…」，别让占位干等 60 秒
   if (s.lastLineAt && s.lastLineAt > prevAt) pendingUntil = 0;
   renderBubble();
   renderDots();
-  // 心情 → 表情（她心情好就笑）
+  // 只在真的变了才做动作，否则每 2 秒推一次会把她按在床上反复睡
   try {
-    if (s.mood === 'happy') api?.do('happy');
-    else if (s.paused === true) api?.do('sleep');
+    if (s.paused === true && prevPaused !== true) api?.do('sleep');
+    else if (s.mood === 'happy' && prevMood !== 'happy') api?.do('happy');
   } catch (_) {}
 }
 
@@ -267,6 +268,14 @@ function closeChat() {
   pushUiRects();
   renderBubble();
 }
+function toggleChat() { if (chat.classList.contains('on')) closeChat(); else openChat(); }
+
+// 点聊天框以外的地方（窗口内）就收起来；窗口外靠主进程的 pet:ui{blur} 和窗口 blur
+document.addEventListener('mousedown', (e) => {
+  if (!chat.classList.contains('on')) return;
+  if (e.target.closest && (e.target.closest('#chat') || e.target.closest('#btns'))) return;
+  closeChat();
+}, true);
 
 async function sendChat() {
   const text = chatIn.value.trim();
@@ -301,7 +310,7 @@ document.getElementById('btns').addEventListener('click', async (e) => {
   const b = e.target.closest('button');
   if (!b) return;
   const a = b.dataset.a;
-  if (a === 'chat') { openChat(); return; }
+  if (a === 'chat') { toggleChat(); return; }
   if (a === 'pat') {
     try { api.do('flustered'); } catch (_) {}
     bubbleSticky = '嘿嘿…别摸啦';
@@ -326,6 +335,7 @@ window.pet?.onUi?.((m) => {
   if (m.t === 'do') { try { api?.do(m.word); } catch (e) { say('do 失败', m.word); } }
   else if (m.t === 'seq') playSeq(m.words || []);
   else if (m.t === 'chat') openChat();
+  else if (m.t === 'blur') closeChat();
   else if (m.t === 'bubble') { bubbleSticky = m.text || ''; renderBubble(); setTimeout(() => { bubbleSticky = ''; renderBubble(); }, 4000); }
 });
 
@@ -369,7 +379,8 @@ function finishDrag() {
   moved = false;
 }
 window.addEventListener('mouseup', () => finishDrag());
-window.addEventListener('blur', () => finishDrag());
+window.addEventListener('pointercancel', () => finishDrag());
+window.addEventListener('blur', () => { finishDrag(); closeChat(); });
 
 window.addEventListener('dblclick', (e) => {
   if (inBody(e.clientX, e.clientY)) { e.preventDefault(); openChat(); }
