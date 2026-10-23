@@ -15,8 +15,8 @@
   name: '@deepseek-ai/dsh-persona'
   config:
     # DSH 0.1.5 起 dsh-persona 的字段为 prefix/suffix（旧版为 text）；
-    # {{model}} / {{cwd}} 由 agent loop 注册的提示词变量在每次装配时解析。
-    suffix: Your working directory is {{cwd}}.
+    # 本 preset 没有工作目录概念，suffix 留空（原 {{cwd}} 在 QQ 场景下不可用）。
+    suffix: ""
     prefix: >-
       You are a coding agent powered by the {{model}} model.
 

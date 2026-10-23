@@ -164,6 +164,8 @@ const SAFE_PREFIXES = [
   'mcp__snowluma__',
   'mcp__snowluma-host__',
   'mcp__web-search-safe__',
+  // 本地补：让 QQ 里的 agent 能操作 MuMu 那台安卓（截图/点击/滑动/启停 App）。
+  'mcp__android__',
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，

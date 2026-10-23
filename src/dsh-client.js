@@ -8,6 +8,7 @@
 // 复核记录（DSH 0.1.5-rc.1，逐项实测）：session/{list,create,prompt,selectModel,rename},
 // workspace/{create,rename,archiveSession}, settings/describe, agentPresets/list 的参数形状与
 // 返回结构均与本文件一致；session/prompt 在新版强制要求 requestId（wrapArgs 已自动补）。
+import { WebSocket as WsClient } from 'ws';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -512,7 +513,7 @@ export class NodeApiClient extends AbstractApiClient {
     signal?.throwIfAborted();
     const url = new URL('/api/remote.mux', this.baseUrl);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WebSocket(url, { headers: { cookie: this.cookie } });
+    const socket = new WsClient(url, { headers: { cookie: this.cookie } });
     const streamId = randomUUID();
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -524,7 +525,7 @@ export class NodeApiClient extends AbstractApiClient {
         socket.removeEventListener('message', message);
         socket.removeEventListener('error', failed);
         socket.removeEventListener('close', failed);
-        if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) socket.close();
+        if (socket.readyState === WsClient.CONNECTING || socket.readyState === WsClient.OPEN) socket.close();
         if (error) reject(error); else resolve(items);
       };
       const abort = () => finish(signal.reason);
@@ -689,7 +690,7 @@ export class NodeApiClient extends AbstractApiClient {
     sig.throwIfAborted();
     const url = new URL('/api/remote.mux', this.baseUrl);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WebSocket(url, { headers: { cookie: this.cookie } });
+    const socket = new WsClient(url, { headers: { cookie: this.cookie } });
     const inbox = [];
     let wake;
     let socketOpen = false;
@@ -891,7 +892,7 @@ export class NodeApiClient extends AbstractApiClient {
     const handleError = () => endStream();
     const handleAbort = () => {
       endStream();
-      if (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN) socket.close();
+      if (socket.readyState === WsClient.CONNECTING || socket.readyState === WsClient.OPEN) socket.close();
     };
     socket.addEventListener('open', handleOpen);
     socket.addEventListener('message', handleMessage);

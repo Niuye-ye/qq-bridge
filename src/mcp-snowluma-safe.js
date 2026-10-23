@@ -293,7 +293,37 @@ async function legacyReadToolAllowed() {
   return String(status?.mode ?? '') === 'closed-agent';
 }
 
-const server = new McpServer({ name: 'snowluma-safe', version: '0.2.0-r4' });
+const server = new McpServer({ name: 'snowluma-safe', version: '0.2.1-r1' });
+
+// ── 会话令牌自动补全 ─────────────────────────────────────────────────────────
+//
+// 每个工具原本都要带一个 `token` 参数（描述「会话令牌（见唤醒提示中的【会话令牌】）」），
+// 36 个工具 × 一个 string 参数 ≈ 2k 字符的 schema，每轮都随 prompt 重发；而且模型偶尔
+// 会抄错 / 漏传，直接 401。
+//
+// 令牌本来就存在本地：state/social-v2.json 的 conversations[key].agentToken。所以这里把
+// `token` 从对外 schema 里摘掉，注册期包一层 handler，用 key 现查令牌填进去。
+// 模型不用再管令牌，描述里也就不用再解释令牌。
+const SOCIAL_STATE_PATH = path.join(ROOT, 'state', 'social-v2.json');
+let socialStateCache = { at: 0, data: null };
+function resolveAgentToken(key) {
+  try {
+    const now = Date.now();
+    if (!socialStateCache.data || now - socialStateCache.at > 3000) {
+      socialStateCache = { at: now, data: JSON.parse(fs.readFileSync(SOCIAL_STATE_PATH, 'utf8')) };
+    }
+    const conv = socialStateCache.data?.conversations?.[String(key ?? '')];
+    return String(conv?.agentToken ?? '');
+  } catch {
+    return '';
+  }
+}
+const registerTool = server.tool.bind(server);
+server.tool = (name, description, shape, handler) => {
+  if (shape && typeof shape === 'object') delete shape.token;
+  const wrapped = (args, extra) => handler({ ...args, token: resolveAgentToken(args?.key) }, extra);
+  return registerTool(name, description, shape, wrapped);
+};
 
 // ── 工具开关必须在**注册期**生效，而不是只在校验期 ──────────────────────────
 //
@@ -340,10 +370,17 @@ const TOOL_CONFIG_FLAGS = {
   qq_list_stickers: 'listStickers',
   qq_get_sticker_image: 'getStickerImage',
   qq_send_sticker: 'sendSticker',
+  qq_send_image: 'sendImage',
+  qq_remember: 'remember',
+  qq_recall: 'recall',
+  qq_forget: 'forget',
   qq_collect_sticker: 'collectSticker',
   qq_get_self_image: 'getSelfImage',
   qq_sticker_note: 'stickerNote',
   qq_set_sticker_remark: 'setStickerRemark',
+  qq_send_mood: 'sendQzone',
+  qq_list_moods: 'listQzone',
+  qq_see_screen: 'seeScreen',
 };
 const disabledTools = [];
 {
@@ -376,14 +413,30 @@ server.tool(
 
 server.tool(
   'qq_list_groups',
-  '列出机器人所在的全部 QQ 群（只读）：群号、群名。',
-  {},
-  async () => {
+  '列出机器人所在的全部 QQ 群（只读）：群号、群名。reserved2 模式要传会话 key；封闭 agent（管理员私聊）模式不用。',
+  {
+    key: z.string().optional().describe('会话 key（reserved2 模式必填，用来校验令牌；封闭 agent 模式可省）')
+  },
+  async ({ key }) => {
+    // 二代仿真模式走 v2 路由（带会话令牌）；封闭 agent 模式仍走旧只读通道。
+    if (key && resolveAgentToken(key)) {
+      try {
+        const data = await agentApi('/api/socialV2/groups', {
+          method: 'POST',
+          body: JSON.stringify({ key }),
+          headers: { 'x-agent-token': resolveAgentToken(key) },
+          timeoutMs: 20000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data.groups ?? data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `查询群列表失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
     // 旧只读工具没有 agent token：只允许在封闭 agent（管理员私聊）里使用。
     // 判定失败一律拒绝（fail-closed），不依赖「看到某个模式才拒绝」的黑名单写法。
     try {
       if (!(await legacyReadToolAllowed())) {
-        return { content: [{ type: 'text', text: '旧只读工具仅在封闭 agent（管理员私聊）模式可用；其它模式请使用带会话令牌的 v2 读工具' }], isError: true };
+        return { content: [{ type: 'text', text: 'reserved2 模式下请带上会话 key 调用本工具（令牌由系统自动补），或改用 qq_get_prompt 看当前会话' }], isError: true };
       }
     } catch (error) {
       return { content: [{ type: 'text', text: `无法确认当前模式，拒绝执行：${error?.message ?? error}` }], isError: true };
@@ -458,7 +511,7 @@ server.tool(
 
 server.tool(
   'qq_send_group_message',
-  '向指定 QQ 群发送一条纯文本消息；如需引用某条消息，可传 replyToMessageId（非零整数，可为负数），可先用 qq_get_recent_messages / qq_get_message_detail 查询。二代模式（reserved2）下这是可用的发送工具之一，但优先使用 qq_send_message；reserved2 下调用时必须携带会话令牌 token，否则会被拒绝。不要在发送后输出“已发送”类汇报。目标群必须命中系统白名单（config.json 的 allow.groups），否则拒绝。',
+  '向指定 QQ 群发一条纯文本。优先用 qq_send_message；reserved2 下必须带 token；群号需在白名单内。发送后不要输出“已发送”类汇报。',
   {
     groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
     message: z.string().describe('消息文本，纯文本，不要用 Markdown 或 CQ 码'),
@@ -484,7 +537,7 @@ server.tool(
 
 server.tool(
   'qq_reply',
-  '在指定 QQ 群里引用/回复某条消息，并发送一条文本。适合群消息很多、需要明确“我回的是哪条”时使用；replyToMessageId 是被引用消息的 id（非零整数，QQ 消息 id 可能为负数），可先用 qq_get_recent_messages / qq_get_unread_messages / qq_get_message_detail 查到具体消息内容和 id。发送前桥接会校验该 id 存在且属于当前会话。二代模式下这是你正常可用的引用工具，但不要每条都引用。只有以下情况才需要引用：① 你这条消息指向的人或消息并非最新一条别人的消息（也就是你在回更早的某条）；② 你连续几句话里不同消息指代的是不同的消息或不同的人。其他情况（上下文唯一、刚在接同一条最新消息）不要引用，别让对方猜，也别为了用工具而用。reserved2 下调用时必须携带会话令牌 token。目标群必须命中系统白名单（config.json 的 allow.groups），否则拒绝。',
+  '引用某条消息并回一条文本。只在「回的不是最新那句」或「连发时不同消息指向不同的人」时引用，上下文唯一就不用。id 从读取结果或 qq_get_message_detail 取。reserved2 下必须带 token。',
   {
     groupId: z.union([z.number(), z.string()]).describe('群号（必须在白名单内）'),
     replyToMessageId: z.union([z.number(), z.string()]).describe('被引用/回复的消息 id（非零整数，可为负数）'),
@@ -508,7 +561,7 @@ server.tool(
 
 server.tool(
   'qq_send_private_message',
-  '向指定 QQ 好友发送一条私聊消息。若提供 replyToMessageId，会以 QQ 引用/回复形式发出（引用条 + 文本）。replyToMessageId 必须是非零整数消息 id（QQ 消息 id 可能为负数），可先用 qq_get_message_detail 查询。二代模式（reserved2）下这是可用的发送工具之一，但优先使用 qq_send_message；调用时必须携带会话令牌 token，否则会被拒绝。不要在发送后输出“已发送”类汇报。目标 QQ 必须命中系统白名单（config.json 的 allow.private），否则拒绝。',
+  '向指定 QQ 好友发一条私聊文本；带 replyToMessageId 则引用发出。优先用 qq_send_message；reserved2 下必须带 token；QQ 号需在白名单内。',
   {
     userId: z.union([z.number(), z.string()]).describe('好友 QQ 号（必须在白名单内）'),
     message: z.string().describe('消息文本，纯文本，不要用 Markdown 或 CQ 码'),
@@ -599,7 +652,7 @@ server.tool(
 
 server.tool(
   'qq_mark_read',
-  '将指定会话已查看的未读消息标记为已读。throughSeq 使用最近读取结果的 readThroughSeq，避免清除读取后才到达的新消息；省略 throughSeq 会按旧行为清空当前全部未读，因此推荐始终带上水位。注意：每次设置潜水/下一次唤醒前，桥接要求先用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话可 mark_read 收尾沉睡；期间有人发新消息则先查看 newMessages，判断不需要你参与也可直接 mark_read 收尾；若你参与了回复，则下次想睡需重新等待观察窗口。',
+  '把会话未读标记到 throughSeq（用读取结果里的 readThroughSeq），不会清除之后到达的新消息。潜水/收尾前须先用 qq_wait_for_messages(timeoutMs=300000) 完成沉睡前观察。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -617,28 +670,28 @@ server.tool(
 
 server.tool(
   'qq_set_wake_config',
-  '设置指定会话的二代唤醒配置：mode/无限期或有限时间/提前唤醒条件（@、名字、关键词、提问、拍一拍、概率、anyMessage、指定成员）。triggers.speakerIds 是可选的“指定群友发言唤醒”：填一个或多个群友 QQ 号后，只要其中任意一位在群里发言就会唤醒你；不设置则不启用。适合在等某个人回复、或某人反应慢怕错过时使用。triggers.poke 开启后，群里有人拍一拍（包括拍你或拍别人）会唤醒你。注意：每次设置潜水/下一次唤醒前需先用 qq_wait_for_messages(timeoutMs=300000) 完成一次沉睡前观察：5 分钟内没人说话可设置并沉睡；期间有人发新消息则先查看 newMessages，判断不需要你参与可直接设置并沉睡；若你参与了回复，则下次想睡需重新等待观察窗口。',
+  '设置本会话唤醒：潜水时长/无限期、定时自醒 everyMinutes、触发条件（@/名字/关键词/提问/拍一拍/概率/anyMessage/指定群友）。throughSeq 可顺带标已读。设置前先用 qq_wait_for_messages(timeoutMs=300000) 做沉睡前观察。',
   {
-    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
-    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    throughSeq: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional().describe('可同时确认已读：使用已查看结果中的 readThroughSeq，省去额外 qq_mark_read；不传则只设置唤醒配置。若 markRead 工具被关闭，该水位会被忽略，本工具只设置唤醒配置'),
+    key: z.string().describe('会话 key：group:群号 或 private:QQ号'),
+    throughSeq: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional().describe('顺带确认已读：用已查看结果的 readThroughSeq；不传只设唤醒'),
     config: z.object({
-      mode: z.enum(['diving', 'active']).optional().describe('diving=潜水，active=活跃（anyMessage 开启）'),
-      infinite: z.boolean().optional().describe('true=无限期，只有条件命中才唤醒；false=有限时间'),
-      sleepMs: z.number().optional().describe('有限潜水毫秒数（从当前时间起算）'),
-      sleepUntil: z.string().optional().describe('有限潜水截止时间 ISO 字符串，优先级高于 sleepMs'),
+      mode: z.enum(['diving', 'active']).optional().describe('diving=潜水 / active=活跃'),
+      infinite: z.boolean().optional().describe('true=无限期（只按条件醒）；false=有限时间'),
+      sleepMs: z.number().optional().describe('有限潜水毫秒（从现在起算）'),
+      sleepUntil: z.string().optional().describe('截止时间 ISO，优先于 sleepMs'),
       triggers: z.object({
-        atMention: z.boolean().optional().describe('被 @ 或引用自己时唤醒'),
-        nameMention: z.boolean().optional().describe('被叫名字/昵称时唤醒'),
-        speakerIds: z.array(z.union([z.number(), z.string()])).max(20).optional().describe('指定群友 QQ 号数组：这些群友中任意一位发言时唤醒（可选，最多 20 个，不设置则不启用；私聊不适用，设置会被桥接清除；可从 qq_get_active_members / qq_get_group_members / qq_get_message_detail 的 userId/user_id 获取）'),
-        keywords: z.array(z.string()).optional().describe('出现任意关键词时唤醒'),
-        question: z.boolean().optional().describe('被直接提问/点名挑战时唤醒'),
-        poke: z.boolean().optional().describe('有人拍一拍时唤醒（群聊包括拍你和拍别人，私聊为对方拍你）'),
-        anyMessage: z.boolean().optional().describe('任意新消息都唤醒（活跃模式）'),
-        probability: z.number().optional().describe('普通消息按该概率随机唤醒（0~1）')
+        atMention: z.boolean().optional().describe('@ 或引用自己'),
+        nameMention: z.boolean().optional().describe('被叫名字/昵称'),
+        speakerIds: z.array(z.union([z.number(), z.string()])).max(20).optional().describe('指定群友 QQ 号（≤20），任一发言就醒；私聊不用'),
+        keywords: z.array(z.string()).optional().describe('命中任一关键词'),
+        question: z.boolean().optional().describe('被直接提问/点名'),
+        poke: z.boolean().optional().describe('有人拍一拍（群聊含拍别人）'),
+        anyMessage: z.boolean().optional().describe('任意新消息（活跃模式）'),
+        probability: z.number().optional().describe('普通消息按概率醒（0~1）')
       }).optional(),
-      batchWindowMs: z.number().optional().describe('多条消息合并唤醒窗口（毫秒，>=1000）')
-    }).describe('要设置的唤醒配置，缺省字段保留原值')
+      batchWindowMs: z.number().optional().describe('多条合并窗口（毫秒，≥1000）'),
+      everyMinutes: z.number().optional().describe('定时自醒：每 N 分钟醒一次（5~1440，0=关），醒来带 mood.json + 最近日记')
+    }).describe('缺省字段保留原值')
   },
   async ({ key, token, config, throughSeq }) => {
     try {
@@ -694,7 +747,7 @@ server.tool(
 
 server.tool(
   'qq_send_message',
-  '统一发送工具：可发一条或多条，可引用某条消息，可自定义/按字数计算条间时间差。二代仿真模式专用。注意：字符串=一条消息，数组=多条消息；每个字符串内部不要用空格分隔中文短句，需要多条请用数组元素；每条消息要读起来完整，不要把同一句话拆到两条里。只有以下情况才需要传 replyToMessageId 引用：① 你这条消息指向的人或消息并非最新一条别人的消息（也就是你在回更早的某条）；② 你连续几句话里不同消息指代的是不同的消息或不同的人。其他情况（上下文唯一、刚在接同一条最新消息）不要引用，别让对方猜，也别为了用工具而用。',
+  '统一发送工具（二代专用）：字符串=一条，数组=分多条；每条要读起来完整，别把一句话拆两条。只在回的不是最新那句、或不同消息指向不同人时才传 replyToMessageId。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -741,7 +794,7 @@ server.tool(
 if (cfg.socialV2?.tools?.sendPoke !== false) {
   server.tool(
     'qq_send_poke',
-    '发送 QQ 拍一拍（群聊/私聊）。适合用“戳一下”代替一句废话、提醒对方、自然回应别人的拍一拍，或偶尔主动戳一下正在聊的人/熟人——这样更拟真；但别频繁，真人不会一直戳人。群聊必须传 targetUserId（要拍的群友 QQ 号，可从 qq_get_active_members / qq_get_message_detail 的 userId 获取）；私聊可不传 targetUserId（默认拍当前私聊对象）。reserved2 下必须携带会话令牌 token，发送会受桥接白名单与发送频率限制。',
+    '发 QQ 拍一拍。适合代替一句废话、提醒、回应别人的拍；别频繁。群聊必传 targetUserId，私聊可省。reserved2 下必须带 token。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
@@ -765,12 +818,12 @@ if (cfg.socialV2?.tools?.sendPoke !== false) {
 
 server.tool(
   'qq_wait_for_messages',
-  '等待分两种用途。首答前已读消息、只想确认有没有补充：用 purpose="reply"，按最后来信时间补足 quietMs 静默，已安静足够就立即返回；读取/思考时新到的消息也会返回，新消息重算静默。timeoutMs 是最长预算，不要求等满；预算到但 quiet=false 不代表对方已说完。此用途绝不代替沉睡前观察。等对方继续说、等回复或睡前观察：用默认 purpose="messages"；先等新消息，收到后才按 quietMs 等静默，没有新消息会等到 timeoutMs，单传 quietMs 不会缩短总等待。静默下限由后台配置，默认 10000ms。直接看 newMessages、unreadCount 和 readThroughSeq，返回消息无需重复查询；仍有未展示未读才补读。决定潜水/收尾时才用默认用途加 timeoutMs=300000 完成沉睡前观察，不能把 5 分钟观察放在首答之前；短等待不能代替。全程无人说话返回 preSleepWaitSatisfied=true；观察期间来了新消息返回 preSleepWaitObserved=true，读后不需参与可收尾，参与回复则下次收尾重新观察。preSleepWaitRemainingMs 仅供准备收尾时参考。',
+  '等消息。purpose="reply"=回复前短静默（不算沉睡前观察）；默认 messages=等新消息再等静默，没消息可等到 timeoutMs。收尾潜水必须用默认用途 + timeoutMs=300000 完成沉睡前观察。返回里的 newMessages / unreadCount / readThroughSeq 可直接用；无人说话时 preSleepWaitSatisfied=true。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
     token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-    purpose: z.enum(['messages', 'reply']).optional().describe('默认 messages：等新消息/回复/睡前观察；reply：回复前短静默，计入最后来信后已过去的时间，绝不授予睡前观察资格'),
-    timeoutMs: z.number().optional().describe('等待预算毫秒数，默认 30000、最大 600000；reply 达到静默即返回，不必等满；沉睡前观察用 messages 并传 300000'),
+    purpose: z.enum(['messages', 'reply']).optional().describe('默认 messages（等消息/睡前观察）；reply（回复前短静默，不算睡前观察）'),
+    timeoutMs: z.number().optional().describe('预算毫秒，默认 30000、上限 600000；睡前观察用 messages + 300000'),
     minNewMessages: z.number().optional().describe('仅 messages 用途：至少等到多少条新消息才进入静默窗口，默认 1；reply 用途会忽略它'),
     quietMs: z.number().optional().describe('静默窗口毫秒数，建议 10000~12000；reply 从最后来信开始计时，messages 只在等到新消息后计时；后台默认至少 10000')
   },
@@ -870,18 +923,17 @@ server.tool(
 
 server.tool(
   'qq_memory_append',
-  '记录一条轻量记忆：activeTopic=进行中的话题；pendingThought=你想说但还没说的话；memberImpression=对某位群友的印象。记忆会持久化，并在后续唤醒/qq_get_prompt 中自动出现。',
+  '记录一条轻量记忆：activeTopic=进行中的话题；pendingThought=想说但还没说的话；memberImpression=对群友的印象。会持久化，后续唤醒时自动出现。',
   {
-    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
-    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    key: z.string().describe('会话 key：group:群号 或 private:QQ号'),
     category: z.enum(['activeTopic', 'pendingThought', 'memberImpression']).describe('记忆类别'),
-    content: z.string().describe('记忆内容，例如话题、想说的话、对某人的印象标签'),
+    content: z.string().describe('记忆内容：话题 / 想说的话 / 印象标签'),
     extra: z.object({
-      target: z.string().optional().describe('memberImpression 时的群友名字/昵称'),
-      participants: z.array(z.string()).optional().describe('activeTopic 的参与者列表'),
-      pendingQuestion: z.string().optional().describe('activeTopic 里还没问出口的问题'),
-      motivation: z.string().optional().describe('pendingThought 的动机，如 curiosity/sociability'),
-      expiresAtMs: z.number().optional().describe('pendingThought 过期毫秒数，默认 2 小时')
+      target: z.string().optional().describe('memberImpression：群友名字'),
+      participants: z.array(z.string()).optional().describe('activeTopic：参与者'),
+      pendingQuestion: z.string().optional().describe('activeTopic：还没问出口的问题'),
+      motivation: z.string().optional().describe('pendingThought：动机，如 curiosity/sociability'),
+      expiresAtMs: z.number().optional().describe('pendingThought：过期毫秒，默认 2 小时')
     }).optional().describe('附加信息')
   },
   async ({ key, token, category, content, extra }) => {
@@ -1113,21 +1165,236 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      stickerId: z.string().describe('表情标识：emoji_id / md5 / 图片 URL（来自 qq_list_stickers）'),
+      stickerId: z.string().optional().describe('表情标识：emoji_id / md5 / 图片 URL（来自 qq_list_stickers）。也可以不给，改用 query 按分类挑一张'),
+      query: z.string().optional().describe('按分类/关键词挑表情（例如"笑死""阴阳怪气""看热闹""无语"）。按表情的备注、标签、用法匹配，命中同分时随机取一张；stickerId 和 query 至少给一个'),
       replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
       atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中可选，私聊不可用）')
     },
-    async ({ key, token, stickerId, replyToMessageId, atUserId }) => {
+    async ({ key, token, stickerId, query, replyToMessageId, atUserId }) => {
       try {
         const data = await agentApi('/api/socialV2/send-sticker', {
           method: 'POST',
-          body: JSON.stringify({ key, stickerId: String(stickerId), replyToMessageId, atUserId: atUserId ?? null }),
+          body: JSON.stringify({ key, stickerId: stickerId ? String(stickerId) : '', query: query ?? '', replyToMessageId, atUserId: atUserId ?? null }),
           headers: { 'x-agent-token': token },
           timeoutMs: 300000
         });
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `发送表情失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+// ── 发普通图片（照片 / 截图 / 自画像） ───────────────────────────────────────
+if (cfg.socialV2?.image?.enabled !== false && cfg.socialV2?.tools?.sendImage !== false) {
+  server.tool(
+    'qq_send_image',
+    '在指定会话发一张普通图片（照片、截图、你自己的形象图），跟表情包不是一回事（表情包用 qq_send_sticker）。三种来源任选：① path 传 qq-bridge 目录下的图片相对路径，例如 assets/deepseek娘.png、diary/x.png；② url 传网络图片地址；③ screenshot: true 现拍一张模拟器当前屏幕发过去。图片本身不带文字；想说的话先单独发一条。真人发图前会说一句、发完可能补一句，别连着甩好几张。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      path: z.string().optional().describe('qq-bridge 下的图片路径，如 assets/deepseek娘.png（只允许 assets/ diary/ state/ memory/ 里的 png/jpg/jpeg/gif/webp/bmp）'),
+      url: z.string().optional().describe('网络图片地址（http/https）'),
+      screenshot: z.boolean().optional().describe('传 true 就现拍一张模拟器（MuMu）当前屏幕发过去，不用给 path/url'),
+      replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
+      atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中可选，私聊不可用）')
+    },
+    async ({ key, token, path: imgPath, url: imgUrl, screenshot, replyToMessageId, atUserId }) => {
+      try {
+        const data = await agentApi('/api/socialV2/send-image', {
+          method: 'POST',
+          body: JSON.stringify({
+            key,
+            path: imgPath ? String(imgPath) : '',
+            url: imgUrl ? String(imgUrl) : '',
+            screenshot: screenshot === true,
+            replyToMessageId,
+            atUserId: atUserId ?? null
+          }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 120000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发送图片失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+// ── QQ 空间（说说） ──────────────────────────────────────────────────────────
+if (cfg.socialV2?.qzone?.enabled !== false && cfg.socialV2?.tools?.sendQzone !== false) {
+  server.tool(
+    'qq_send_mood',
+    '发一条 QQ 空间说说（发动态）。日常碎碎念、突然想到的事、心情低谷时的独白都可以发；不是任务汇报，也别每天硬凑。有每日条数上限，超了会被拒（返回里带 usedToday / maxPerDay）。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号（说说发在你自己空间，这里只用来校验令牌）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      content: z.string().describe('说说正文（纯文本，最多 1000 字）'),
+      images: z.array(z.string()).optional().describe('配图地址数组（http(s):// 或 file://），可选'),
+      ugc_right: z.number().optional().describe('可见范围：1=所有人（默认）4=好友 16=部分好友可见 64=仅自己可见 128=部分好友不可见'),
+      targetUins: z.array(z.string()).optional().describe('ugc_right 为 16/128 时的目标 QQ 号数组')
+    },
+    async ({ key, token, content, images, ugc_right, targetUins }) => {
+      try {
+        const data = await agentApi('/api/socialV2/send-qzone', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, content, images, ugc_right, targetUins }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发说说失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.setActivity !== false) {
+  server.tool(
+    'qq_set_activity',
+    '记下你「现在在干嘛」：干嘛、心里想着什么、接下来打算干嘛。定时自醒时会读出来，让你接着上一件事继续。只传想改的字段。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      doing: z.string().optional().describe('在干什么，比如「刷小黑盒」「看B站」「发呆」'),
+      note: z.string().optional().describe('心里想着什么，比如「刚看到个离谱帖子」'),
+      plan: z.string().optional().describe('接下来打算干嘛，比如「再刷十分钟去吃饭」')
+    },
+    async ({ key, token, doing, note, plan }) => {
+      try {
+        const data = await agentApi('/api/socialV2/now', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, doing, note, plan }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 15000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `记活动失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.getActivity !== false) {
+  server.tool(
+    'qq_get_activity',
+    '看你上次记的「现在在干嘛」（不传任何字段就是读）。',
+    { key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号') },
+    async ({ key, token }) => {
+      try {
+        const data = await agentApi('/api/socialV2/now', {
+          method: 'POST',
+          body: JSON.stringify({ key, token }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 15000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `读活动状态失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.remember !== false) {
+  server.tool(
+    'qq_remember',
+    '记一件事到长期记忆。每轮会自动带出几条，不用主动查。tier=long 永不淡忘（画像/喜好/约定），tier=normal 会变淡（事件/见闻，半衰期 30 天）。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      text: z.string().describe('记什么，一句话，比如「YG 讨厌被叫主人」「说好了明天聊那个游戏」'),
+      kind: z.enum(['fact', 'pref', 'event', 'promise']).optional().describe('fact=事实 pref=喜好 event=见闻 promise=约定'),
+      tier: z.enum(['long', 'normal']).optional().describe('long=永不淡忘 normal=会变淡（默认 normal）')
+    },
+    async ({ key, token, text, kind, tier }) => {
+      try {
+        const data = await agentApi('/api/socialV2/facts', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, action: 'add', text, kind, tier }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 15000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `记记忆失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.recall !== false) {
+  server.tool(
+    'qq_recall',
+    '翻长期记忆。不传 query 就是按重要度列出来；传了就在记忆文本里搜。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      query: z.string().optional().describe('搜索词，比如「游戏」「吃饭」'),
+      limit: z.number().optional().describe('最多几条，默认 20，上限 60')
+    },
+    async ({ key, token, query, limit }) => {
+      try {
+        const data = await agentApi('/api/socialV2/facts', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, action: 'list', query, limit }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 15000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `翻记忆失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.forget !== false) {
+  server.tool(
+    'qq_forget',
+    '删掉记错/过期的记忆。给 id 或原文里的关键词都行。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      remove: z.string().describe('要删的记忆 id，或原文里的关键词')
+    },
+    async ({ key, token, remove }) => {
+      try {
+        const data = await agentApi('/api/socialV2/facts', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, action: 'remove', remove }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 15000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `删记忆失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.qzone?.enabled !== false && cfg.socialV2?.tools?.listQzone !== false) {
+  server.tool(
+    'qq_list_moods',
+    '看看自己最近在 QQ 空间发过哪些说说（含今天已发条数）。发之前不确定会不会重复，或者想知道上次什么时候发的，先看这个。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号（只用来校验令牌）'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      page_num: z.number().optional().describe('第几页，从 1 开始'),
+      count: z.number().optional().describe('每页条数（1~50，默认 10）')
+    },
+    async ({ key, token, page_num, count }) => {
+      try {
+        const data = await agentApi('/api/socialV2/qzone-list', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, page_num, count }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 30000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `拉说说列表失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );
@@ -1240,6 +1507,36 @@ if (cfg.socialV2?.tools?.getSelfImage !== false) {
       }
     }
   );
+
+server.tool(
+  'qq_see_screen',
+  '看一眼模拟器现在的屏幕，返回真正的画面（图片会直接进入你的视觉上下文，你能看见）。刷 feed、看视频、玩游戏、任何需要知道「屏幕现在长什么样」的时候都用它。**不要再用 mcp__android__screenshot** —— 那个只返回一段文字字符串，你看不见画面，会误判成白屏。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号')
+  },
+  async ({ key, token }) => {
+    try {
+      const data = await agentApi('/api/socialV2/screen', {
+        method: 'POST',
+        body: JSON.stringify({ key, token }),
+        headers: { 'x-agent-token': token },
+        timeoutMs: 60000
+      });
+      if (!data?.data) {
+        return { content: [{ type: 'text', text: `看屏幕失败：${errorText(data?.error, '没拿到画面')}` }], isError: true };
+      }
+      return {
+        content: [
+          { type: 'text', text: `模拟器当前屏幕（约 ${Math.round((data.bytes || 0) / 1024)} KB）` },
+          { type: 'image', mimeType: data.mimeType || 'image/png', data: data.data }
+        ]
+      };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `看屏幕失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
 }
 
 if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.stickerNote !== false) {
@@ -1369,5 +1666,136 @@ if (cfg.socialV2?.tools?.getForwardMsg !== false) {
     }
   );
 }
+
+// ===== 日记与心情：受限文件工具 =====
+// QQ 里的 agent 需要落盘的长记忆（日记、心情状态）。DSH 自带的 read/write/edit
+// 在 QQ preset 里被 qq-tool-restrict 隐藏（仿真会话不得有本地文件能力），
+// 所以这里给一套只认两个根目录的窄工具：
+//   diary/ → <repo>/diary     （日记，按日期命名，每条带 tier）
+//   state/ → <repo>/state     （mood.json 等状态）
+// 路径必须落在根目录内（拒绝 .. 与绝对路径），单次读写有大小上限。
+const DIARY_ROOT = path.join(ROOT, 'diary');
+const STATE_ROOT = path.join(ROOT, 'state');
+const MEMORY_ROOT = path.join(ROOT, 'memory');
+const FS_ROOTS = { diary: DIARY_ROOT, state: STATE_ROOT, memory: MEMORY_ROOT };
+const FS_ROOT_NAMES = Object.keys(FS_ROOTS);
+const FS_ROOT_RE = new RegExp(`^(${FS_ROOT_NAMES.join('|')})/`);
+const FS_HINT = `${FS_ROOT_NAMES.join('/')} 之一`;
+const FS_MAX_READ_BYTES = 256 * 1024;
+const FS_MAX_WRITE_BYTES = 512 * 1024;
+
+// 允许三种写法：
+//   1) diary/2026-10-22.md（推荐，短）
+//   2) D:\qq-bridge\diary\2026-10-22.md（模型照抄用户给的绝对路径也不会写飞）
+//   3) 2026-10-22.md（没前缀就当日记，落 diary/）
+function resolveFsPath(rawPath) {
+  const raw = String(rawPath ?? '').trim().replace(/\\/g, '/');
+  if (!raw) throw new Error(`path 不能为空：写 diary/2026-10-22.md、memory/2026-10-22.md 或 state/mood.json`);
+  let rel0 = raw;
+  if (/^[a-zA-Z]:\//.test(raw) || raw.startsWith('//') || raw.startsWith('/')) {
+    const abs = path.resolve(raw);
+    const relToRoot = path.relative(ROOT, abs);
+    if (!relToRoot || relToRoot.startsWith('..') || path.isAbsolute(relToRoot)) {
+      throw new Error(`path 越界：只能读写 D:/qq-bridge/ 下的 ${FS_HINT}（收到 ${raw}）`);
+    }
+    rel0 = relToRoot.split(path.sep).join('/');
+  }
+  rel0 = rel0.replace(/^\.\//, '');
+  const withRoot = FS_ROOT_RE.test(rel0) ? rel0 : `diary/${rel0}`;
+  const segs = withRoot.split('/').filter((s) => s && s !== '.');
+  if (segs.some((s) => s === '..')) throw new Error('path 不允许包含 ..');
+  const rootName = segs[0];
+  const root = FS_ROOTS[rootName];
+  if (!root) throw new Error(`path 必须以 ${FS_HINT} 开头`);
+  const abs = path.resolve(root, ...segs.slice(1));
+  const rel = path.relative(root, abs);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) throw new Error(`path 越界：只能读写 ${FS_HINT} 里的文件`);
+  return { abs, label: `${rootName}/${rel.split(path.sep).join('/')}` };
+}
+
+server.tool(
+  'qq_read_file',
+  '读 diary/、memory/ 或 state/ 下的文本文件（如 state/mood.json、diary/2026-10-22.md）。绝对路径 D:/qq-bridge/... 也认。可选 tailLines 只读末尾 N 行（长日记省 token）。',
+  { path: z.string(), tailLines: z.number().int().positive().max(2000).optional() },
+  async ({ path: rawPath, tailLines }) => {
+    try {
+      const { abs, label } = resolveFsPath(rawPath);
+      if (!fs.existsSync(abs)) return { content: [{ type: 'text', text: `${label} 还不存在` }] };
+      const st = fs.statSync(abs);
+      if (st.isDirectory()) return { content: [{ type: 'text', text: `${label} 是目录，用 qq_list_files 列内容` }], isError: true };
+      if (st.size > FS_MAX_READ_BYTES) return { content: [{ type: 'text', text: `${label} 太大（${st.size} 字节，上限 ${FS_MAX_READ_BYTES}）；用 tailLines 读末尾` }], isError: true };
+      let text = fs.readFileSync(abs, 'utf8');
+      if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+      if (Number.isFinite(tailLines) && tailLines > 0) {
+        const lines = text.split('\n');
+        text = lines.slice(Math.max(0, lines.length - tailLines)).join('\n');
+      }
+      return { content: [{ type: 'text', text: text || `（${label} 是空文件）` }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `读取失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_write_file',
+  '覆盖写 diary/、memory/ 或 state/ 下的文本文件（自动建父目录，绝对路径也认）。要往末尾加内容请用 qq_append_file。',
+  { path: z.string(), content: z.string() },
+  async ({ path: rawPath, content }) => {
+    try {
+      const { abs, label } = resolveFsPath(rawPath);
+      const buf = Buffer.from(String(content ?? ''), 'utf8');
+      if (buf.length > FS_MAX_WRITE_BYTES) return { content: [{ type: 'text', text: `内容太大（${buf.length} 字节，上限 ${FS_MAX_WRITE_BYTES}）` }], isError: true };
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.writeFileSync(abs, buf);
+      return { content: [{ type: 'text', text: `已写入 ${label}（${buf.length} 字节）` }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `写入失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_append_file',
+  '追加到 diary/、memory/ 或 state/ 下的文件末尾（不存在则新建）。写日记建议用它，一条一个块。',
+  { path: z.string(), content: z.string() },
+  async ({ path: rawPath, content }) => {
+    try {
+      const { abs, label } = resolveFsPath(rawPath);
+      const buf = Buffer.from(String(content ?? ''), 'utf8');
+      if (buf.length > FS_MAX_WRITE_BYTES) return { content: [{ type: 'text', text: `内容太大（${buf.length} 字节，上限 ${FS_MAX_WRITE_BYTES}）` }], isError: true };
+      fs.mkdirSync(path.dirname(abs), { recursive: true });
+      fs.appendFileSync(abs, buf);
+      const size = fs.statSync(abs).size;
+      return { content: [{ type: 'text', text: `已追加到 ${label}（本次 ${buf.length} 字节，现共 ${size} 字节）` }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `追加失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_list_files',
+  '列出 diary/、memory/ 或 state/ 里的文件（名字、大小、修改时间）。按 tier 清理旧日记时先用它看有哪些文件。',
+  { root: z.enum(['diary', 'memory', 'state']).optional() },
+  async ({ root }) => {
+    try {
+      const name = FS_ROOTS[root] ? root : 'diary';
+      const dir = FS_ROOTS[name];
+      if (!fs.existsSync(dir)) return { content: [{ type: 'text', text: `${name}/ 目录不存在` }] };
+      const rows = fs.readdirSync(dir).map((f) => {
+        const abs = path.join(dir, f);
+        const st = fs.statSync(abs);
+        return { name: f, bytes: st.size, mtime: new Date(st.mtimeMs).toISOString(), isDir: st.isDirectory() };
+      }).sort((a, b) => a.name.localeCompare(b.name));
+      const text = rows.length
+        ? rows.map((r) => `${r.isDir ? '[dir] ' : ''}${name}/${r.name}\t${r.bytes}B\t${r.mtime}`).join('\n')
+        : `（${name}/ 是空的）`;
+      return { content: [{ type: 'text', text }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `列目录失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
 
 await server.connect(new StdioServerTransport());

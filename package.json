@@ -44,6 +44,7 @@
     "test:dsh-inbox": "node scripts/test-dsh-inbox-projection.mjs",
     "test:session-retire:e2e": "node scripts/test-dsh-session-retire.mjs",
     "verify:persona": "node scripts/verify-persona-config.mjs",
+    "check:role-tools": "node scripts/check-role-tools.mjs",
     "test:mcp-servers": "node scripts/test-mcp-servers-stdio.mjs",
     "test:plugin": "node scripts/test-qq-mode-plugin.mjs",
     "test:setup-idempotent": "node scripts/test-setup-dsh-idempotent.mjs",
@@ -66,6 +67,7 @@
     "@snowluma/mcp": "^1.14.20",
     "@snowluma/sdk": "^1.14.20",
     "js-yaml": "^4.3.2",
+    "ws": "^8.22.0",
     "zod": "^4.4.3"
   }
 }

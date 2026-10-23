@@ -1,0 +1,22 @@
+{
+  "_说明": "动作 → 工具映射。人格卡里只说『做了什么动作』，工具名以这里为准；scripts/check-role-tools.mjs 会拿真实的 tools/list 来校验这张表。required 里写的是该工具必须给的业务参数（token 由 MCP 层自动补，不用写）。",
+  "version": 2,
+  "actions": {
+    "说话（可一次多条）": { "tool": "qq_send_message", "required": ["key", "messages"] },
+    "引用回复某条": { "tool": "qq_reply", "required": ["replyToMessageId", "message"] },
+    "发表情（填分类或 id）": { "tool": "qq_send_sticker", "required": ["query"] },
+    "看自己有哪些表情": { "tool": "qq_list_stickers", "required": [] },
+    "发自己的形象图/自拍": { "tool": "qq_send_image", "required": ["path"] },
+    "截当前的屏幕发过去": { "tool": "qq_send_image", "required": ["screenshot"] },
+    "发网络图片": { "tool": "qq_send_image", "required": ["url"] },
+    "改表情的官方备注": { "tool": "qq_set_sticker_remark", "required": ["stickerId", "remark"] },
+    "拍一拍": { "tool": "qq_send_poke", "required": [] },
+    "发说说（QQ 空间）": { "tool": "qq_send_mood", "required": ["content"] },
+    "看已发的说说": { "tool": "qq_list_moods", "required": [] },
+    "写/追加日记": { "tool": "qq_append_file", "required": ["path", "content"] },
+    "读日记": { "tool": "qq_read_file", "required": ["path"] },
+    "列日记文件": { "tool": "qq_list_files", "required": [] },
+    "设唤醒条件": { "tool": "qq_set_wake_config", "required": ["config"] },
+    "等消息": { "tool": "qq_wait_for_messages", "required": [] }
+  }
+}
