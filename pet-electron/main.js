@@ -9,9 +9,14 @@ const net = require('net');
 const { spawn } = require('child_process');
 
 // ────────────────────────────── 常量 ──────────────────────────────
-const PET_ROOT = 'D:\\qq-bridge\\assets\\pet';
-const STATE_DIR = 'D:\\qq-bridge\\state';
-const DIARY_DIR = 'D:\\qq-bridge\\diary';
+// 仓库根 = 本文件上一级（pet-electron/ 就在仓库根下）。
+// 这样 clone / 搬到任何目录都能直接跑，不用改代码；个别位置可以用环境变量覆盖：
+//   PET_STATE_DIR / PET_DIARY_DIR / PET_LOG —— 状态、日记、日志目录
+//   PET_ONECLICK —— 你自己的「一键启动」脚本；不配就不显示这一项
+const REPO_ROOT = path.resolve(__dirname, '..');
+const PET_ROOT = path.join(REPO_ROOT, 'assets', 'pet');
+const STATE_DIR = process.env.PET_STATE_DIR || path.join(REPO_ROOT, 'state');
+const DIARY_DIR = process.env.PET_DIARY_DIR || path.join(REPO_ROOT, 'diary');
 const PET_JSON = path.join(STATE_DIR, 'pet.json');
 const ACTIVITY_JSON = path.join(STATE_DIR, 'activity.json');
 const MOOD_JSON = path.join(STATE_DIR, 'mood.json');
@@ -19,11 +24,11 @@ const TOKEN_FILE = path.join(STATE_DIR, 'console-token');
 const FACTS_JSON = path.join(STATE_DIR, 'facts.json');
 // 用户主动退出时留的标记：pet-guard 看到它就收手，不会把桌宠又拉回来
 const QUIT_MARK = path.join(STATE_DIR, 'pet-quit');
-const BRIDGE_CFG = 'D:\\qq-bridge\\config.json';
+const BRIDGE_CFG = path.join(REPO_ROOT, 'config.json');
 const TRAY_PNG = path.join(PET_ROOT, 'pet-tray.png');
 const FACE_PNG = path.join(PET_ROOT, 'whale', 'tex', 'face.png');
-const APP_LOG = 'F:\\项目\\手机上使用dsh\\logs\\pet-app.log';
-const ONECLICK = 'F:\\项目\\手机上使用dsh\\一键启动.ps1';
+const APP_LOG = process.env.PET_LOG || path.join(REPO_ROOT, 'logs', 'pet-app.log');
+const ONECLICK = process.env.PET_ONECLICK || '';
 
 // VIEW = [-12, -8, 268, 272] → 280 x 280。窗口必须是正方形，理由见 桌宠改造-最终方案.md §2
 const SIZE = 420;
@@ -92,6 +97,7 @@ function writePetState(patch) {
   try {
     const cur = readPetState();
     fs.mkdirSync(STATE_DIR, { recursive: true });
+fs.mkdirSync(path.dirname(APP_LOG), { recursive: true });
     fs.writeFileSync(PET_JSON, JSON.stringify({ ...cur, ...patch }, null, 2), 'utf8');
   } catch (e) { log('写 pet.json 失败', e.message); }
 }
@@ -659,7 +665,7 @@ function popupMenu() {
       label: 'QQ 链路',
       submenu: [
         { label: '看链路状态', click: showLinkStatus },
-        { label: '一键修复 · 启动', click: runOneClick },
+        ...(ONECLICK ? [{ label: '一键修复 · 启动', click: runOneClick }] : []),
         { label: '打开桥控制台', click: () => openPath(`${BRIDGE}/?token=${encodeURIComponent(consoleToken)}`) },
         { type: 'separator' },
         { label: '打开桌宠日志', click: () => openPath(APP_LOG) },
@@ -755,6 +761,18 @@ async function togglePause() {
 }
 
 function runOneClick() {
+  if (!ONECLICK || !fs.existsSync(ONECLICK)) {
+    log('一键启动脚本没配置（PET_ONECLICK）');
+    if (win && !win.isDestroyed()) {
+      dialog.showMessageBox(win, {
+        type: 'info',
+        title: '没配一键启动',
+        message: '没有配置一键启动脚本',
+        detail: '设置环境变量 PET_ONECLICK 指向你自己的启动脚本（例如 C:\\your\\一键启动.ps1），重启桌宠后这一项才会出现。',
+      }).catch(() => {});
+    }
+    return;
+  }
   try {
     const child = spawn('powershell.exe', [
       '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ONECLICK, '-Quiet',

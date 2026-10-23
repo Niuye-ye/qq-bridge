@@ -198,6 +198,23 @@ node scripts/setup-dsh.mjs
    看到 `SnowLuma 已连接` 即成功；然后 QQ 上给机器人账号发条消息测试。
    Windows 想要「崩溃自动重启」请改用 `start.bat`（见下节）。
 
+## 桌面宠物（小鲸鱼）
+
+桥接跑起来之后，她还可以**出现在桌面上**：一个 420×420 的透明、无边框、置顶小窗口，
+里面是拆件伪骨骼动画的立绘（`assets/pet/whale/` 的 30 张立绘件 + 25 个表情件，由 Coopanion 的
+`kit/rig.js` 每帧合成，约 1.3 ms/帧）。点她、拖她、跟她打字聊天，右键有五组菜单。
+
+- 主进程在 `pet-electron/`，页面在 `assets/pet/electron.html`
+- 数据全在 `state/`：`pet.json`（位置/配色）、`activity.json`（她在干嘛）、`mood.json`、`facts.json`
+- 聊天走 `/api/socialV2/desk-message`（只投递，她什么时候回取决于桥的唤醒调度）
+- 形象包自带四套配色：原版蓝、樱粉、薄荷、夜紫（`schemes/`）
+
+完整的安装、启动脚本、开机自启、崩溃守护、环境变量与踩坑清单见
+**[docs/guides/PET.md](docs/guides/PET.md)**。
+
+> 两个最容易踩的：本机若有 `ELECTRON_RUN_AS_NODE=1`，electron.exe 会当纯 node 跑；
+> 从隐藏 cmd 启动时主进程不能 `console.log`（管道断了抛 EPIPE，弹错误框）。
+
 ## 运行与运维
 
 ```bash
@@ -272,6 +289,11 @@ qq-bridge/
   scripts/              # 测试/运维脚本（含 postinstall 的 patch-snowluma-sdk.mjs）
     patch-snowluma-sdk.mjs  # 修补 SDK 的 ESM 打包 bug（postinstall 自动执行）
   state/                # 运行时数据（不入库）
+  diary/                # 她的日记 YYYY-MM-DD.md（不入库）
+  memory/               # 长期回忆（不入库）
+  roles/                # 人格卡：只有 README.md 与示例入库，本机那份不进仓库
+  assets/pet/           # 桌宠形象包（whale/ 立绘与配色、kit/ 渲染器）+ electron.html
+  pet-electron/         # 桌宠的 Electron 主进程（main.js / preload.js）
 ```
 
 > 🎤 **独立的「发语音」工具不在这里**：它是仓库上一级的 [`../voice-tool/`](../voice-tool/)（`voice-cli.mjs` /
