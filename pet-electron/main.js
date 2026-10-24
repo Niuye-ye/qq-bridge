@@ -193,6 +193,8 @@ let quitRequested = false;
 let uiRects = [];    // 渲染进程上报的、需要吃鼠标的 UI 矩形
 let consoleToken = '';
 let bridgeState = null;
+let turboState = null;   // 超活跃模式状态（/api/socialV2/turbo 的快照，9 秒刷一次）
+const TURBO_HOURS = 10;  // 开一次默认跑多久
 
 function readPetState() {
   try { return JSON.parse(fs.readFileSync(PET_JSON, 'utf8')); } catch (_) { return {}; }
@@ -718,6 +720,7 @@ async function pollBridge() {
     at: Date.now(), paused: null, mood: '', affinity: null,
     doing: '', note: '', plan: '', activityAt: 0,
     lastLine: '', lastLineAt: 0,
+    turbo: turboState,
     links: (bridgeState && bridgeState.links) || { sluma: null, web: null, bridge: null },
   };
 
@@ -750,8 +753,13 @@ async function pollBridge() {
   if (pollRound++ % 3 === 0) {
     const [sluma, web, br] = await Promise.all([probePort(3000), probePort(3080), probePort(3100)]);
     s.links = { sluma, web, bridge: br };
+    try {
+      const t = await getJson('/api/socialV2/turbo');
+      if (t && t.ok) s.turbo = t;
+    } catch (_) {}
   }
 
+  turboState = s.turbo || null;
   const prev = bridgeState;
   bridgeState = s;
   const changed = !prev || safeStr(prev) !== safeStr(s);
@@ -793,6 +801,18 @@ function popupMenu() {
         { label: '长期记忆', click: () => openPreview(FACTS_JSON, '长期记忆', 'facts') },
         { type: 'separator' },
         { label: '让她去玩会儿手机', click: () => wakeHer('interval') },
+        {
+          label: (st.turbo && st.turbo.on)
+            ? `超活跃模式：整晚玩（${clock(st.turbo.until)} 到期，这段已花 ¥${Number(st.turbo.costTurboCny || 0).toFixed(2)}）· 点这里关掉`
+            : `超活跃模式：让她整晚一直玩（${TURBO_HOURS} 小时）`,
+          click: () => toggleTurbo(),
+        },
+        {
+          label: (st.turbo && typeof st.turbo.costTodayCny === 'number')
+            ? `她今天花了 ¥${st.turbo.costTodayCny.toFixed(2)}`
+            : '她今天花了（统计不到）',
+          enabled: false,
+        },
         { label: st.paused ? '恢复她的自主时间' : '暂停她的自主时间', click: () => togglePause() },
         { label: readPetState().noAnim ? '恢复动画' : '暂停动画', click: () => toggleAnim() },
       ],
@@ -996,6 +1016,22 @@ async function togglePause() {
     log('暂停切换 →', next);
     pollBridge().catch(() => {});
   } catch (e) { log('暂停切换失败', e.message); }
+}
+
+// 超活跃模式：让她整晚一直醒着玩（桥那边把自醒间隔压到 1 分钟、夜里不放慢）。
+// 关掉的方式有三种：点这里、主人发消息（桥自己关）、到点自动到期。
+async function toggleTurbo() {
+  const on = !(bridgeState && bridgeState.turbo && bridgeState.turbo.on);
+  try {
+    const r = await postJson('/api/socialV2/turbo', { on, hours: TURBO_HOURS, by: 'pet' });
+    log('超活跃模式 →', on ? '开' : '关', safeStr(r));
+    const cost = r && typeof r.costTodayCny === 'number' ? `（今天已花 ¥${r.costTodayCny.toFixed(2)}）` : '';
+    win?.webContents.send('pet:ui', {
+      t: 'bubble',
+      text: on ? `超活跃模式开了，${TURBO_HOURS} 小时内我一直在${cost}` : '超活跃模式关了',
+    });
+    await pollBridge();
+  } catch (e) { log('超活跃模式切换失败', e.message); }
 }
 
 // 动画开关：只停渲染层的动作（呼吸/走路/待机），不影响她的自主时间

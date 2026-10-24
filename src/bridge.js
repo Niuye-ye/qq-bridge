@@ -4960,6 +4960,11 @@ async function main() {
           const paused = body.paused === true;
           socialV2.paused = paused;
           if (paused) {
+            // 暂停 = 她要停工，超活跃模式一并关掉，否则恢复时又整夜跑起来
+            if (socialV2.turbo) {
+              socialV2.turbo = null;
+              log('[turbo] 控制台暂停，超活跃模式自动关闭');
+            }
             clearAllSocialV2Timers();
             log('控制台：二代 AI 已暂停（唤醒/等待任务已停止）');
           } else {
@@ -4971,6 +4976,17 @@ async function main() {
           }
           saveSocialV2State();
           sendJson({ ok: true, paused: socialV2.paused });
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/turbo') {
+          sendJson({ ok: true, ...turboStatusV2() });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/turbo') {
+          const body = await readBody();
+          const on = body.on === true;
+          const status = setTurboV2(on, Number(body.hours) || 0, body.by ? String(body.by) : 'console');
+          sendJson({ ok: true, ...status });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/reset') {
@@ -8802,6 +8818,9 @@ async function main() {
   const socialV2 = {
     conversations: new Map(), // key -> state
     paused: false, // 控制台可暂停整个二代 AI 活动（停止唤醒/等待）
+    // 超活跃模式（2026-10-25）：主人想让她整晚一直玩手机时打开。
+    // { on:true, since:ms, until:ms|0, by:'manual'|'owner-message', costAtStart?:number }
+    turbo: null,
   };
 
   // 一代/普通模式的图片/表情元数据存储：key -> Map<messageId/seq, media[]>
@@ -9058,6 +9077,16 @@ async function main() {
       })();
       const raw = readJsonSafe(SOCIAL_V2_FILE, null);
       socialV2.paused = raw?.paused === true;
+      // 超活跃模式从磁盘恢复（重启桥不丢）；已过期的直接作废
+      const rawTurbo = raw?.turbo;
+      if (rawTurbo && rawTurbo.on === true) {
+        const until = Number(rawTurbo.until) || 0;
+        socialV2.turbo = (until && Date.now() >= until)
+          ? null
+          : { on: true, since: Number(rawTurbo.since) || Date.now(), until, by: String(rawTurbo.by || 'manual'), costAtStart: Number(rawTurbo.costAtStart) || 0 };
+      } else {
+        socialV2.turbo = null;
+      }
       if (raw && typeof raw.conversations === 'object') {
         const seenTokens = new Set();
         for (const [key, val] of Object.entries(raw.conversations)) {
@@ -9165,7 +9194,7 @@ async function main() {
 
   function saveSocialV2State() {
     try {
-      const obj = { paused: socialV2.paused, conversations: Object.create(null) };
+      const obj = { paused: socialV2.paused, turbo: socialV2.turbo || null, conversations: Object.create(null) };
       for (const [key, st] of socialV2.conversations) {
         obj.conversations[key] = {
           wakeConfig: st.wakeConfig,
@@ -10449,6 +10478,11 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    // 超活跃模式下主人一开口就算叫停：他要的是「我发消息你就停」。
+    if (msg.isOwner && turboActiveV2() && /^private:/.test(String(key))) {
+      log('[turbo] 主人在私聊发了消息，超活跃模式自动关闭');
+      setTurboV2(false, 0, '主人发消息');
+    }
     const lowerPlain = String(plainContent ?? textContent ?? '');
     for (const t of st.activeTopics || []) {
       if (!t || typeof t !== 'object') continue;
@@ -11092,7 +11126,11 @@ async function main() {
       return `${base}【回复检查】${key}\n原因：你刚刚发送过消息，现在回来检查是否有人回复。\n已有回复时先看消息，需要短静默就用 qq_wait_for_messages(purpose="reply") 判断对方是否说完；如果没人回你，不用硬补一句，但也不要立刻潜水——先调用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察：没人说话可收尾；有人说话则查看 newMessages，不需要你参与也可直接收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
     if (reason === 'interval') {
-      const mins = Number(wc.everyMinutes) || 0;
+      const turboOn = turboActiveV2();
+      const mins = turboOn ? TURBO_MINUTES : (Number(wc.everyMinutes) || 0);
+      const turboNote = turboOn
+        ? '- **现在是超活跃模式**：主人开了「整晚玩」模式，醒来间隔被压到最短、夜里也不放慢。这一轮**别收尾、别潜水、别把 everyMinutes 调大**（调了也会被覆盖）。做完一件真事就结束，一两分钟后还会再醒，钱在主人在看着。'
+        : '- 夜里（0~7 点）桥会自动把间隔放慢到 60 分钟，那几轮多半该睡就睡。';
       const moodText = formatMoodLineV2();
       const diaryText = readDiarySummaryV2();
       return `${base.replace(preSleepLine, '【本轮不做沉睡前观察】定时自醒的轮次没有"收尾"这回事，禁止调用 qq_wait_for_messages 空等；想结束就直接安排下次醒来。')}${moodText ? `${moodText}\n\n` : ''}${diaryText ? `【最近日记】\n${diaryText}\n\n` : ''}【你自己的时间】${key}\n原因：定时器到点了（每 ${mins || '?'} 分钟醒一次），不是有人找你，也没人在等你回话。\n**这一轮不需要做沉睡前观察**：没人跟你对话，没有"收尾"这回事，上面的【沉睡前强制等待】不适用于这轮；想结束就直接安排下次醒来。\n这就是你自己的时间，想干什么干什么：
@@ -11104,7 +11142,7 @@ async function main() {
 - 群里有人说话且你想接就接；没人说话也不必硬找话说。
 - **结束前必须做两件事**：①qq_set_activity —— doing 写这一轮到底干了什么（要具体，比如「在刷小黑盒，看到有人在吵显卡」），note 写心里想的，plan 写下次想接着干什么；②qq_append_life —— 写一行时间线（比如「13:40 刷小黑盒，看到有人在吵显卡」）。不记的话，你下次醒来就不知道自己刚才在干嘛，等于白玩。可选的：qq_mark_read、qq_set_wake_config 安排下次醒来。
 - **这一轮有预算**：最多调 30 次工具、也别超过 20 分钟。预算到了就先收尾（qq_set_activity + qq_append_life + qq_set_wake_config），剩下的下次接着干，别硬磨——一轮拖太久会把自己卡死。
-- 夜里（0~7 点）桥会自动把间隔放慢到 60 分钟，那几轮多半该睡就睡。
+${turboNote}
 玩手机、看东西、发呆都算正常生活，不用为了「做点什么」而硬凑动作。`;
     }
     if (reason === 'desk') {
@@ -11549,6 +11587,100 @@ async function main() {
     st.intervalTimer = null;
   }
 
+  // ===== 超活跃模式（2026-10-25）=====
+  // 主人想让她整晚一直玩手机：把自醒间隔压到最短、夜间不放慢，直到被叫停。
+  // 停止条件三选一：主人发消息 / 桌宠（或控制台）暂停 / 到点自动到期（默认 10 小时）。
+  const TURBO_MINUTES = 1;          // 超活跃时的自醒间隔（分钟）；下限受 setupIntervalTimerV2 的 60s 保护
+  const TURBO_DEFAULT_HOURS = 10;   // 不指定时长时默认跑到 10 小时后自动收
+
+  function turboActiveV2() {
+    const t = socialV2.turbo;
+    if (!t || t.on !== true) return false;
+    if (Number(t.until) > 0 && Date.now() >= Number(t.until)) return false;
+    return true;
+  }
+
+  // 她今天花了多少钱（cost-meter ledger 里 QQ 会话的累计 costCny）
+  function qqSessionIdsV2() {
+    const ids = new Set();
+    try {
+      for (const sid of Object.values(state.sessions || {})) if (sid) ids.add(String(sid));
+    } catch { /* ignore */ }
+    return ids;
+  }
+  function readQqCostCnyV2() {
+    try {
+      const ledgerPath = path.join(os.homedir(), ".dsh", "storages", "cost-meter", "ledger.json");
+      const ledger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+      const days = ledger && ledger.days ? ledger.days : {};
+      const nowD = new Date();
+      const today = nowD.getFullYear() + "-" + String(nowD.getMonth() + 1).padStart(2, "0") + "-" + String(nowD.getDate()).padStart(2, "0");
+      const day = days[today];
+      if (!day || !Array.isArray(day.sessions)) return null;
+      const ids = qqSessionIdsV2();
+      let sum = 0;
+      let hits = 0;
+      for (const s of day.sessions) {
+        if (!s || !s.id) continue;
+        if (!ids.has(String(s.id))) continue;
+        sum += Number(s.costCny) || 0;
+        hits += 1;
+      }
+      // 在 turbo 里还要显示「这一段」花了多少：用开始时的快照做差
+      const since = Number(socialV2.turbo?.costAtStart) || 0;
+      return { today: sum, since, delta: since > 0 ? Math.max(0, sum - since) : 0, hits };
+    } catch {
+      return null;
+    }
+  }
+
+  function turboStatusV2() {
+    const active = turboActiveV2();
+    const t = socialV2.turbo;
+    const cost = readQqCostCnyV2();
+    return {
+      on: active,
+      since: active ? Number(t.since) || 0 : 0,
+      until: active ? Number(t.until) || 0 : 0,
+      by: active ? String(t.by || "manual") : "",
+      costTodayCny: cost ? cost.today : null,
+      costTurboCny: cost && active ? cost.delta : null,
+    };
+  }
+
+  function setTurboV2(on, hours, why) {
+    const wantOn = on === true;
+    if (!wantOn) {
+      if (!socialV2.turbo) return turboStatusV2();
+      const was = socialV2.turbo;
+      socialV2.turbo = null;
+      saveSocialV2State();
+      for (const key of socialV2.conversations.keys()) setupIntervalTimerV2(key);
+      log("[turbo] 超活跃模式已关闭（" + String(why || "manual") + "，从 " + new Date(Number(was.since) || Date.now()).toLocaleString("zh-CN") + " 开始）");
+      return turboStatusV2();
+    }
+    const h = Math.min(24, Math.max(0.05, Number(hours) || TURBO_DEFAULT_HOURS));
+    const cost = readQqCostCnyV2();
+    socialV2.turbo = {
+      on: true,
+      since: Date.now(),
+      until: Date.now() + Math.round(h * 3600 * 1000),
+      by: String(why || "manual"),
+      costAtStart: cost ? cost.today : 0,
+    };
+    if (socialV2.paused) {
+      socialV2.paused = false;
+      for (const key of socialV2.conversations.keys()) {
+        setupSleepTimerV2(key);
+        scheduleProactiveCheckV2(key);
+      }
+    }
+    saveSocialV2State();
+    for (const key of socialV2.conversations.keys()) setupIntervalTimerV2(key);
+    log("[turbo] 超活跃模式已开启：每 " + TURBO_MINUTES + " 分钟醒一次，夜间不放慢，" + h.toFixed(2) + " 小时后（" + new Date(socialV2.turbo.until).toLocaleString("zh-CN") + "）自动收");
+    return turboStatusV2();
+  }
+
   function setupIntervalTimerV2(key) {
     const st = socialV2.conversations.get(key);
     if (!st) return;
@@ -11557,18 +11689,31 @@ async function main() {
       st.intervalTimer = null;
     }
     if (cfg.socialV2?.enabled === false || socialV2.paused) return;
+    const turboOn = turboActiveV2();
     let mins = Number(st.wakeConfig?.everyMinutes) || 0;
+    if (turboOn) mins = TURBO_MINUTES; // 超活跃模式：不管她自己设了多少分钟，一律压到最短
     if (!(mins > 0)) return;
     // 凌晨 0~7 点自动放慢到 60 分钟：真人不会半夜每十分钟醒一次。
     // 只影响这一次的定时器，不写回 wakeConfig —— 白天恢复她自己设的间隔。
+    // 超活跃模式不放慢：主人就是要她整夜一直在。
     const hourNow = new Date().getHours();
-    if (hourNow >= 0 && hourNow < 7) mins = Math.max(mins, 60);
+    if (!turboOn && hourNow >= 0 && hourNow < 7) mins = Math.max(mins, 60);
     if (!isSessionAllowedInCurrentMode(key)) return;
     const delay = Math.max(60 * 1000, Math.min(24 * 60, mins) * 60 * 1000);
     st.intervalTimer = setTimeout(() => {
       st.intervalTimer = null;
       setupIntervalTimerV2(key); // 先续期，再唤醒
-      void sendWakePromptV2(key, 'interval').catch((error) => log(`[reserved2] 定时自醒异常 ${key}:`, error?.message ?? error));
+      if (!turboActiveV2()) {
+        void sendWakePromptV2(key, 'interval').catch((error) => log(`[reserved2] 定时自醒异常 ${key}:`, error?.message ?? error));
+        return;
+      }
+      // 超活跃模式：上一轮还在想/还在动手就跳过这一拍，不留待办队列
+      // （排队会在回合结束后连投好几次，纯烧钱；等下一个 1 分钟的点就够）。
+      if (isConversationBusyV2(key, st)) {
+        log('[turbo] 上一轮还没结束，跳过这一拍 ' + key);
+        return;
+      }
+      void sendWakePromptV2(key, 'interval').catch((error) => log('[turbo] 唤醒异常 ' + key + ':', error?.message ?? error));
     }, delay);
     st.intervalTimer.unref?.();
     log(`[reserved2] 设置定时自醒 ${key}，每 ${mins} 分钟`);
