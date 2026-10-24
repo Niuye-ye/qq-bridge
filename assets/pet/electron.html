@@ -35,23 +35,23 @@
   }
   #btns button:hover { opacity: 1; transform: scale(1.12); background: rgba(255,255,255,.95); }
 
-  /* 气泡：底边钉在角色头顶线上（54px），向上生长。两行会把长句切掉，
-     主进程的台词最多 34 字、加上表情/动作描述容易超，放宽到 3 行。
-     **尺寸和位置都要乘 --k**：窗口缩到 260 时若还用固定 54px，气泡会顶出
-     窗口上沿被切掉一半（用户实测）。 */
+  /* 气泡：贴窗口顶部、向下生长，**不截断**。
+     之前是「底边钉在头顶线上、向上生长」+ line-clamp，字一多就顶出窗口上沿被切一半。
+     现在改成从 y=2 往下铺，字多就多占几行（最多会盖住她的头发，但话一定说全）。
+     字号跟 --k 缩，但保底 10px —— 260 窗口时 k≈0.62，不保底会小到看不清。 */
   #bubble {
-    position: absolute; left: 50%; bottom: calc(100% - 54px * var(--k, 1)); transform: translateX(-50%);
-    max-width: min(342px, calc(100% - 14px));
+    position: absolute; left: 50%; top: 2px; transform: translateX(-50%);
+    max-width: min(342px, calc(100% - 12px));
     padding: calc(6px * var(--k, 1)) calc(10px * var(--k, 1));
     border-radius: calc(12px * var(--k, 1));
-    background: rgba(255,255,255,.94); color: #1f2937;
-    font-size: calc(12.5px * var(--k, 1)); line-height: 1.42; text-align: center;
+    background: rgba(255,255,255,.95); color: #1f2937;
+    font-size: max(10px, calc(12.5px * var(--k, 1))); line-height: 1.42; text-align: center;
     box-shadow: 0 2px 10px rgba(0,0,0,.16); border: 1px solid rgba(148,163,184,.35);
     display: none; pointer-events: none;
-    overflow: hidden;
     word-break: break-word;
+    max-height: calc(100% - 4px);
   }
-  #bubble.on { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+  #bubble.on { display: block; }
   #bubble.thin { color: #64748b; font-style: italic; }
 
   /* 聊天框：和气泡同一个位置，打开时顶上去一点 */

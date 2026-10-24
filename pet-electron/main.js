@@ -761,13 +761,11 @@ function showActivity() {
   const st = bridgeState || {};
   let line;
   if (st.doing) {
-    line = trimTo(st.doing, 22);
-    // 气泡最多两行，doing + 计划拼起来控制在 34 字内，超了只留 doing
-    const plan = trimTo(String(st.plan || '').replace(/^[，,。；;\s]+/, ''), 12);
-    if (plan && plan !== line) {
-      const cand = line + '，等会儿' + plan;
-      if (cand.length <= 34) line = cand;
-    }
+    line = String(st.doing).trim();
+    const plan = String(st.plan || '').replace(/^[，,。；;\s]+/, '').trim();
+    if (plan && plan !== line) line = line + '，等会儿' + plan;
+    // 气泡改成不截断（贴窗口顶向下铺），这里只做个小上限防止盖住她整个人
+    line = trimTo(line, 56);
   } else {
     line = '没记着在干嘛，大概在发呆';
   }
