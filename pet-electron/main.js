@@ -548,7 +548,7 @@ function buildTray() {
     { label: '显示小鲸鱼', click: () => showPet() },
     { label: '跟她说句话', click: () => openChat() },
     { type: 'separator' },
-    { label: '藏起来（要她出现就右键这里）', click: () => hideForGood() },
+    { label: '藏起来', click: () => hideForGood() },
     { type: 'separator' },
     { label: '打开日志', click: () => openPath(APP_LOG) },
     { label: '退出', click: () => { quitRequested = true; app.quit(); } },
@@ -798,7 +798,7 @@ function popupMenu() {
           ],
         },
         { type: 'separator' },
-        { label: '藏起来（托盘里叫她出来）', click: () => hideForGood() },
+        { label: '藏起来', click: () => hideForGood() },
       ],
     },
     {
@@ -895,6 +895,7 @@ function readMuMuInfo() {
             started: j.is_android_started === true,
             running: j.is_process_started === true,
             name: j.name || '',
+            adbPort: Number(j.adb_port) || 0,
           });
         } catch (_) { resolve(null); }
       });
@@ -905,11 +906,14 @@ function readMuMuInfo() {
 async function showLinkStatus() {
   const l = (bridgeState && bridgeState.links) || {};
   const mark = (v) => (v === true ? '✅' : v === false ? '❌' : '…');
-  const [mumu, adb] = await Promise.all([readMuMuInfo(), probePort(16384)]);
+  const mumu = await readMuMuInfo();
+  // 端口别写死：MuMu 每次分配的可能不同（2026-10-24 实测从 16384 变成 16385）
+  const adbPort = (mumu && mumu.adbPort) || 16384;
+  const adb = await probePort(adbPort);
   const muLine = mumu
     ? `MuMu 实例${mumu.name ? `「${mumu.name}」` : ''}  ${mumu.started ? '✅ 安卓已启动' : mumu.running ? '⚠️ 进程在，安卓没起来' : '❌ 没启动'}`
     : 'MuMu 实例  … 找不到 MuMuManager.exe（可设环境变量 PET_MUMU_CLI）';
-  const adbLine = `adb 16384  ${mark(adb)}`;
+  const adbLine = `adb ${adbPort}  ${mark(adb)}`;
   // 她能不能操控手机 = MuMu 安卓真的起来了 + adb 通
   const canControl = mumu ? (mumu.started === true && adb === true) : adb === true;
   const whyNot = !mumu
@@ -917,7 +921,7 @@ async function showLinkStatus() {
     : !mumu.started
       ? 'MuMu 实例没启动'
       : adb !== true
-        ? 'adb 没连上 127.0.0.1:16384'
+        ? `adb 没连上 127.0.0.1:${adbPort}`
         : '';
   const lines = [
     `SnowLuma 3000  ${mark(l.sluma)}`,
@@ -977,11 +981,20 @@ function runOneClick() {
     return;
   }
   try {
+    // stdio 落文件：以前用 'ignore'，powershell 起不来时一点痕迹都没有，白点三次都不知道为什么
+    const spawnLog = path.join(path.dirname(APP_LOG), 'oneclick-spawn.log');
+    const opts = { detached: true, windowsHide: true, stdio: 'ignore' };
+    try {
+      const fd = fs.openSync(spawnLog, 'a');
+      opts.stdio = ['ignore', fd, fd];
+    } catch { /* 打不开就退回 ignore，至少不会挡住启动 */ }
     const child = spawn('powershell.exe', [
       '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ONECLICK, '-Quiet',
-    ], { detached: true, stdio: 'ignore', windowsHide: true });
+    ], opts);
+    child.on('error', (e) => log('一键启动 spawn 失败', e.message));
+    child.on('exit', (code) => log('一键启动进程退出 code =', code));
     child.unref();
-    log('已拉起一键启动.ps1 -Quiet');
+    log('已拉起一键启动.ps1 -Quiet → PID', child.pid);
   } catch (e) { log('一键启动失败', e.message); }
 }
 
