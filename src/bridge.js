@@ -10478,10 +10478,13 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
-    // 超活跃模式下主人一开口就算叫停：他要的是「我发消息你就停」。
+    // 超活跃模式的叫停：主人私聊里说了「停」这类词才关，普通消息不打断整晚模式。
     if (msg.isOwner && turboActiveV2() && /^private:/.test(String(key))) {
-      log('[turbo] 主人在私聊发了消息，超活跃模式自动关闭');
-      setTurboV2(false, 0, '主人发消息');
+      const ownerLine = String(plainContent ?? textContent ?? '');
+      if (TURBO_STOP_RE.test(ownerLine)) {
+        log('[turbo] 主人叫停（' + ownerLine.slice(0, 20) + '），超活跃模式关闭');
+        setTurboV2(false, 0, '主人叫停');
+      }
     }
     const lowerPlain = String(plainContent ?? textContent ?? '');
     for (const t of st.activeTopics || []) {
@@ -11129,7 +11132,7 @@ async function main() {
       const turboOn = turboActiveV2();
       const mins = turboOn ? TURBO_MINUTES : (Number(wc.everyMinutes) || 0);
       const turboNote = turboOn
-        ? '- **现在是超活跃模式**：主人开了「整晚玩」模式，醒来间隔被压到最短、夜里也不放慢。这一轮**别收尾、别潜水、别把 everyMinutes 调大**（调了也会被覆盖）。做完一件真事就结束，一两分钟后还会再醒，钱在主人在看着。'
+        ? '- **现在是超活跃模式**：主人开了「整晚玩」模式，醒来间隔被压到最短、夜里也不放慢。这一轮**别收尾、别潜水、别把 everyMinutes 调大**（调了也会被覆盖）。做完一件真事就结束，一两分钟后还会再醒，钱在主人在看着。这个模式只有主人私聊里说「停一下 / 别玩了 / 睡吧」这类话，或者主人在桌宠点暂停，才会结束。'
         : '- 夜里（0~7 点）桥会自动把间隔放慢到 60 分钟，那几轮多半该睡就睡。';
       const moodText = formatMoodLineV2();
       const diaryText = readDiarySummaryV2();
@@ -11592,6 +11595,9 @@ ${turboNote}
   // 停止条件三选一：主人发消息 / 桌宠（或控制台）暂停 / 到点自动到期（默认 10 小时）。
   const TURBO_MINUTES = 1;          // 超活跃时的自醒间隔（分钟）；下限受 setupIntervalTimerV2 的 60s 保护
   const TURBO_DEFAULT_HOURS = 10;   // 不指定时长时默认跑到 10 小时后自动收
+  // 主人「叫停」的关键词：只有私聊消息里出现这些才关超活跃，其余消息照常聊、模式继续跑。
+  // 别只写「停」一个字当关键词 —— 「别停」「停不下来」都会被误判，宁可多列几个明确的说法。
+  const TURBO_STOP_RE = /(停一下|停下来|停下|停止|停吧|别玩了|不要玩了|不玩了|别刷了|睡吧|去睡|睡觉吧|睡觉了|晚安了|该睡了|关掉|关了吧|关了|收工|收摊|下班了|够了|结束吧|今晚到这|回来吧|别玩了|歇着|休息吧)/;
 
   function turboActiveV2() {
     const t = socialV2.turbo;
