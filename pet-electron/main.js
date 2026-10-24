@@ -844,7 +844,7 @@ function popupMenu() {
       label: 'QQ 链路',
       submenu: [
         { label: '看链路状态', click: showLinkStatus },
-        ...(ONECLICK ? [{ label: '一键修复 · 启动', click: runOneClick }] : []),
+        ...(ONECLICK ? [{ label: oneClickBusy ? '一键修复 · 启动（运行中…）' : '一键修复 · 启动', click: runOneClick }] : []),
         { label: '打开桥控制台', click: () => openPath(`${BRIDGE}/?token=${encodeURIComponent(consoleToken)}`) },
         { type: 'separator' },
         { label: '打开桌宠日志', click: () => openPath(APP_LOG) },
@@ -1006,6 +1006,70 @@ function toggleAnim() {
   log('动画切换 →', next ? '暂停' : '恢复');
 }
 
+// ── 一键修复 · 启动：给看得见的反馈 ─────────────────────────────
+// 点了没反应的观感有两个来源：① spawn 静默退出（2026-10-24 已修，见下面注释）；
+// ② 脚本跑 25 秒全程 -WindowStyle Hidden，跑完只写文件，桌面上一点动静都没有。
+// 现在：点击立刻冒气泡 → 跑完只读这次新增的 oneclick.log → 解析末尾验证表 → 气泡报结果。
+let oneClickBusy = 0;           // 运行中 = 开始时间戳；0 = 空闲
+let oneClickTimer = null;
+const ONECLICK_TIMEOUT_MS = 180000;
+
+/** 气泡 + 窗口不可见时兜底弹一条系统通知 */
+function notify(text, ms) {
+  bubble(text, ms || 25000);
+  try {
+    if (win && !win.isDestroyed() && win.isVisible()) return;   // 看得见气泡就不弹通知
+    if (Notification.isSupported()) {
+      new Notification({ title: '小鲸鱼 · QQ 链路', body: text, silent: true }).show();
+    }
+  } catch (_) {}
+}
+
+function bubble(text, ms) { send('pet:ui', { t: 'bubble', text, ms: ms || 20000 }); }
+
+function oneClickLogPath() {
+  try { return ONECLICK ? path.join(path.dirname(ONECLICK), 'logs', 'oneclick.log') : ''; } catch (_) { return ''; }
+}
+
+function fileSize(p) { try { return fs.statSync(p).size; } catch (_) { return 0; } }
+
+/** 只读 from 之后新增的部分（上一轮的旧结果不能拿来冒充这次的） */
+function readLogDelta(p, from) {
+  try {
+    const buf = fs.readFileSync(p);
+    return buf.subarray(from > 0 ? from : 0).toString('utf8');
+  } catch (_) { return ''; }
+}
+
+/** 验证表行形如：   QQ 主进程 : OK  PID 22792   /   dsh web 3080 : 缺
+ *  只看最后一张表：日志里那行「== 链路验证 ==」之后才是本次结果；
+ *  再加一道「同名项重复出现 = 又开了一张表」的兜底，免得 offset 算错时把上一次的算进来。 */
+function parseCheckRows(text) {
+  let s = String(text || '');
+  const i = s.lastIndexOf('链路验证');
+  if (i >= 0) s = s.slice(i);
+  const rows = [];
+  for (const line of s.split(/\r?\n/)) {
+    const m = line.match(/^\s{2,}(\S[^:：]{0,30}?)\s*[:：]\s*(OK|缺|DOWN|FAIL|不可用)/);
+    if (!m) continue;
+    const name = m[1].trim();
+    if (rows.some((r) => r.name === name)) rows.length = 0;
+    rows.push({ name, ok: m[2] === 'OK' });
+  }
+  return rows;
+}
+
+function oneClickSummary(rows, code) {
+  if (!rows.length) {
+    return code === 0
+      ? '跑完了，但没读到结果表，看 logs\\oneclick.log'
+      : '脚本提前退出了（code ' + code + '），看 logs\\oneclick.log';
+  }
+  const bad = rows.filter((r) => !r.ok);
+  if (!bad.length) return '修好了：' + rows.length + ' 项全绿 ✓';
+  return (rows.length - bad.length) + ' 项 OK、' + bad.length + ' 项没好：' + bad.map((r) => r.name).join('、');
+}
+
 function runOneClick() {
   if (!ONECLICK || !fs.existsSync(ONECLICK)) {
     log('一键启动脚本没配置（PET_ONECLICK）');
@@ -1019,20 +1083,56 @@ function runOneClick() {
     }
     return;
   }
+  // 已经有一次在跑就别起第二个：两个 powershell 抢同一批端口只会互相打架
+  if (oneClickBusy && Date.now() - oneClickBusy < ONECLICK_TIMEOUT_MS) {
+    const secs = Math.round((Date.now() - oneClickBusy) / 1000);
+    notify('上一次还在跑（' + secs + ' 秒了），等它跑完…', 5000);
+    log('一键启动已在运行，忽略重复点击（已跑', secs, '秒）');
+    return;
+  }
+
   try {
     // 2026-10-24 实测：detached:true 和「stdio 重定向到 fd」都会让 powershell.exe 5.1
     // 在 ~100~300ms 内以 code 0 静默退出（什么都不干，spawn 日志 0 字节），
     // 表现就是点菜单「一键修复 · 启动」点了没反应。只有「不 detached + stdio:'ignore'」
     // 能让它正常跑满（实测 25 秒）。诊断信息本来就会写进脚本自己的 logs\oneclick.log，不亏。
     const opts = { windowsHide: true, stdio: 'ignore' };
+    const logPath = oneClickLogPath();
+    const from = fileSize(logPath);          // 只看这次新增的那段
     const child = spawn('powershell.exe', [
       '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ONECLICK, '-Quiet',
     ], opts);
-    child.on('error', (e) => log('一键启动 spawn 失败', e.message));
-    child.on('exit', (code) => log('一键启动进程退出 code =', code));
+
+    oneClickBusy = Date.now();
+    notify('好，我去把链路修一遍…大概 25 秒', 30000);
+    log('已拉起一键启动.ps1 -Quiet → PID', child.pid, '（日志起点', from, '字节）');
+
+    let done = false;
+    const finish = (code, why) => {
+      if (done) return;
+      done = true;
+      if (oneClickTimer) { clearTimeout(oneClickTimer); oneClickTimer = null; }
+      const usedMs = Date.now() - oneClickBusy;
+      oneClickBusy = 0;
+      const rows = parseCheckRows(readLogDelta(logPath, from));
+      const msg = why || oneClickSummary(rows, code);
+      notify(msg, 30000);
+      log('一键启动结束 code =', code, '| 耗时', Math.round(usedMs / 1000) + '秒 | 结果行数', rows.length, '|', msg);
+      if (process.env.PET_TEST_ONECLICK) setTimeout(() => app.quit(), 4000);
+    };
+
+    child.on('error', (e) => { log('一键启动 spawn 失败', e.message); finish(null, '没拉起来：' + e.message); });
+    child.on('exit', (code) => finish(code));
     child.unref();
-    log('已拉起一键启动.ps1 -Quiet → PID', child.pid);
-  } catch (e) { log('一键启动失败', e.message); }
+
+    oneClickTimer = setTimeout(() => {
+      if (!oneClickBusy) return;
+      oneClickBusy = 0; oneClickTimer = null;
+      notify('跑了 3 分钟还没结束，可能卡住了，去看 logs\\oneclick.log', 25000);
+      log('一键启动超时（3 分钟未见退出）');
+    }, ONECLICK_TIMEOUT_MS);
+    if (oneClickTimer.unref) oneClickTimer.unref();
+  } catch (e) { log('一键启动失败', e.message); notify('没拉起来：' + e.message, 15000); }
 }
 
 // ────────────────────────────── IPC ──────────────────────────────
@@ -1192,6 +1292,10 @@ if (!app.requestSingleInstanceLock()) {
     startBridgePolling();
     if (process.env.PET_DEBUG_CURSOR) {
       setTimeout(() => { moveToCursor(); log('debug: 窗口已挪到光标处'); }, 3000);
+    }
+    if (process.env.PET_TEST_ONECLICK) {
+      // 自检：起窗 6 秒后自动点一次「一键修复 · 启动」，跑完自己退出（不留第二个桌宠）
+      setTimeout(() => { log('[测试] 自动触发一键修复'); runOneClick(); }, 6000);
     }
     if (process.env.PET_TEST_ACT === 'activity') {
       setTimeout(() => { log('debug: 试一次「她在干嘛」'); showActivity(); }, 4000);
