@@ -31,9 +31,15 @@ const APP_LOG = process.env.PET_LOG || path.join(REPO_ROOT, 'logs', 'pet-app.log
 const ONECLICK = process.env.PET_ONECLICK || '';
 
 // VIEW = [-12, -8, 268, 272] → 280 x 280。窗口必须是正方形，理由见 桌宠改造-最终方案.md §2
-const SIZE = 420;
-const K = SIZE / 280;
-const FLOOR_Y = 264 * K; // 地面在 rig y=256，VIEW 顶是 -8
+const VIEW = 280;                 // rig view 的边长（正方形）
+const FLOOR_RATIO = 264 / 280;    // 地面在 rig y=256，VIEW 顶是 -8
+const SIZE_MIN = 260;             // 再小按钮和气泡就挤成一团了
+const SIZE_MAX = 760;
+const SIZE_STEP = 40;
+const SIZE_DEFAULT = 420;
+let SIZE = SIZE_DEFAULT;          // 启动时会被 state/pet.json 的 size 覆盖
+let K = SIZE / VIEW;
+let FLOOR_Y = 264 * K;
 const KEY = 'private:1946431105';
 const BRIDGE = 'http://127.0.0.1:3100';
 const CONFIG = { size: SIZE, k: K, floorY: FLOOR_Y, key: KEY };
@@ -107,16 +113,20 @@ fs.mkdirSync(path.dirname(APP_LOG), { recursive: true });
 function restoreBounds() {
   const st = readPetState();
   const x = Number(st.left), y = Number(st.top);
-  if (Number.isFinite(x) && Number.isFinite(y)) {
-    const ok = screen.getAllDisplays().some((d) => {
-      const w = d.workArea;
-      return x >= w.x - HIT_RECT.x0 && x <= w.x + w.width - HIT_RECT.x1
-        && y >= w.y - HIT_RECT.y0 && y <= w.y + w.height - HIT_RECT.y1;
-    });
-    if (ok) return { x: Math.round(x), y: Math.round(y) };
-    log('位置不在任何屏幕内，回落默认', x, y);
-  }
   const w = screen.getPrimaryDisplay().workArea;
+  if (Number.isFinite(x) && Number.isFinite(y)) {
+    // 只要跟某块屏幕有交集就认，然后夹进工作区；差几像素不算「跑丢了」
+    const visible = screen.getAllDisplays().some((d) => {
+      const a = d.workArea;
+      return x + SIZE > a.x && x < a.x + a.width && y + SIZE > a.y && y < a.y + a.height;
+    });
+    if (visible) {
+      const cx = Math.max(w.x - HIT_RECT.x0, Math.min(x, w.x + w.width - HIT_RECT.x1));
+      const cy = Math.max(w.y - HIT_RECT.y0, Math.min(y, w.y + w.height - HIT_RECT.y1));
+      return { x: Math.round(cx), y: Math.round(cy) };
+    }
+    log('位置完全在屏幕外，回落默认', x, y);
+  }
   return { x: w.x + w.width - SIZE - 24, y: w.y + w.height - SIZE - 24 };
 }
 
@@ -168,13 +178,53 @@ function registerAppProtocol() {
 // ────────────────────────────── 穿透 ──────────────────────────────
 // forward 在本机实测没把 mousemove 送进渲染进程，所以穿透判定改由主进程轮询光标：
 // 30ms 一次 GetCursorPos，比 IPC 往返稳，渲染进程卡住也不影响。
-const CHAR_HALF = Math.min(112 * K, SIZE * 0.44);
-const HIT_RECT = {
-  x0: SIZE / 2 - CHAR_HALF,
-  x1: SIZE / 2 + CHAR_HALF,
-  y0: Math.max(0, FLOOR_Y * 0.24),
-  y1: Math.min(SIZE, FLOOR_Y + 14),
-};
+/** 命中区按「角色本体」算；改尺寸后必须跟着重算 */
+function makeHitRect() {
+  const half = Math.min(112 * K, SIZE * 0.44);
+  return {
+    x0: SIZE / 2 - half,
+    x1: SIZE / 2 + half,
+    y0: Math.max(0, FLOOR_Y * 0.24),
+    y1: Math.min(SIZE, FLOOR_Y + 14),
+  };
+}
+let HIT_RECT = makeHitRect();
+
+const clampSize = (n) => Math.max(SIZE_MIN, Math.min(SIZE_MAX, Math.round(n)));
+
+/** 只改尺寸变量（不碰窗口）—— createWindow 之前先用它把 size 从 pet.json 读进来 */
+function setSizeVars(n) {
+  SIZE = clampSize(n);
+  K = SIZE / VIEW;
+  FLOOR_Y = FLOOR_RATIO * SIZE;
+  HIT_RECT = makeHitRect();
+  CONFIG.size = SIZE; CONFIG.k = K; CONFIG.floorY = FLOOR_Y;
+}
+
+/** 改大小：以「脚底中心」为锚点，她站的位置不跳；同时通知渲染进程重算 bounds */
+function applySize(n, opts = {}) {
+  const want = clampSize(n);
+  if (want === SIZE) return false;
+  const old = SIZE;
+  const b = win && !win.isDestroyed() ? win.getBounds() : null;
+  setSizeVars(want);
+  if (b && opts.keepAnchor !== false) {
+    const cx = b.x + old / 2;
+    const cy = b.y + old * FLOOR_RATIO;
+    let nx = Math.round(cx - SIZE / 2);
+    let ny = Math.round(cy - SIZE * FLOOR_RATIO);
+    // 放大最容易把窗口顶出屏幕：整窗夹进 workArea（先保脚底，再保头顶）
+    const wa = screen.getDisplayMatching({ x: nx, y: ny, width: SIZE, height: SIZE }).workArea;
+    ny = Math.max(wa.y, Math.min(ny, wa.y + wa.height - SIZE));
+    nx = Math.max(wa.x, Math.min(nx, wa.x + wa.width - SIZE));
+    win.setBounds({ x: nx, y: ny, width: SIZE, height: SIZE });
+  }
+  if (opts.persist !== false) writePetState({ size: SIZE });
+  if (win && !win.isDestroyed()) win.webContents.send('pet:config', CONFIG);
+  log('尺寸 →', SIZE, 'K=' + K.toFixed(3), 'floorY=' + Math.round(FLOOR_Y));
+  return true;
+}
+
 const inRect = (r, x, y) => x >= r.x0 && x <= r.x1 && y >= r.y0 && y <= r.y1;
 const hitTest = (wx, wy) => inRect(HIT_RECT, wx, wy) || uiRects.some((r) => inRect(r, wx, wy));
 
@@ -354,6 +404,8 @@ function startProactive() {
 
 // ────────────────────────────── 窗口 ──────────────────────────────
 function createWindow() {
+  const st = readPetState();
+  if (Number.isFinite(Number(st.size)) && Number(st.size) > 0) setSizeVars(Number(st.size));
   const b = restoreBounds();
   win = new BrowserWindow({
     width: SIZE,
@@ -648,6 +700,20 @@ function popupMenu() {
             },
           })),
         },
+        {
+          label: `大小（当前 ${SIZE}px）`,
+          submenu: [
+            { label: `更大 +${SIZE_STEP}`, click: () => applySize(SIZE + SIZE_STEP) },
+            { label: `更小 −${SIZE_STEP}`, click: () => applySize(SIZE - SIZE_STEP) },
+            { type: 'separator' },
+            { label: '小 280', type: 'checkbox', checked: SIZE === 280, click: () => applySize(280) },
+            { label: '中 420（默认）', type: 'checkbox', checked: SIZE === 420, click: () => applySize(420) },
+            { label: '大 560', type: 'checkbox', checked: SIZE === 560, click: () => applySize(560) },
+            { label: '巨大 700', type: 'checkbox', checked: SIZE === 700, click: () => applySize(700) },
+            { type: 'separator' },
+            { label: '鼠标放她身上滚轮也能调', enabled: false },
+          ],
+        },
         { label: '做个动作', submenu: subItems(MOTIONS) },
         { label: '换个表情', submenu: subItems(FACES) },
         {
@@ -853,6 +919,13 @@ ipcMain.handle('pet:config', () => ({
   hasToken: fs.existsSync(TOKEN_FILE),
   petState: readPetState(),
 }));
+
+// 渲染进程滚轮 / 菜单都能调大小；delta 是「几档」，size 是绝对值
+ipcMain.on('pet:resize', (_e, arg) => {
+  const o = arg || {};
+  if (Number.isFinite(o.size) && o.size > 0) applySize(o.size);
+  else if (Number.isFinite(o.delta) && o.delta !== 0) applySize(SIZE + o.delta * SIZE_STEP);
+});
 
 ipcMain.handle('pet:pos', (_e, { x, y }) => {
   if (Number.isFinite(x) && Number.isFinite(y)) writePetState({ left: Math.round(x), top: Math.round(y) });

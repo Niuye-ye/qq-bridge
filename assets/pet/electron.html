@@ -22,6 +22,7 @@
   #btns {
     position: absolute; left: 6px; top: 46px; display: flex; flex-direction: column; gap: 6px;
     opacity: 0; visibility: hidden; transition: opacity .16s ease;
+    transform-origin: top left; transform: scale(var(--k, 1));   /* 跟着窗口尺寸一起放大 */
   }
   #btns.on { opacity: 1; visibility: visible; }
   #btns button {
@@ -118,7 +119,7 @@ import { createRig, createBody } from './kit/body.js';
 // ── 尺寸：由主进程给，必须是正方形（VIEW 280x280），否则 figure/body 两套坐标系对不上
 let CFG = { size: 420, k: 420 / 280, floorY: 264 * (420 / 280), key: 'private:1946431105' };
 try { CFG = { ...CFG, ...(await (window.pet?.config?.() ?? null) || {}) }; } catch (e) { say('config 失败', e.message); }
-const W = CFG.size, H = CFG.size, S = CFG.k, FLOOR = CFG.floorY;
+let W = CFG.size, H = CFG.size, S = CFG.k, FLOOR = CFG.floorY;
 
 let api = null;
 let state = { mood: '', affinity: null, doing: '', lastLine: '', lastLineAt: 0, links: {}, paused: null, activityAt: 0 };
@@ -134,18 +135,21 @@ function flashBubble(text, ms) {
 }
 
 // ── 命中区：只覆盖角色本体，窗口其余部分一律让鼠标穿过去
-const CHAR_HALF = Math.min(112 * S, W * 0.44);
-const HIT = {
-  x0: W / 2 - CHAR_HALF,
-  x1: W / 2 + CHAR_HALF,
-  y0: Math.max(0, FLOOR * 0.24),
-  y1: Math.min(H, FLOOR + 14),
-};
-const inBody = (x, y) => x >= HIT.x0 && x <= HIT.x1 && y >= HIT.y0 && y <= HIT.y1;
+function makeHit() {
+  const half = Math.min(112 * S, W * 0.44);
+  return {
+    x0: W / 2 - half,
+    x1: W / 2 + half,
+    y0: Math.max(0, FLOOR * 0.24),
+    y1: Math.min(H, FLOOR + 14),
+  };
+}
+let HIT = makeHit();
+let inBody = (x, y) => x >= HIT.x0 && x <= HIT.x1 && y >= HIT.y0 && y <= HIT.y1;
 
 // ── UI 命中矩形：上报给主进程，让它把这几块从穿透里挖出来
-const BTN_RECT = { x0: 2, y0: 42, x1: 46, y1: 168 };
-const CHAT_RECT = { x0: 36, y0: 4, x1: 384, y1: 112 };
+let BTN_RECT = { x0: 2, y0: 42, x1: 46, y1: 168 };
+let CHAT_RECT = { x0: 36, y0: 4, x1: 384, y1: 112 };
 let hoverNear = false;
 function pushUiRects() {
   const rects = [];
@@ -154,8 +158,38 @@ function pushUiRects() {
   window.pet?.setUiRects(rects);
 }
 
+// 尺寸一变（右键菜单 / 滚轮），所有跟像素有关的矩形都得重算，再让 body 重新 layout
+function relayoutRects() {
+  HIT = makeHit();
+  inBody = (x, y) => x >= HIT.x0 && x <= HIT.x1 && y >= HIT.y0 && y <= HIT.y1;
+  CHAT_RECT = { x0: 36, y0: 4, x1: W - 36, y1: 112 };
+  // 按钮跟着尺寸缩放（CSS 读 --k），命中矩形同步放大
+  const k = Math.max(0.8, Math.min(2.2, W / 420));
+  document.documentElement.style.setProperty('--k', k.toFixed(3));
+  BTN_RECT = { x0: 2 * k, y0: 42 * k, x1: 46 * k, y1: 168 * k };
+  pushUiRects();
+}
+window.pet?.onConfig?.((c) => {
+  if (!c || !c.size) return;
+  CFG = { ...CFG, ...c };
+  W = CFG.size; H = CFG.size; S = CFG.k; FLOOR = CFG.floorY;
+  relayoutRects();
+  try { api?.resize?.(); } catch (_) {}
+  try { api?.layout?.(); } catch (_) {}
+  say('尺寸 →', W);
+});
+
+// 鼠标在她身上滚滚轮 = 调大小（聊天框开着时不抢）
+window.addEventListener('wheel', (e) => {
+  if (chat.classList.contains('on')) return;
+  if (!inBody(e.clientX, e.clientY)) return;
+  e.preventDefault();
+  window.pet?.resizeBy(e.deltaY < 0 ? 1 : -1);
+}, { passive: false });
+
 // ── 启动
 async function boot() {
+  relayoutRects();
   const stage = document.getElementById('stage');
   const base = new URL('./whale/', location.href);
 

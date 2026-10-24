@@ -51,6 +51,17 @@ contextBridge.exposeInMainWorld('pet', {
   /** 记住窗口位置 */
   savePos: (x, y) => ipcRenderer.invoke('pet:pos', { x, y }),
 
+  /** 调大小：delta=档数（+1 放大一档），size=绝对像素 */
+  resizeBy: (delta) => ipcRenderer.send('pet:resize', { delta }),
+  setSize: (size) => ipcRenderer.send('pet:resize', { size }),
+
+  /** 主进程改完尺寸会推新配置，渲染进程按它重算 bounds 再 api.layout() */
+  onConfig: (cb) => {
+    const h = (_e, c) => cb(c);
+    ipcRenderer.on('pet:config', h);
+    return () => ipcRenderer.removeListener('pet:config', h);
+  },
+
   /** 上报需要吃鼠标的 UI 矩形（窗口坐标），主进程并进穿透判定 */
   setUiRects: (rects) => ipcRenderer.send('pet:ui-rects', Array.isArray(rects) ? rects : []),
 
