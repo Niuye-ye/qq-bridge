@@ -12,7 +12,10 @@ import sys
 import numpy as np
 from PIL import Image
 
-WHALE = r'D:\qq-bridge\assets\pet\whale'
+# 仓库根 = 本脚本所在目录（scripts/）的上一级，不写死盘符。
+# 换机器 / 换目录只要保证脚本还在 <repo>/scripts/ 下就能跑；也支持环境变量覆盖。
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WHALE = os.environ.get('PET_WHALE_DIR') or os.path.join(REPO, 'assets', 'pet', 'whale')
 SCHEMES_DIR = os.path.join(WHALE, 'schemes')
 
 # id: (目标色相, 饱和度倍率, 明度倍率)

@@ -1686,7 +1686,7 @@ const FS_MAX_WRITE_BYTES = 512 * 1024;
 
 // 允许三种写法：
 //   1) diary/2026-10-22.md（推荐，短）
-//   2) D:\qq-bridge\diary\2026-10-22.md（模型照抄用户给的绝对路径也不会写飞）
+//   2) <数据目录>/diary/2026-10-22.md（模型照抄用户给的绝对路径也不会写飞）
 //   3) 2026-10-22.md（没前缀就当日记，落 diary/）
 function resolveFsPath(rawPath) {
   const raw = String(rawPath ?? '').trim().replace(/\\/g, '/');
