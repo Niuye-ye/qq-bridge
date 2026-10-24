@@ -2768,7 +2768,11 @@ async function main() {
   })();
 
   function cancelRoundWatchdog(key) {
-    const st = socialV2?.conversations?.[key];
+    // conversations 是 Map，用 conversations[key] 永远拿不到 → 旧定时器清不掉。
+    // 曾经就是这样：每轮 arm 一个新 watchdog，旧的 15 分钟后必定开火，把当时那个
+    // 才跑了 1 分钟的新回合掐断（日志「已经跑了 1 分钟（上限 15 分钟），强制掐断」）。
+    let st = null;
+    try { st = getSocialV2State(key); } catch { st = null; }
     if (st && st.roundWatchdogTimer) {
       clearTimeout(st.roundWatchdogTimer);
       st.roundWatchdogTimer = null;
@@ -2779,10 +2783,16 @@ async function main() {
     cancelRoundWatchdog(key);
     const st = getSocialV2State(key);
     const budget = WAKE_ROUND_BUDGET_MS;
+    const armedAt = Number(v2TurnStartAt.get(sessionId)) || 0;
     const timer = setTimeout(() => {
+      // 双重校验，只掐「自己负责的那一轮」：
+      //  1) 自己必须仍是当前定时器（不是被后来的 arm 顶替掉的旧定时器）
+      //  2) v2TurnStartAt 里的回合起点必须还是 arm 时那一轮（换轮了就不归我管）
+      if (st.roundWatchdogTimer !== timer) return;
       st.roundWatchdogTimer = null;
       const startedAt = Number(v2TurnStartAt.get(sessionId));
       if (!Number.isFinite(startedAt) || startedAt <= 0) return; // 回合已经正常结束
+      if (armedAt > 0 && startedAt !== armedAt) return;          // 已经开新一轮了
       const mins = Math.max(1, Math.round((Date.now() - startedAt) / 60000));
       log(`[reserved2] 回合超预算：${key} 已经跑了 ${mins} 分钟（上限 ${Math.round(budget / 60000)} 分钟），强制掐断`);
       void (async () => {
