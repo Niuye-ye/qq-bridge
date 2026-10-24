@@ -125,8 +125,36 @@ const SKINS = [
 // console.log 会抛 EPIPE 直接把主进程炸出一个错误弹窗（踩过）。
 const STAMP = () => new Date().toISOString().slice(11, 23);
 function writeLog(line) {
-  try { fs.appendFileSync(APP_LOG, line + '\r\n'); } catch (_) {}
+  // 编码写死 utf8：历史上有过一段是 cmd 重定向写的（GBK），混在同一个文件里
+  // 会让 grep / python 整读糊成 ????，中文关键词一个都搜不到。新行必须统一 UTF-8。
+  try { fs.appendFileSync(APP_LOG, line + '\r\n', 'utf8'); } catch (_) {}
 }
+
+// 启动时体检一次日志：含非法 UTF-8（历史 GBK 段）或超过 2MB 就轮转，
+// 旧文件改名 pet-app.log.old（只留一份，和 state-trim.ps1 的口径一致），新文件从干净的 UTF-8 开始。
+// 这样 grep 中文日志才靠得住，也不用担心文件无限长。
+const LOG_MAX_BYTES = 2 * 1024 * 1024;
+function prepareLogFile() {
+  try {
+    fs.mkdirSync(path.dirname(APP_LOG), { recursive: true });
+  } catch (_) { return; }
+  let buf = null;
+  try { buf = fs.readFileSync(APP_LOG); } catch (_) { return; }
+  if (!buf || !buf.length) return;
+  const hasBadBytes = buf.toString('utf8').includes('\uFFFD');
+  if (!hasBadBytes && buf.length < LOG_MAX_BYTES) return;
+  const old = APP_LOG + '.old';
+  try { fs.rmSync(old, { force: true }); } catch (_) {}
+  try {
+    fs.renameSync(APP_LOG, old);
+  } catch (_) {
+    try { fs.writeFileSync(APP_LOG, '', 'utf8'); } catch (__) {}
+    return;
+  }
+  const why = hasBadBytes ? '含非 UTF-8 段' : `超过 ${(buf.length / 1048576).toFixed(1)}MB`;
+  writeLog(`[日志轮转] 旧文件（${why}）已改名为 ${path.basename(old)}`);
+}
+prepareLogFile();
 function log(...a) {
   writeLog(`[${STAMP()}] ${a.map((x) => (typeof x === 'string' ? x : safeStr(x))).join(' ')}`);
 }
@@ -992,13 +1020,11 @@ function runOneClick() {
     return;
   }
   try {
-    // stdio 落文件：以前用 'ignore'，powershell 起不来时一点痕迹都没有，白点三次都不知道为什么
-    const spawnLog = path.join(path.dirname(APP_LOG), 'oneclick-spawn.log');
-    const opts = { detached: true, windowsHide: true, stdio: 'ignore' };
-    try {
-      const fd = fs.openSync(spawnLog, 'a');
-      opts.stdio = ['ignore', fd, fd];
-    } catch { /* 打不开就退回 ignore，至少不会挡住启动 */ }
+    // 2026-10-24 实测：detached:true 和「stdio 重定向到 fd」都会让 powershell.exe 5.1
+    // 在 ~100~300ms 内以 code 0 静默退出（什么都不干，spawn 日志 0 字节），
+    // 表现就是点菜单「一键修复 · 启动」点了没反应。只有「不 detached + stdio:'ignore'」
+    // 能让它正常跑满（实测 25 秒）。诊断信息本来就会写进脚本自己的 logs\oneclick.log，不亏。
+    const opts = { windowsHide: true, stdio: 'ignore' };
     const child = spawn('powershell.exe', [
       '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', ONECLICK, '-Quiet',
     ], opts);
