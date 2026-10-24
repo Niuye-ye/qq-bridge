@@ -35,24 +35,28 @@
   }
   #btns button:hover { opacity: 1; transform: scale(1.12); background: rgba(255,255,255,.95); }
 
-  /* 气泡：底边钉在角色头顶线上（y≈54），向上生长。两行会把长句切掉，
-     主进程的台词最多 34 字、加上表情/动作描述容易超，放宽到 4 行。 */
+  /* 气泡：底边钉在角色头顶线上（54px），向上生长。两行会把长句切掉，
+     主进程的台词最多 34 字、加上表情/动作描述容易超，放宽到 3 行。
+     **尺寸和位置都要乘 --k**：窗口缩到 260 时若还用固定 54px，气泡会顶出
+     窗口上沿被切掉一半（用户实测）。 */
   #bubble {
-    position: absolute; left: 50%; bottom: calc(100% - 54px); transform: translateX(-50%);
-    max-width: 342px; padding: 7px 11px; border-radius: 12px;
+    position: absolute; left: 50%; bottom: calc(100% - 54px * var(--k, 1)); transform: translateX(-50%);
+    max-width: min(342px, calc(100% - 14px));
+    padding: calc(6px * var(--k, 1)) calc(10px * var(--k, 1));
+    border-radius: calc(12px * var(--k, 1));
     background: rgba(255,255,255,.94); color: #1f2937;
-    font-size: 12.5px; line-height: 1.42; text-align: center;
+    font-size: calc(12.5px * var(--k, 1)); line-height: 1.42; text-align: center;
     box-shadow: 0 2px 10px rgba(0,0,0,.16); border: 1px solid rgba(148,163,184,.35);
     display: none; pointer-events: none;
     overflow: hidden;
     word-break: break-word;
   }
-  #bubble.on { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; }
+  #bubble.on { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
   #bubble.thin { color: #64748b; font-style: italic; }
 
   /* 聊天框：和气泡同一个位置，打开时顶上去一点 */
   #chat {
-    position: absolute; left: 50%; bottom: calc(100% - 104px); transform: translateX(-50%);
+    position: absolute; left: 50%; bottom: calc(100% - 104px * var(--k, 1)); transform: translateX(-50%);
     width: 344px; padding: 8px; border-radius: 14px; display: none;
     background: rgba(255,255,255,.96); box-shadow: 0 4px 18px rgba(0,0,0,.22);
     border: 1px solid rgba(148,163,184,.4); gap: 6px; align-items: center;
