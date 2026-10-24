@@ -56,7 +56,21 @@ const BRIDGE_CFG = path.join(REPO_ROOT, 'config.json');
 const TRAY_PNG = path.join(PET_ROOT, 'pet-tray.png');
 const FACE_PNG = path.join(PET_ROOT, 'whale', 'tex', 'face.png');
 const APP_LOG = process.env.PET_LOG || path.join(REPO_ROOT, 'logs', 'pet-app.log');
-const ONECLICK = process.env.PET_ONECLICK || '';
+// 「一键修复 · 启动」指向项目根的 一键启动.ps1。
+// 桌宠代码住在 <项目根>/qq-bridge/ 下，所以要先往上一级找；也兼容脚本被拷进仓库里的情况。
+// 找不到就是空串 —— 菜单里那一项不出现（不自作主张去猜别的路径）。
+function findOneClick() {
+  if (process.env.PET_ONECLICK) return process.env.PET_ONECLICK;
+  const cands = [
+    path.join(REPO_ROOT, '..', '一键启动.ps1'),   // qq-bridge 的兄弟目录（现在的真实位置）
+    path.join(REPO_ROOT, '一键启动.ps1'),
+  ];
+  for (const p of cands) {
+    try { if (fs.existsSync(p)) return path.resolve(p); } catch { /* 权限/坏链，跳过 */ }
+  }
+  return '';
+}
+const ONECLICK = findOneClick();
 
 // VIEW = [-12, -8, 268, 272] → 280 x 280。窗口必须是正方形，理由见 桌宠改造-最终方案.md §2
 const VIEW = 280;                 // rig view 的边长（正方形）
@@ -1121,6 +1135,7 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(() => {
     clearQuit();
     log('=== 桌宠启动', safeStr({ SIZE, K, FLOOR_Y }));
+    log(ONECLICK ? `一键启动脚本: ${ONECLICK}` : '一键启动脚本: 没找到 —— 右键菜单里不会有「一键修复 · 启动」');
     registerAppProtocol();
     createWindow();
     buildTray();
