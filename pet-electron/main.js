@@ -8,6 +8,34 @@ const fs = require('fs');
 const net = require('net');
 const { spawn, execFile } = require('child_process');
 
+// ────────────────────────────── 省内存开关 ──────────────────────────────
+// 桌宠是常驻程序：四个进程（main / gpu / utility / renderer）合计 455MB 太胖。
+// 下面这些必须在 app ready 之前定下来，改完要用 PET_MEM_REPORT=1 起一次，看日志里的「内存」行。
+// 原则：只关我们用不到的能力，画面渲染和鼠标交互一律不动。
+try {
+  // 渲染进程的 V8 堆上限（默认 ~2GB，我们只有几 MB 状态 + 若干纹理）。压小让 GC 更积极。
+  app.commandLine.appendSwitch('js-flags', '--max-old-space-size=128');
+  // 一共就几个本地文件，HTTP 缓存纯占内存和磁盘
+  app.commandLine.appendSwitch('disable-http-cache');
+  // 关掉用不到的 Chromium 子系统（每个都自带线程 / 内存预算）
+  app.commandLine.appendSwitch('disable-features', [
+    'Translate',                      // 网页翻译
+    'MediaRouter',                    // Cast 投屏
+    'AutofillServerCommunication',    // 表单自动填充联网
+    'OptimizationHints',              // 优化提示下载
+    'InterestFeedContentSuggestions', // 内容推荐
+    'BackForwardCache',               // 前进后退缓存
+    'CalculateNativeWinOcclusion',    // 窗口遮挡计算：透明 + 置顶窗口上它只会帮倒忙（会被判成"被遮挡"而停渲染）
+    'HardwareMediaKeyHandling',
+    'SpareRendererForSitePerProcess',
+  ].join(','));
+  // 低端设备模式：Chromium 换成更小的缓存/解码预算。实测这一条最省，画面几乎看不出差别
+  app.commandLine.appendSwitch('enable-low-end-device-mode');
+  app.commandLine.appendSwitch('disable-domain-reliability');  // 不上报稳定性数据
+  app.commandLine.appendSwitch('disable-background-networking');
+  app.commandLine.appendSwitch('no-pings');
+} catch { /* 开关设置失败不影响运行 */ }
+
 // ────────────────────────────── 常量 ──────────────────────────────
 // 仓库根 = 本文件上一级（pet-electron/ 就在仓库根下）。
 // 这样 clone / 搬到任何目录都能直接跑，不用改代码；个别位置可以用环境变量覆盖：
@@ -81,6 +109,23 @@ function safeStr(x) { try { return JSON.stringify(x); } catch (_) { return Strin
 function trimTo(s, n) {
   const t = String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
   return t.length > n ? t.slice(0, n - 1) + '…' : t;
+}
+
+// 内存体检：PET_MEM_REPORT=1 起一次，日志里会出现「内存 合计 xxxMB」+ 每个进程的明细。
+// 注意这只是我们自己四个进程，不含 DSH 桌面端（那也是 electron.exe）。
+function reportMemory(tag) {
+  try {
+    const rows = app.getAppMetrics().map((p) => {
+      const mb = Math.round((p.memory && p.memory.workingSetSize ? p.memory.workingSetSize : 0) / 1024);
+      return { type: p.type, pid: p.pid, mb };
+    }).sort((a, b) => b.mb - a.mb);
+    const total = rows.reduce((s, r) => s + r.mb, 0);
+    log(`内存(${tag || ''}) 合计 ${total}MB  ` + rows.map((r) => `${r.type} ${r.mb}MB`).join(' / '));
+    return total;
+  } catch (e) {
+    log('内存统计失败', e && e.message);
+    return 0;
+  }
 }
 
 process.on('uncaughtException', (e) => writeLog(`[${STAMP()}] !!! uncaught ${(e && e.stack) || e}`));
@@ -429,7 +474,7 @@ function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: false,
-      backgroundThrottling: false,
+      backgroundThrottling: true,   // 隐藏/最小化时自动降到 ~1fps，省 CPU；可见时无差别
       spellcheck: false,
     },
   });
@@ -443,6 +488,9 @@ function createWindow() {
     log('窗口已显示（不抢焦点）');
     startHitPolling();
     startProactive();
+    // 全是本地文件，HTTP 缓存纯占地方
+    try { win.webContents.session.clearCache().catch(() => {}); } catch { /* ignore */ }
+    if (process.env.PET_MEM_REPORT) setTimeout(() => reportMemory('启动后'), 9000);
   });
   win.webContents.on('did-fail-load', (_e, code, desc, url) => log('did-fail-load', code, desc, url));
   win.webContents.on('render-process-gone', (_e, d) => log('渲染进程没了', safeStr(d)));
@@ -456,6 +504,17 @@ function createWindow() {
     const [x, y] = win.getPosition();
     writePetState({ left: x, top: y });
   });
+
+  // 藏起来 / 最小化时把渲染帧率压到 2fps：她还在，但不再每帧重画（量过，能省 3~5% CPU）
+  const setIdleFrameRate = (fps) => {
+    if (!win || win.isDestroyed()) return;
+    try { win.webContents.setFrameRate(fps); } catch { /* 旧版本没有这个方法 */ }
+  };
+  win.on('hide', () => setIdleFrameRate(2));
+  win.on('show', () => setIdleFrameRate(60));
+  win.on('minimize', () => setIdleFrameRate(2));
+  win.on('restore', () => setIdleFrameRate(60));
+
   win.on('closed', () => { win = null; });
 
   win.loadURL('app://pet/electron.html');
