@@ -9,6 +9,7 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -1794,6 +1795,170 @@ server.tool(
       return { content: [{ type: 'text', text }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `列目录失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+// ── 视频：让她自己挑内容、自己生成 ───────────────────────────────────────────
+const MCP_HERE = path.dirname(fileURLToPath(import.meta.url));
+const VIDEO_SCRIPT = path.join(MCP_HERE, '..', 'scripts', 'make-video.py');
+const VIDEO_DIR = path.join(MCP_HERE, '..', 'videos');
+const VIDEO_JOBS = path.join(MCP_HERE, '..', 'state', 'video-jobs');
+
+function pickPython() {
+  const fromEnv = process.env.PET_PYTHON;
+  if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
+  for (const p of ['D:\\Python\\python.exe', 'C:\\Python312\\python.exe', 'C:\\Python311\\python.exe', '/usr/bin/python3']) {
+    try { if (fs.existsSync(p)) return p; } catch { /* ignore */ }
+  }
+  return 'python';
+}
+
+function readTailLines(file, n = 8) {
+  try {
+    return fs.readFileSync(file, 'utf8').split(/\r?\n/).filter((l) => l.trim()).slice(-n);
+  } catch {
+    return [];
+  }
+}
+
+server.tool(
+  'qq_make_video',
+  '自己做一个科普短视频（旁白配音 + 字幕动效，输出 mp4）。传标题和分段，后台开始渲染，一分钟左右的片子要几十秒到几分钟。做完用 qq_video_status 查，拿到路径可以发给主人。选题规矩：一个视频只讲一个具体的小问题，要有能画出来的对比或数字，别做「AI 是什么」这种大而空的题。',
+  {
+    title: z.string().describe('视频标题（左上角常驻小字）'),
+    segments: z.array(
+      z.object({
+        say: z.string().optional().describe('给配音念的旁白；不填就是纯画面段'),
+        show: z.string().optional().describe('画面上的大字；不填就用 say'),
+        kind: z.enum(['title', 'text', 'number', 'end']).optional().describe('title=开场大标题 text=正文 number=数字放大 end=结尾'),
+        big: z.string().optional().describe('kind=number 时的大数字，例如 0.03'),
+        unit: z.string().optional().describe('数字后面的单位，例如 元 / 倍 / 秒'),
+        dur: z.number().optional().describe('没有 say 时这一段的秒数，默认 3'),
+      })
+    ).describe('分段，按顺序播'),
+    voice: z.string().optional().describe('音色，默认 zh-CN-XiaoxiaoNeural（女声）；男声可用 zh-CN-YunxiNeural'),
+    size: z.enum(['720p', '1080p']).optional().describe('分辨率，默认 1080p；赶时间用 720p'),
+  },
+  async ({ title, segments, voice, size }) => {
+    try {
+      if (!Array.isArray(segments) || segments.length === 0) {
+        return { content: [{ type: 'text', text: 'segments 是空的，至少给一段' }], isError: true };
+      }
+      if (segments.length > 30) {
+        return { content: [{ type: 'text', text: `分段太多（${segments.length}），最多 30 段` }], isError: true };
+      }
+      if (!fs.existsSync(VIDEO_SCRIPT)) {
+        return { content: [{ type: 'text', text: `找不到渲染脚本：${VIDEO_SCRIPT}` }], isError: true };
+      }
+      fs.mkdirSync(VIDEO_JOBS, { recursive: true });
+      fs.mkdirSync(VIDEO_DIR, { recursive: true });
+
+      const id = 'v' + Date.now().toString(36);
+      const hd = size !== '720p';
+      const job = {
+        title: String(title || '一个视频'),
+        voice: voice || 'zh-CN-XiaoxiaoNeural',
+        width: hd ? 1920 : 1280,
+        height: hd ? 1080 : 720,
+        fps: 30,
+        segments,
+      };
+      const jobPath = path.join(VIDEO_JOBS, `${id}.json`);
+      fs.writeFileSync(jobPath, JSON.stringify(job, null, 2), 'utf8');
+      const outPath = path.join(VIDEO_DIR, `${id}.mp4`);
+      const logPath = path.join(VIDEO_JOBS, `${id}.log`);
+      const fd = fs.openSync(logPath, 'a');
+      const child = spawn(pickPython(), [VIDEO_SCRIPT, jobPath, '--out', outPath], {
+        cwd: path.dirname(VIDEO_SCRIPT),
+        detached: true,
+        stdio: ['ignore', fd, fd],
+        windowsHide: true,
+      });
+      child.unref();
+      try { fs.writeSync(fd, ''); } catch { /* ignore */ }
+      fs.writeFileSync(path.join(VIDEO_JOBS, `${id}.pid`), String(child.pid ?? ''), 'utf8');
+
+      const est = Math.round(segments.length * 9 + 15);
+      return {
+        content: [{
+          type: 'text',
+          text: [
+            `开始做了：《${job.title}》`,
+            `id=${id}，${segments.length} 段，${hd ? '1080p' : '720p'}，预计 ${est} 秒左右出片。`,
+            `文件会出在 videos/${id}.mp4。`,
+            `过一会儿用 qq_video_status 传 id=${id} 看做好了没（做完了会把路径给你，可以直接发给主人）。`,
+          ].join('\n'),
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `没能开始：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_video_status',
+  '查自己做过的视频：进行中显示渲染进度，做好给文件路径（可以发给主人），失败给报错。不传 id 就列最近几个。',
+  { id: z.string().optional().describe('qq_make_video 返回的 id，例如 vk3f9a；留空列最近 5 个') },
+  async ({ id }) => {
+    try {
+      if (!fs.existsSync(VIDEO_JOBS)) {
+        return { content: [{ type: 'text', text: '还没做过视频' }] };
+      }
+      const allIds = fs.readdirSync(VIDEO_JOBS)
+        .filter((f) => f.endsWith('.json'))
+        .map((f) => f.slice(0, -5))
+        .sort((a, b) => {
+          try { return fs.statSync(path.join(VIDEO_JOBS, b + '.json')).mtimeMs - fs.statSync(path.join(VIDEO_JOBS, a + '.json')).mtimeMs; }
+          catch { return 0; }
+        });
+
+      const describeOne = (vid) => {
+        const out = path.join(VIDEO_DIR, `${vid}.mp4`);
+        const tail = readTailLines(path.join(VIDEO_JOBS, `${vid}.log`), 10);
+        const joined = tail.join('\n');
+        let hasOut = false;
+        let bytes = 0;
+        try { bytes = fs.statSync(out).size; hasOut = bytes > 1024; } catch { /* ignore */ }
+        const done = hasOut && /完成:/.test(joined);
+        const failed = !done && /Traceback|渲染失败|找不到 ffmpeg|没能开始/.test(joined);
+        let titleNow = '';
+        try { titleNow = JSON.parse(fs.readFileSync(path.join(VIDEO_JOBS, `${vid}.json`), 'utf8')).title || ''; } catch { /* ignore */ }
+        return {
+          vid,
+          title: titleNow,
+          done,
+          failed,
+          out,
+          mb: hasOut ? (bytes / 1048576).toFixed(1) : '0',
+          last: tail.filter((l) => l.trim()).pop() || '（还没输出）',
+        };
+      };
+
+      if (!id) {
+        const rows = allIds.slice(0, 5).map(describeOne);
+        if (!rows.length) return { content: [{ type: 'text', text: '还没做过视频' }] };
+        const text = rows.map((r) => {
+          const st = r.done ? '✅ 做好了' : r.failed ? '❌ 失败' : '⏳ 进行中';
+          return `${st}  ${r.vid}  《${r.title}》${r.done ? `  ${r.mb}MB  ${r.out}` : `  — ${r.last}`}`;
+        }).join('\n');
+        return { content: [{ type: 'text', text: `最近做的视频：\n${text}\n\n要看详情就传 id。` }] };
+      }
+
+      const r = describeOne(String(id).trim());
+      if (!fs.existsSync(path.join(VIDEO_JOBS, `${r.vid}.json`))) {
+        return { content: [{ type: 'text', text: `没有 id=${r.vid} 这个任务。现有的：${allIds.slice(0, 5).join(', ') || '（无）'}` }], isError: true };
+      }
+      if (r.done) {
+        return { content: [{ type: 'text', text: `✅ 《${r.title}》做好了\n路径：${r.out}\n大小：${r.mb} MB\n想给主人看就用 qq_send_image 传不了的视频，先跟主人说一声文件在哪。` }] };
+      }
+      if (r.failed) {
+        return { content: [{ type: 'text', text: `❌ 《${r.title}》失败了\n最后的输出：\n${r.last}\n\n要重做就再调一次 qq_make_video（改改分段）。` }], isError: true };
+      }
+      return { content: [{ type: 'text', text: `⏳ 《${r.title}》还在做\n进度：${r.last}\n再过半分钟问一次。` }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `查状态失败：${error?.message ?? error}` }], isError: true };
     }
   }
 );

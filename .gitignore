@@ -78,3 +78,10 @@ audio/
 /pet-electron/err.txt
 /pet-electron/out.txt
 /pet-electron/install.log
+# 生成的视频与任务记录
+/videos/
+/state/video-jobs/
+
+# 本地跑渲染器时的临时产物
+/scripts/_sample.json
+/scripts/videos/
