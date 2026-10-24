@@ -11632,9 +11632,12 @@ ${turboNote}
         sum += Number(s.costCny) || 0;
         hits += 1;
       }
-      // 在 turbo 里还要显示「这一段」花了多少：用开始时的快照做差
-      const since = Number(socialV2.turbo?.costAtStart) || 0;
-      return { today: sum, since, delta: since > 0 ? Math.max(0, sum - since) : 0, hits };
+      // 在 turbo 里还要显示「这一段」花了多少：用开始时的快照做差。
+      // 快照为 0 也要算：她刚装上 cost-meter 那晚快照就是 0，若用 since > 0 判定，
+      // 「这一段」会永远显示 0（2026-10-25 踩过）。
+      const snap = socialV2.turbo ? Number(socialV2.turbo.costAtStart) : NaN;
+      const since = Number.isFinite(snap) && snap > 0 ? snap : 0;
+      return { today: sum, since, delta: Number.isFinite(snap) ? Math.max(0, sum - since) : 0, hits };
     } catch {
       return null;
     }
