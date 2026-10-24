@@ -6,7 +6,7 @@ const {
 const path = require('path');
 const fs = require('fs');
 const net = require('net');
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 
 // ────────────────────────────── 常量 ──────────────────────────────
 // 仓库根 = 本文件上一级（pet-electron/ 就在仓库根下）。
@@ -795,17 +795,74 @@ function showActivityBox() {
   dialog.showMessageBox({ type: 'info', title: '她', message: '她现在这样', detail: lines.join('\n'), buttons: ['知道了'] });
 }
 
-function showLinkStatus() {
+// ── MuMu 虚拟机状态 ───────────────────────────────────────────────────────────
+// 不能用"MuMuNxMain.exe 在不在"判断：那个只是管理器窗口，实例没启动它照样在跑。
+// 官方 CLI 的 `info -v 0` 才有 is_process_started / is_android_started。
+function findMuMuCli() {
+  if (process.env.PET_MUMU_CLI) return process.env.PET_MUMU_CLI;
+  const cands = [
+    'F:\\Program Files\\Netease\\MuMu\\nx_main\\MuMuManager.exe',
+    'C:\\Program Files\\Netease\\MuMu\\nx_main\\MuMuManager.exe',
+    'D:\\Program Files\\Netease\\MuMu\\nx_main\\MuMuManager.exe',
+    'E:\\Program Files\\Netease\\MuMu\\nx_main\\MuMuManager.exe',
+  ];
+  for (const p of cands) { try { if (fs.existsSync(p)) return p; } catch (_) {} }
+  return '';
+}
+
+function readMuMuInfo() {
+  const cli = findMuMuCli();
+  if (!cli) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    try {
+      execFile(cli, ['info', '-v', '0'], { timeout: 5000, windowsHide: true }, (err, stdout) => {
+        if (err || !stdout) return resolve(null);
+        try {
+          const j = JSON.parse(String(stdout).trim());
+          resolve({
+            started: j.is_android_started === true,
+            running: j.is_process_started === true,
+            name: j.name || '',
+          });
+        } catch (_) { resolve(null); }
+      });
+    } catch (_) { resolve(null); }
+  });
+}
+
+async function showLinkStatus() {
   const l = (bridgeState && bridgeState.links) || {};
   const mark = (v) => (v === true ? '✅' : v === false ? '❌' : '…');
+  const [mumu, adb] = await Promise.all([readMuMuInfo(), probePort(16384)]);
+  const muLine = mumu
+    ? `MuMu 实例${mumu.name ? `「${mumu.name}」` : ''}  ${mumu.started ? '✅ 安卓已启动' : mumu.running ? '⚠️ 进程在，安卓没起来' : '❌ 没启动'}`
+    : 'MuMu 实例  … 找不到 MuMuManager.exe（可设环境变量 PET_MUMU_CLI）';
+  const adbLine = `adb 16384  ${mark(adb)}`;
+  // 她能不能操控手机 = MuMu 安卓真的起来了 + adb 通
+  const canControl = mumu ? (mumu.started === true && adb === true) : adb === true;
+  const whyNot = !mumu
+    ? '没装 MuMu / 路径不对'
+    : !mumu.started
+      ? 'MuMu 实例没启动'
+      : adb !== true
+        ? 'adb 没连上 127.0.0.1:16384'
+        : '';
   const lines = [
-    `SnowLuma 3000　${mark(l.sluma)}`,
-    `dsh web 3080　　${mark(l.web)}`,
-    `qq-bridge 3100　${mark(l.bridge)}`,
+    `SnowLuma 3000  ${mark(l.sluma)}`,
+    `dsh web 3080    ${mark(l.web)}`,
+    `qq-bridge 3100  ${mark(l.bridge)}`,
+    muLine,
+    adbLine,
     '',
-    `她说了 ${(bridgeState && bridgeState.lastLine) ? '话' : '…'}`,
+    canControl ? '她能不能操控手机：✅ 能' : `她能不能操控手机：❌ 不能（${whyNot}）`,
   ];
-  dialog.showMessageBox({ type: 'info', title: 'QQ 链路', message: '现在的链路', detail: lines.join('\n'), buttons: ['知道了'] });
+  dialog.showMessageBox({
+    type: canControl ? 'info' : 'warning',
+    title: 'QQ 链路',
+    message: canControl ? '现在的链路' : '链路有环节没起来',
+    detail: lines.join('\n'),
+    buttons: ['知道了'],
+  });
 }
 
 async function wakeHer(reason) {

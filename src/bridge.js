@@ -834,7 +834,7 @@ function loadConfig() {
         syncTtlMs: 60000,          // QQ 收藏表情刷新缓存 TTL（毫秒）
         maxListCount: 100,         // qq_list_stickers 单次最大返回数
         includeInPrompt: true,     // 是否在 qq_get_prompt / 唤醒提示里附带表情摘要与策略
-        promptMaxStickers: 8,      // 提示里最多列出的常用表情数
+        promptMaxStickers: 3,      // 提示里最多列出的常用表情数（8→3：实测 8 个占 544 字符/轮，多数用不上）
         collect: {
           enabled: true,           // AI 收藏他人表情总开关
           maxPerMinute: 2,         // 每分钟最多收藏次数
@@ -946,7 +946,7 @@ function loadConfig() {
     syncTtlMs: 60000,
     maxListCount: 100,
     includeInPrompt: true,
-    promptMaxStickers: 8,
+    promptMaxStickers: 3,
     collect: {
       enabled: true,
       maxPerMinute: 2,
@@ -10733,8 +10733,10 @@ async function main() {
   // tier: long = 画像/喜好/约定，永不淡忘；normal = 事件/见闻，半衰期 30 天。
   const FACTS_PATH = path.join(ROOT, 'state', 'facts.json');
   const FACTS_MAX = 80;
-  const FACTS_INJECT_LONG = 6;
-  const FACTS_INJECT_NORMAL = 4;
+  // 每轮注入的记忆条数。原来是 6+4，实测「【你记得的事】」一段就占 1246 字符/轮；
+  // 4+2 仍能覆盖画像与近期见闻，长尾让 AI 用 qq_recall 按需翻。
+  const FACTS_INJECT_LONG = 4;
+  const FACTS_INJECT_NORMAL = 2;
   const FACTS_HALF_LIFE_DAYS = 30;
 
   function readFactsV2() {
@@ -10883,7 +10885,7 @@ async function main() {
     const antiAiLine = '【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n';
     const stickerCfg = cfg.socialV2?.sticker ?? {};
     const stickerLine = stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false
-      ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 8)}\n\n`
+      ? `${buildStickerStrategyHint()}\n${buildStickerContext(stickerEntries, stickerCfg.promptMaxStickers ?? 3)}\n\n`
       : '';
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
     const proactiveLine = '【积极性】不要习惯性潜水：群里有你能接的话题就主动参与，偶尔插一句别人的话题也很正常；只有确实没话可说、对方已明确结束、或长时间没人说话时才潜水。\n\n';
@@ -10924,7 +10926,18 @@ async function main() {
     const activityLine = activityText ? `${activityText}\n\n` : '';
     const factsText = formatFactsLineV2();
     const factsLine = factsText ? `${factsText}\n\n` : '';
-    const base = clockLine + roleLine + identityLine + tokenLine + initialPromptLine + activityLine + factsLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + participationLine + preSleepLine + journalLine;
+    // ── 规则段分层注入 ────────────────────────────────────────────────
+    // 【反AI味】【积极性】【表情策略】【沉睡前等待】【日记与心情】这五段是稳定的行为约束，
+    // 内容每轮几乎完全一样（合计约 1400 字符）。DSH 会话是持久化的：第一轮讲清楚，
+    // 后续轮次它们已经在上文里了，重复注入纯属给每轮加钱。
+    // 但上下文压缩（billion-context / DSH 自己的裁剪）可能把早期内容吃掉，
+    // 规则丢了就会行为退化（有求必应、跳过沉睡前观察……），所以每 N 轮补一次。
+    const RULES_REFRESH_EVERY = 10;
+    const wakeCountForRules = Number(st.wakeConfig?.wakeCount) || 0;
+    const needRules = reason === 'bootstrap' || wakeCountForRules <= 2 || wakeCountForRules % RULES_REFRESH_EVERY === 0;
+    const rulesLine = needRules ? `${antiAiLine}${proactiveLine}${stickerLine}${preSleepLine}${journalLine}` : '';
+    // 【首回复节奏】里带动态的剩余静默秒数，必须每轮带；其余（时间/状态/记忆/参与度）也都是变化项。
+    const base = clockLine + roleLine + identityLine + tokenLine + initialPromptLine + activityLine + factsLine + rulesLine + replyLine + statusLine + wakeLine + memoryLine + participationLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }

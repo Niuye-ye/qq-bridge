@@ -35,7 +35,8 @@
   }
   #btns button:hover { opacity: 1; transform: scale(1.12); background: rgba(255,255,255,.95); }
 
-  /* 气泡：底边钉在角色头顶线上（y≈54），向上生长，最多两行 */
+  /* 气泡：底边钉在角色头顶线上（y≈54），向上生长。两行会把长句切掉，
+     主进程的台词最多 34 字、加上表情/动作描述容易超，放宽到 4 行。 */
   #bubble {
     position: absolute; left: 50%; bottom: calc(100% - 54px); transform: translateX(-50%);
     max-width: 342px; padding: 7px 11px; border-radius: 12px;
@@ -46,7 +47,7 @@
     overflow: hidden;
     word-break: break-word;
   }
-  #bubble.on { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  #bubble.on { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; }
   #bubble.thin { color: #64748b; font-style: italic; }
 
   /* 聊天框：和气泡同一个位置，打开时顶上去一点 */
@@ -70,14 +71,7 @@
   #chat button:hover { background: #1d4ed8; }
   #chat button:disabled { background: #94a3b8; cursor: default; }
 
-  /* 右上角三个链路点 */
-  #dots { position: absolute; right: 8px; top: 8px; display: flex; gap: 4px; opacity: .8; }
-  #dots i {
-    width: 7px; height: 7px; border-radius: 50%; background: #cbd5e1; display: block;
-    box-shadow: 0 0 0 1px rgba(255,255,255,.7);
-  }
-  #dots i.ok { background: #22c55e; }
-  #dots i.bad { background: #ef4444; }
+  /* 右上角三个链路点已移除（用户反馈"没用"）：链路状态看右键菜单「QQ 链路 → 看链路状态」 */
 
   #err {
     position: absolute; left: 4px; bottom: 4px; right: 4px; color: #dc2626;
@@ -88,7 +82,6 @@
 <body>
 <div id="stage"></div>
 <div id="ui">
-  <div id="dots" title="链路"><i data-k="sluma"></i><i data-k="web"></i><i data-k="bridge"></i></div>
   <div id="btns">
     <button data-a="chat" title="打字">打</button>
     <button data-a="pat" title="摸头">摸</button>
@@ -231,7 +224,6 @@ const bubble = document.getElementById('bubble');
 const chat = document.getElementById('chat');
 const chatIn = document.getElementById('chatIn');
 const chatSend = document.getElementById('chatSend');
-const dots = [...document.querySelectorAll('#dots i')];
 
 // 气泡不常显：只有她刚说过话 / 在等她回 / 鼠标靠过来 才冒出来
 const BUBBLE_FRESH_MS = 120 * 1000;
@@ -263,14 +255,6 @@ function renderBubble() {
 // 让她说过的话到点自己收起来（2 分钟），不用等下一次状态推送
 setInterval(renderBubble, 1000);
 
-function renderDots() {
-  for (const el of dots) {
-    const v = state.links ? state.links[el.dataset.k] : null;
-    el.classList.toggle('ok', v === true);
-    el.classList.toggle('bad', v === false);
-  }
-}
-
 function applyState(s) {
   const prevAt = state.lastLineAt || 0;
   const prevMood = state.mood, prevPaused = state.paused;
@@ -278,7 +262,6 @@ function applyState(s) {
   // 她回了新的 → 立刻撤掉「她想一下…」，别让占位干等 60 秒
   if (s.lastLineAt && s.lastLineAt > prevAt) pendingUntil = 0;
   renderBubble();
-  renderDots();
   // 只在真的变了才做动作，否则每 2 秒推一次会把她按在床上反复睡
   try {
     if (s.paused === true && prevPaused !== true) api?.do('sleep');
