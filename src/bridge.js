@@ -2104,25 +2104,115 @@ async function main() {
     return { abs, bytes: st.size, label: rel.split(path.sep).join('/') };
   }
 
-  // 现拍一张 MuMu 的屏幕（adb exec-out screencap -p），给"发张截图给我"这种请求用。
-  function captureDeviceScreenshotV2() {
+  // ── adb 设备解析（2026-10-24）──────────────────────────────────────────────
+  // MuMu 的 adb 端口会漂（实测 16384 ↔ 16385），以前直接把 config 的 serial 塞给 adb，
+  // 端口一变就是 "device not found / offline"，截图和发图一起哑。这里按
+  // 「配置的 serial → 已在线设备 → 逐个 adb connect 试端口」的顺序解析，成功的串号缓存 10 分钟。
+  const ADB_DEVICE_CACHE = { serial: '', at: 0 };
+  const ADB_DEVICE_CACHE_TTL_MS = 10 * 60 * 1000;
+
+  function adbPathV2() {
     const ic = cfg.socialV2?.image ?? {};
     const adbPath = String(ic.adbPath || '').trim();
-    const serial = String(ic.serial || '').trim();
     if (!adbPath || !fs.existsSync(adbPath)) {
       throw new Error(`adb 不存在：${adbPath || '(未配置 socialV2.image.adbPath)'}`);
     }
-    const buf = execFileSync(adbPath, ['-s', serial, 'exec-out', 'screencap', '-p'], {
-      timeout: 25000,
-      maxBuffer: 64 * 1024 * 1024,
-      encoding: 'buffer',
-      windowsHide: true
-    });
-    if (!looksLikeImageBuffer(buf)) {
-      throw new Error('截图回来的不是图片：模拟器可能没连上（先确认 MuMu 开着、adb connect 成功）');
+    return adbPath;
+  }
+
+  function adbRunV2(adbPath, args, timeout = 8000) {
+    try {
+      const out = execFileSync(adbPath, args, { timeout, encoding: 'utf8', windowsHide: true });
+      return { ok: true, out: String(out || '') };
+    } catch (error) {
+      return { ok: false, out: String(error?.stdout || ''), err: String(error?.stderr || error?.message || error) };
     }
-    if (buf.length > MAX_MEDIA_BYTES) throw new Error(`截图太大（${formatBytes(buf.length)}）`);
-    return buf;
+  }
+
+  function adbOnlineSerialsV2(adbPath) {
+    const out = adbRunV2(adbPath, ['devices'], 8000).out;
+    return out.split(/\r?\n/).slice(1).map((line) => line.trim()).filter(Boolean)
+      .map((line) => line.split(/\s+/))
+      .filter((parts) => parts[1] === 'device')
+      .map((parts) => parts[0]);
+  }
+
+  function adbPortCandidatesV2(prefer) {
+    const ic = cfg.socialV2?.image ?? {};
+    const list = [];
+    const push = (p) => { const n = Number(p); if (Number.isInteger(n) && n > 0 && n < 65536 && !list.includes(n)) list.push(n); };
+    const preferPort = Number((/^([\d.]+):(\d+)$/.exec(prefer) || [])[2]);
+    if (preferPort) push(preferPort);
+    if (Array.isArray(ic.adbPorts)) ic.adbPorts.forEach(push);
+    [16384, 16385, 16386, 16387].forEach(push);
+    return list;
+  }
+
+  function resolveAdbSerialV2(adbPath) {
+    const prefer = String(cfg.socialV2?.image?.serial || '').trim();
+    const preferIsAuto = !prefer || prefer.toLowerCase() === 'auto';
+    const now = Date.now();
+    const cached = ADB_DEVICE_CACHE.serial;
+    if (cached && now - ADB_DEVICE_CACHE.at < ADB_DEVICE_CACHE_TTL_MS && adbOnlineSerialsV2(adbPath).includes(cached)) {
+      return cached;
+    }
+    const remember = (serial) => {
+      if (ADB_DEVICE_CACHE.serial && ADB_DEVICE_CACHE.serial !== serial) log(`[screen] adb 串号从 ${ADB_DEVICE_CACHE.serial} 换成 ${serial}`);
+      ADB_DEVICE_CACHE.serial = serial;
+      ADB_DEVICE_CACHE.at = Date.now();
+      return serial;
+    };
+    const online = adbOnlineSerialsV2(adbPath);
+    if (!preferIsAuto && online.includes(prefer)) return remember(prefer);
+    if (online.length) {
+      const first = online[0];
+      if (!preferIsAuto && first !== prefer) log(`[screen] 配置的 adb 设备 ${prefer} 不在线，改用已连接的 ${first}`);
+      return remember(first);
+    }
+    // 一个在线设备都没有 → 按端口逐个 adb connect（MuMu 端口会漂，别只试一个）
+    const host = (/^([\d.]+):\d+$/.exec(prefer) || [])[1] || '127.0.0.1';
+    const ports = adbPortCandidatesV2(prefer);
+    for (const port of ports) {
+      const target = `${host}:${port}`;
+      adbRunV2(adbPath, ['connect', target], 6000);
+      if (adbOnlineSerialsV2(adbPath).includes(target)) {
+        log(`[screen] adb connect ${target} 成功（配置的 serial：${prefer || '(空)'}）`);
+        return remember(target);
+      }
+    }
+    throw new Error(`adb 找不到可用设备（配置 serial：${prefer || '(空)'}；已试 ${ports.map((p) => `${host}:${p}`).join(' / ')}）——先确认 MuMu 开着，或改 config.json 的 socialV2.image.serial`);
+  }
+
+  // 现拍一张 MuMu 的屏幕（adb exec-out screencap -p），给"发张截图给我"这种请求用。
+  // 第一次用缓存串号；失败就清缓存重解析（含 adb connect 重连）再试一次。
+  function captureDeviceScreenshotV2() {
+    const adbPath = adbPathV2();
+    let lastError = '';
+    let lastSerial = '';
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const serial = resolveAdbSerialV2(adbPath);
+      lastSerial = serial;
+      try {
+        const buf = execFileSync(adbPath, ['-s', serial, 'exec-out', 'screencap', '-p'], {
+          timeout: 25000,
+          maxBuffer: 64 * 1024 * 1024,
+          encoding: 'buffer',
+          windowsHide: true
+        });
+        if (!looksLikeImageBuffer(buf)) {
+          throw new Error('截图回来的不是图片：模拟器可能没连上（先确认 MuMu 开着、adb connect 成功）');
+        }
+        if (buf.length > MAX_MEDIA_BYTES) throw new Error(`截图太大（${formatBytes(buf.length)}）`);
+        return buf;
+      } catch (error) {
+        lastError = String(error?.stderr || error?.message || error).trim();
+        ADB_DEVICE_CACHE.serial = '';
+        ADB_DEVICE_CACHE.at = 0;
+        adbRunV2(adbPath, ['disconnect', serial], 4000);
+        log(`[screen] 第 ${attempt + 1} 次截图失败（${serial}）：${lastError.slice(0, 200)}`);
+      }
+    }
+    throw new Error(`截图失败（${lastSerial}）：${lastError.slice(0, 300)}`);
   }
 
   async function sendImageV2(key, buffer, options = {}) {

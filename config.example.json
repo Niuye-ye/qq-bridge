@@ -109,6 +109,13 @@
     "enabled": true,
     "autoReplyCheckMs": 30000,
     "agentPreset": "qq-chat-v2",
+    "image": {
+      "enabled": true,
+      "adbPath": "",
+      "serial": "auto",
+      "adbPorts": [16384, 16385],
+      "maxPerMinute": 6
+    },
     "provideRecommendations": true,
     "tools": {
       "getPrompt": true,
