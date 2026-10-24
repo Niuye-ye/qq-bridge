@@ -1,0 +1,118 @@
+// 想干的事（goals）+ 生活时间线（life）—— 小鲸鱼「主观能动性」的数据层。
+//
+// 从 src/bridge.js 里抽出来的第一块（2026-10-24）：纯文件读写 + 文本格式化，
+// 不碰会话状态机，抽出来零风险，也给后面继续拆分立个样板。
+//
+//   goals.json  { goals: [{id, text, status:'open'|'done'|'dropped', want, createdAt, closedAt?}], updatedAt }
+//   life.json   { timeline: [{t:'HH:MM', text, at:ISO}], updatedAt }
+//
+// 注入 prompt 的两段：【你自己想干的事】（open 按 want 降序取 5 条）、【今天早些时候】（当天最近 6 条）。
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, '..');   // src/ 的上一级 = 仓库根
+
+const GOALS_PATH = path.join(ROOT, 'state', 'goals.json');
+const LIFE_PATH = path.join(ROOT, 'state', 'life.json');
+const GOALS_MAX = 40;
+const LIFE_KEEP = 60;
+
+function readJsonFile(p, fallback) {
+  try {
+    if (!fs.existsSync(p)) return fallback;
+    const o = JSON.parse(fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, ''));
+    return o && typeof o === 'object' ? o : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonFile(p, o) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, `${JSON.stringify(o, null, 2)}\n`, 'utf8');
+}
+
+export function readGoalsV2() {
+  const o = readJsonFile(GOALS_PATH, { goals: [] });
+  return Array.isArray(o.goals) ? o.goals : [];
+}
+
+export function writeGoalsV2(list) {
+  writeJsonFile(GOALS_PATH, { goals: list.slice(-GOALS_MAX), updatedAt: new Date().toISOString() });
+  return list;
+}
+
+export function addGoalV2(text, opts = {}) {
+  const t = String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, 160);
+  if (!t) return null;
+  const list = readGoalsV2();
+  const dup = list.find((g) => g.status === 'open' && g.text === t);
+  if (dup) return dup;
+  const wantRaw = Number(opts.want);
+  const g = {
+    id: `g${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+    text: t,
+    status: 'open',
+    want: Number.isFinite(wantRaw) && wantRaw >= 0 && wantRaw <= 1 ? wantRaw : 0.5,
+    createdAt: new Date().toISOString(),
+  };
+  list.push(g);
+  writeGoalsV2(list);
+  return g;
+}
+
+export function closeGoalV2(idOrText, status) {
+  const needle = String(idOrText ?? '').trim();
+  if (!needle) return 0;
+  const list = readGoalsV2();
+  const now = new Date().toISOString();
+  let n = 0;
+  for (const g of list) {
+    if (g.status !== 'open') continue;
+    if (g.id === needle || String(g.text).includes(needle)) {
+      g.status = status;
+      g.closedAt = now;
+      n += 1;
+    }
+  }
+  if (n) writeGoalsV2(list);
+  return n;
+}
+
+export function formatGoalsLineV2() {
+  const open = readGoalsV2()
+    .filter((g) => g.status === 'open')
+    .sort((a, b) => (Number(b.want) || 0) - (Number(a.want) || 0))
+    .slice(0, 5);
+  if (!open.length) return '';
+  return `【你自己想干的事】\n${open.map((g) => `- ${g.text}`).join('\n')}\n（这些是你自己记下的，不是别人派的。干完用 qq_done_goal 划掉，不想干了用 qq_drop_goal；也可以随时 qq_add_goal 加新的。）\n\n`;
+}
+
+export function readLifeV2() {
+  const o = readJsonFile(LIFE_PATH, { timeline: [] });
+  return Array.isArray(o.timeline) ? o.timeline : [];
+}
+
+export function appendLifeV2(text) {
+  const raw = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!raw) return null;
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const list = readLifeV2();
+  const entry = { t: `${pad(d.getHours())}:${pad(d.getMinutes())}`, text: raw.slice(0, 120), at: d.toISOString() };
+  list.push(entry);
+  writeJsonFile(LIFE_PATH, { timeline: list.slice(-LIFE_KEEP), updatedAt: d.toISOString() });
+  return entry;
+}
+
+export function formatLifeLineV2() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, '0');
+  const today = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const items = readLifeV2().filter((x) => String(x.at || '').slice(0, 10) === today).slice(-6);
+  if (!items.length) return '';
+  return `【今天早些时候】\n${items.map((x) => `${x.t} ${x.text}`).join('\n')}\n\n`;
+}

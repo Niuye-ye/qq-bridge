@@ -28,6 +28,7 @@ import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
+import { addGoalV2, appendLifeV2, closeGoalV2, formatGoalsLineV2, formatLifeLineV2, readGoalsV2, readLifeV2 } from './goals-life.js';
 import {
   loadSlang,
   saveSlang,
@@ -10718,110 +10719,7 @@ async function main() {
     return next;
   }
 
-  // ── 想干的事（goals）+ 生活时间线（life）─────────────────────────────
-  // 「主观能动性」的载体：目标是她自己写的，时间线是她自己记的。
-  // 每轮 interval 自醒都会带进 prompt，让她记得上午干了什么、下午想干什么。
-  const GOALS_PATH = path.join(ROOT, 'state', 'goals.json');
-  const LIFE_PATH = path.join(ROOT, 'state', 'life.json');
-  const GOALS_MAX = 40;
-  const LIFE_KEEP = 60;
-
-  function readJsonFileV2(p, fallback) {
-    try {
-      if (!fs.existsSync(p)) return fallback;
-      const o = JSON.parse(fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, ''));
-      return o && typeof o === 'object' ? o : fallback;
-    } catch {
-      return fallback;
-    }
-  }
-
-  function writeJsonFileV2(p, o) {
-    fs.mkdirSync(path.dirname(p), { recursive: true });
-    fs.writeFileSync(p, `${JSON.stringify(o, null, 2)}\n`, 'utf8');
-  }
-
-  function readGoalsV2() {
-    const o = readJsonFileV2(GOALS_PATH, { goals: [] });
-    return Array.isArray(o.goals) ? o.goals : [];
-  }
-
-  function writeGoalsV2(list) {
-    writeJsonFileV2(GOALS_PATH, { goals: list.slice(-GOALS_MAX), updatedAt: new Date().toISOString() });
-    return list;
-  }
-
-  function addGoalV2(text, opts = {}) {
-    const t = String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, 160);
-    if (!t) return null;
-    const list = readGoalsV2();
-    const dup = list.find((g) => g.status === 'open' && g.text === t);
-    if (dup) return dup;
-    const wantRaw = Number(opts.want);
-    const g = {
-      id: `g${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
-      text: t,
-      status: 'open',
-      want: Number.isFinite(wantRaw) && wantRaw >= 0 && wantRaw <= 1 ? wantRaw : 0.5,
-      createdAt: new Date().toISOString(),
-    };
-    list.push(g);
-    writeGoalsV2(list);
-    return g;
-  }
-
-  function closeGoalV2(idOrText, status) {
-    const needle = String(idOrText ?? '').trim();
-    if (!needle) return 0;
-    const list = readGoalsV2();
-    const now = new Date().toISOString();
-    let n = 0;
-    for (const g of list) {
-      if (g.status !== 'open') continue;
-      if (g.id === needle || String(g.text).includes(needle)) {
-        g.status = status;
-        g.closedAt = now;
-        n += 1;
-      }
-    }
-    if (n) writeGoalsV2(list);
-    return n;
-  }
-
-  function formatGoalsLineV2() {
-    const open = readGoalsV2()
-      .filter((g) => g.status === 'open')
-      .sort((a, b) => (Number(b.want) || 0) - (Number(a.want) || 0))
-      .slice(0, 5);
-    if (!open.length) return '';
-    return `【你自己想干的事】\n${open.map((g) => `- ${g.text}`).join('\n')}\n（这些是你自己记下的，不是别人派的。干完用 qq_done_goal 划掉，不想干了用 qq_drop_goal；也可以随时 qq_add_goal 加新的。）\n\n`;
-  }
-
-  function readLifeV2() {
-    const o = readJsonFileV2(LIFE_PATH, { timeline: [] });
-    return Array.isArray(o.timeline) ? o.timeline : [];
-  }
-
-  function appendLifeV2(text) {
-    const raw = String(text ?? '').replace(/\s+/g, ' ').trim();
-    if (!raw) return null;
-    const d = new Date();
-    const pad = (n) => String(n).padStart(2, '0');
-    const list = readLifeV2();
-    const entry = { t: `${pad(d.getHours())}:${pad(d.getMinutes())}`, text: raw.slice(0, 120), at: d.toISOString() };
-    list.push(entry);
-    writeJsonFileV2(LIFE_PATH, { timeline: list.slice(-LIFE_KEEP), updatedAt: d.toISOString() });
-    return entry;
-  }
-
-  function formatLifeLineV2() {
-    const d = new Date();
-    const pad = (n) => String(n).padStart(2, '0');
-    const today = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-    const items = readLifeV2().filter((x) => String(x.at || '').slice(0, 10) === today).slice(-6);
-    if (!items.length) return '';
-    return `【今天早些时候】\n${items.map((x) => `${x.t} ${x.text}`).join('\n')}\n\n`;
-  }
+  // 想干的事（goals）+ 生活时间线（life）已经抽到 ./goals-life.js（2026-10-24）
 
   function formatClockV2() {
     const d = new Date();
