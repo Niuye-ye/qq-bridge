@@ -67,8 +67,42 @@ def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def _local_config():
+    """读桥根目录的 config.json（本地配置，不进 git）。读不到就当空字典。"""
+    for name in ("config.json", "config.example.json"):
+        p = Path(__file__).resolve().parent.parent / name
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    return {}
+
+
+def _search_tools_dir(base):
+    """在 base/tools 下找 ffmpeg.exe（含 tools/ffmpeg-path.txt 指路）。"""
+    if not base:
+        return None
+    base = Path(base)
+    hit = base / "tools" / "ffmpeg-path.txt"
+    if hit.exists():
+        try:
+            p = hit.read_text(encoding="utf-8").strip()
+            if p and Path(p).exists():
+                return p
+        except Exception:
+            pass
+    for cand in base.glob("tools/ffmpeg/**/ffmpeg.exe"):
+        return str(cand)
+    return None
+
+
 def find_ffmpeg():
-    """按 环境变量 -> PATH -> 项目 tools 目录 -> 常见安装位置 找 ffmpeg.exe"""
+    """找 ffmpeg.exe，顺序：
+       环境变量 PET_FFMPEG -> PATH -> config.json 的 video.ffmpeg
+       -> 脚本上级目录的 tools（桥自带） -> PET_PROJECT_DIR / DSH_PROJECT_DIR 下的 tools
+       -> 常见安装位置。
+    仓库分家后 ffmpeg 常驻在运维项目目录里，所以不能只往脚本自身上级找。
+    """
     env = os.environ.get("PET_FFMPEG")
     if env and Path(env).exists():
         return env
@@ -76,19 +110,34 @@ def find_ffmpeg():
         p = shutil.which(name)
         if p:
             return p
+
+    cfg = _local_config()
+    video = cfg.get("video") if isinstance(cfg.get("video"), dict) else {}
+    for key in ("ffmpeg", "ffmpegPath"):
+        p = video.get(key)
+        if p:
+            p = Path(p)
+            if not p.is_absolute():
+                p = Path(__file__).resolve().parent.parent / p
+            if p.exists():
+                return str(p)
+
     here = Path(__file__).resolve().parent
-    for base in (here.parent, here.parent.parent):
-        for cand in base.glob("tools/ffmpeg/**/ffmpeg.exe"):
-            return str(cand)
-        txt = base / "tools" / "ffmpeg-path.txt"
-        if txt.exists():
-            p = txt.read_text(encoding="utf-8").strip()
-            if p and Path(p).exists():
-                return p
+    dirs = [here.parent, here.parent.parent]
+    for key in ("PET_PROJECT_DIR", "DSH_PROJECT_DIR", "PET_HOME"):
+        d = os.environ.get(key)
+        if d:
+            dirs.append(Path(d))
+            dirs.append(Path(d).parent)
+    for base in dirs:
+        hit = _search_tools_dir(base)
+        if hit:
+            return hit
+
     for cand in (r"C:\ffmpeg\bin\ffmpeg.exe", r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"):
         if Path(cand).exists():
             return cand
-    raise SystemExit("找不到 ffmpeg.exe：设环境变量 PET_FFMPEG 指向它，或放进 PATH")
+    raise SystemExit("找不到 ffmpeg.exe：设环境变量 PET_FFMPEG 指向它，或写进 config.json 的 video.ffmpeg")
 
 
 def load_font(size, bold=False):

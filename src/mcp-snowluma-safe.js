@@ -9,7 +9,7 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -1877,13 +1877,47 @@ const VIDEO_SCRIPT = path.join(MCP_HERE, '..', 'scripts', 'make-video.py');
 const VIDEO_DIR = path.join(MCP_HERE, '..', 'videos');
 const VIDEO_JOBS = path.join(MCP_HERE, '..', 'state', 'video-jobs');
 
+const BRIDGE_CONFIG_PATH = path.join(ROOT, 'config.json');
+
+/** 读桥的本地 config.json（不进 git），读不到返回 {}。 */
+function readBridgeConfig() {
+  try { return JSON.parse(fs.readFileSync(BRIDGE_CONFIG_PATH, 'utf8')); } catch { return {}; }
+}
+
+/** config.json 里的 video 段（ffmpeg / python / adb 的本机路径都放这儿，不写死在代码里）。 */
+function videoConfig() {
+  const v = readBridgeConfig()?.video;
+  return v && typeof v === 'object' ? v : {};
+}
+
+function resolveLocal(p) {
+  if (!p) return null;
+  const abs = path.isAbsolute(p) ? p : path.resolve(ROOT, p);
+  try { return fs.existsSync(abs) ? abs : null; } catch { return null; }
+}
+
 function pickPython() {
-  const fromEnv = process.env.PET_PYTHON;
-  if (fromEnv && fs.existsSync(fromEnv)) return fromEnv;
+  const fromEnv = resolveLocal(process.env.PET_PYTHON) || resolveLocal(videoConfig().python);
+  if (fromEnv) return fromEnv;
   for (const p of ['D:\\Python\\python.exe', 'C:\\Python312\\python.exe', 'C:\\Python311\\python.exe', '/usr/bin/python3']) {
     try { if (fs.existsSync(p)) return p; } catch { /* ignore */ }
   }
   return 'python';
+}
+
+/** ffmpeg.exe：环境变量 -> config.json video.ffmpeg -> 桥内 tools -> PATH。渲染脚本自己也有一套同级查找，这里显式传过去更稳。 */
+function pickFfmpeg() {
+  const fromEnv = resolveLocal(process.env.PET_FFMPEG);
+  if (fromEnv) return fromEnv;
+  const fromCfg = resolveLocal(videoConfig().ffmpeg);
+  if (fromCfg) return fromCfg;
+  try {
+    for (const cand of fs.readdirSync(path.join(ROOT, 'tools', 'ffmpeg'))) {
+      const exe = path.join(ROOT, 'tools', 'ffmpeg', cand, 'bin', 'ffmpeg.exe');
+      if (fs.existsSync(exe)) return exe;
+    }
+  } catch { /* ignore */ }
+  return null;
 }
 
 function readTailLines(file, n = 8) {
@@ -1941,11 +1975,15 @@ server.tool(
       const outPath = path.join(VIDEO_DIR, `${id}.mp4`);
       const logPath = path.join(VIDEO_JOBS, `${id}.log`);
       const fd = fs.openSync(logPath, 'a');
+      const ffmpeg = pickFfmpeg();
+      const childEnv = { ...process.env, PYTHONIOENCODING: process.env.PYTHONIOENCODING || 'utf-8' };
+      if (ffmpeg) childEnv.PET_FFMPEG = ffmpeg;
       const child = spawn(pickPython(), [VIDEO_SCRIPT, jobPath, '--out', outPath], {
         cwd: path.dirname(VIDEO_SCRIPT),
         detached: true,
         stdio: ['ignore', fd, fd],
         windowsHide: true,
+        env: childEnv,
       });
       child.unref();
       try { fs.writeSync(fd, ''); } catch { /* ignore */ }
@@ -1959,6 +1997,7 @@ server.tool(
             `开始做了：《${job.title}》`,
             `id=${id}，${segments.length} 段，${hd ? '1080p' : '720p'}，预计 ${est} 秒左右出片。`,
             `文件会出在 videos/${id}.mp4。`,
+            ffmpeg ? '' : '⚠️ 没定位到 ffmpeg.exe（config.json 的 video.ffmpeg 没配、PATH 里也没有），渲染那步很可能失败。',
             `过一会儿用 qq_video_status 传 id=${id} 看做好了没（做完了会把路径给你，可以直接发给主人）。`,
           ].join('\n'),
         }],
@@ -2023,7 +2062,7 @@ server.tool(
         return { content: [{ type: 'text', text: `没有 id=${r.vid} 这个任务。现有的：${allIds.slice(0, 5).join(', ') || '（无）'}` }], isError: true };
       }
       if (r.done) {
-        return { content: [{ type: 'text', text: `✅ 《${r.title}》做好了\n路径：${r.out}\n大小：${r.mb} MB\n想给主人看就用 qq_send_image 传不了的视频，先跟主人说一声文件在哪。` }] };
+        return { content: [{ type: 'text', text: `✅ 《${r.title}》做好了\n路径：${r.out}\n大小：${r.mb} MB\n想在手机上发就先调 qq_push_video 推到模拟器（相册/文件选择器才翻得到），再跟主人说一声。` }] };
       }
       if (r.failed) {
         return { content: [{ type: 'text', text: `❌ 《${r.title}》失败了\n最后的输出：\n${r.last}\n\n要重做就再调一次 qq_make_video（改改分段）。` }], isError: true };
@@ -2031,6 +2070,119 @@ server.tool(
       return { content: [{ type: 'text', text: `⏳ 《${r.title}》还在做\n进度：${r.last}\n再过半分钟问一次。` }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `查状态失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+// ── 视频推到模拟器：出片以后 B 站上传才翻得到 ─────────────────────────────────
+function adbBin() {
+  const cands = [process.env.PET_ADB, videoConfig().adb, readBridgeConfig()?.socialV2?.image?.adbPath];
+  for (const c of cands) {
+    const p = resolveLocal(c);
+    if (p) return p;
+  }
+  return 'adb';
+}
+
+function runAdb(adb, args, timeout = 15000) {
+  return execFileSync(adb, args, { encoding: 'utf8', timeout, windowsHide: true, maxBuffer: 4 * 1024 * 1024 });
+}
+
+function adbSerials(adb) {
+  try {
+    return runAdb(adb, ['devices'], 8000)
+      .split(/\r?\n/)
+      .slice(1)
+      .map((l) => l.trim())
+      .filter((l) => /^(.*)\tdevice$/.test(l))
+      .map((l) => l.split(/\s+/)[0]);
+  } catch {
+    return [];
+  }
+}
+
+/** MuMu 的 adb 端口会从 16384 漂到 16385，所以先信 adb devices，再按常见的几个端口补 connect。 */
+function pickSerial(adb) {
+  const preferred = readBridgeConfig()?.socialV2?.image?.serial;
+  let list = adbSerials(adb);
+  if (preferred && list.includes(preferred)) return preferred;
+  if (list.length) return list.find((s) => s.startsWith('127.0.0.1:')) || list[0];
+  for (let port = 16384; port <= 16392; port += 1) {
+    try { runAdb(adb, ['connect', '127.0.0.1:' + port], 4000); } catch { /* ignore */ }
+    list = adbSerials(adb);
+    if (list.length) return list[0];
+  }
+  return null;
+}
+
+server.tool(
+  'qq_push_video',
+  '把做好的视频推进 MuMu 模拟器（/sdcard/Movies/qq/），推完系统相册就会索引到，B 站「上传」能翻到。传 id（qq_make_video / qq_video_status 给的）或 path（桥的 videos 目录里的文件）；都不传就推最新的那个。',
+  {
+    id: z.string().optional().describe('视频任务 id，例如 vk3f9a'),
+    path: z.string().optional().describe('或者给视频文件路径（在桥的 videos 目录里）'),
+    name: z.string().optional().describe('手机上显示的文件名，默认沿用原名'),
+  },
+  async ({ id, path: givenPath, name }) => {
+    try {
+      let localPath = null;
+      if (givenPath) {
+        localPath = path.isAbsolute(givenPath) ? givenPath : path.resolve(ROOT, givenPath);
+      } else if (id) {
+        localPath = path.join(VIDEO_DIR, String(id).trim() + '.mp4');
+      } else if (fs.existsSync(VIDEO_DIR)) {
+        const files = fs.readdirSync(VIDEO_DIR).filter((f) => f.toLowerCase().endsWith('.mp4'));
+        if (!files.length) return { content: [{ type: 'text', text: 'videos 目录里还没有 mp4，先用 qq_make_video 做一个。' }], isError: true };
+        files.sort((a, b) => fs.statSync(path.join(VIDEO_DIR, b)).mtimeMs - fs.statSync(path.join(VIDEO_DIR, a)).mtimeMs);
+        localPath = path.join(VIDEO_DIR, files[0]);
+      } else {
+        return { content: [{ type: 'text', text: 'videos 目录不存在，先用 qq_make_video 做一个。' }], isError: true };
+      }
+
+      if (!fs.existsSync(localPath)) {
+        return { content: [{ type: 'text', text: '找不到这个视频文件：' + localPath }], isError: true };
+      }
+      const sizeMb = (fs.statSync(localPath).size / 1048576).toFixed(1);
+      const adb = adbBin();
+      const serial = pickSerial(adb);
+      if (!serial) {
+        return { content: [{ type: 'text', text: '模拟器没连上（adb devices 是空的）。先确认 MuMu 开着，或者让主人跑一次一键启动。' }], isError: true };
+      }
+
+      const remoteDir = '/sdcard/Movies/qq/';
+      const remoteName = String(name || path.basename(localPath)).replace(/[^\w.\-]/g, '_').replace(/^_+/, '') || 'video.mp4';
+      const remotePath = remoteDir + remoteName;
+      runAdb(adb, ['-s', serial, 'shell', 'mkdir', '-p', remoteDir], 15000);
+      runAdb(adb, ['-s', serial, 'push', localPath, remotePath], 300000);
+      // 让媒体库收录。Android 12 上 MEDIA_SCANNER_SCAN_FILE 这个广播已经不好使了
+      // （广播能发出去，但 MediaProvider 不理会，相册里始终看不到），
+      // 实测有效的是 content call scan_volume —— 会全盘扫一遍，慢几秒但一定能进 media store。
+      let indexed = false;
+      try {
+        runAdb(adb, ['-s', serial, 'shell', 'am', 'broadcast', '-a', 'android.intent.action.MEDIA_SCANNER_SCAN_FILE', '-d', 'file://' + remotePath], 20000);
+      } catch { /* ignore */ }
+      try {
+        const scan = runAdb(adb, ['-s', serial, 'shell', 'content', 'call', '--uri', 'content://media', '--method', 'scan_volume', '--arg', 'external_primary'], 90000);
+        indexed = /Result:\s*Bundle/.test(scan || '');
+      } catch {
+        try { runAdb(adb, ['-s', serial, 'shell', 'content', 'call', '--uri', 'content://media/external/file', '--method', 'scan_file', '--arg', remotePath], 40000); } catch { /* ignore */ }
+      }
+
+      return {
+        content: [{
+          type: 'text',
+          text: [
+            '✅ 视频已经放进模拟器了',
+            '本机：' + localPath + '（' + sizeMb + ' MB）',
+            '手机：' + remotePath,
+            '设备：' + serial,
+            indexed ? '媒体库已收录，相册的「视频」分类里能看到。' : '媒体库扫描没确认成功，文件在手机里，但相册可能还看不到（用文件选择器进 Movies/qq 也行）。',
+            'B 站上传时用「本地视频 / 相册」入口，在 电影(Movies) → qq 目录里翻它。',
+          ].join('\n'),
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: 'text', text: '推送失败：' + (error?.message ?? error) }], isError: true };
     }
   }
 );

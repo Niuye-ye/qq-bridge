@@ -267,5 +267,10 @@
     "maxTokens": 4096,
     "maxResults": 8,
     "timeoutMs": 35000
+  },
+  "video": {
+    "ffmpeg": "",
+    "python": "",
+    "adb": ""
   }
 }
