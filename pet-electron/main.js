@@ -1182,6 +1182,10 @@ if (!app.requestSingleInstanceLock()) {
       // 调试用：验证「暂停动画」这条链路（菜单走的是同一个 toggleAnim）
       setTimeout(() => { log('测试暂停动画'); toggleAnim(); }, 8000);
     }
+    if (process.env.PET_TEST_CHAT) {
+      // 调试用：自动打开聊天框（验证小窗口下不被裁 / 命中矩形对不对）
+      setTimeout(() => { log('测试打开聊天框'); send('pet:ui', { t: 'chat' }); }, 7000);
+    }
   });
 
   app.on('window-all-closed', () => { quitRequested = true; app.quit(); });

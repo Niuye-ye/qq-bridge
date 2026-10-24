@@ -57,7 +57,9 @@
   /* 聊天框：和气泡同一个位置，打开时顶上去一点 */
   #chat {
     position: absolute; left: 50%; bottom: calc(100% - 104px * var(--k, 1)); transform: translateX(-50%);
-    width: 344px; padding: 8px; border-radius: 14px; display: none;
+    /* 宽度不能写死：桌宠能缩到 260px，344px 的框会被窗口裁掉。跟着窗口走，最多 344。 */
+    width: min(344px, calc(100% - 16px)); box-sizing: border-box;
+    padding: 8px; border-radius: 14px; display: none;
     background: rgba(255,255,255,.96); box-shadow: 0 4px 18px rgba(0,0,0,.22);
     border: 1px solid rgba(148,163,184,.4); gap: 6px; align-items: center;
   }
@@ -159,7 +161,10 @@ function pushUiRects() {
 function relayoutRects() {
   HIT = makeHit();
   inBody = (x, y) => x >= HIT.x0 && x <= HIT.x1 && y >= HIT.y0 && y <= HIT.y1;
-  CHAT_RECT = { x0: 36, y0: 4, x1: W - 36, y1: 112 };
+  // 聊天框实际宽度 = min(344, W-16)，居中；命中矩形跟着它走，
+  // 否则小窗口下框的两头露在 CHAT_RECT 外面，点一下就被当成"点外面"关掉。
+  const cw = Math.min(344, W - 16);
+  CHAT_RECT = { x0: (W - cw) / 2 - 2, y0: 0, x1: (W + cw) / 2 + 2, y1: 112 };
   // 按钮跟着尺寸缩放（CSS 读 --k），命中矩形同步放大
   const k = Math.max(0.8, Math.min(2.2, W / 420));
   document.documentElement.style.setProperty('--k', k.toFixed(3));
