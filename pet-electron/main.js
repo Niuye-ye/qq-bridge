@@ -741,6 +741,7 @@ function popupMenu() {
         { type: 'separator' },
         { label: '让她去玩会儿手机', click: () => wakeHer('interval') },
         { label: st.paused ? '恢复她的自主时间' : '暂停她的自主时间', click: () => togglePause() },
+        { label: readPetState().noAnim ? '恢复动画' : '暂停动画', click: () => toggleAnim() },
       ],
     },
     {
@@ -938,6 +939,14 @@ async function togglePause() {
     log('暂停切换 →', next);
     pollBridge().catch(() => {});
   } catch (e) { log('暂停切换失败', e.message); }
+}
+
+// 动画开关：只停渲染层的动作（呼吸/走路/待机），不影响她的自主时间
+function toggleAnim() {
+  const next = !readPetState().noAnim;
+  writePetState({ noAnim: next });
+  if (win && !win.isDestroyed()) win.webContents.send('pet:ui', { t: 'anim', on: !next });
+  log('动画切换 →', next ? '暂停' : '恢复');
 }
 
 function runOneClick() {
@@ -1140,6 +1149,10 @@ if (!app.requestSingleInstanceLock()) {
         log('测试换样子 →', process.env.PET_TEST_SCHEME);
         send('pet:ui', { t: 'scheme', id: process.env.PET_TEST_SCHEME });
       }, 6000);
+    }
+    if (process.env.PET_TEST_NOANIM) {
+      // 调试用：验证「暂停动画」这条链路（菜单走的是同一个 toggleAnim）
+      setTimeout(() => { log('测试暂停动画'); toggleAnim(); }, 8000);
     }
   });
 

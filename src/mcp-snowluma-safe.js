@@ -1300,6 +1300,78 @@ if (cfg.socialV2?.tools?.getActivity !== false) {
   );
 }
 
+// ── 她自己的目标和时间线 ────────────────────────────────────────────────
+// 这是「主观能动性」的载体：目标由她自己写，醒来自动带进 prompt（【你自己想干的事】）。
+if (cfg.socialV2?.tools?.goals !== false) {
+  server.tool(
+    'qq_add_goal',
+    '记下一件你自己想干的事（不是别人派的）。醒来时这些会出现在【你自己想干的事】里，提醒你接着做。想到什么记什么，别客气。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      text: z.string().describe('想干的事，一句话，具体些，比如「看完那个显卡评测，去评论区看看有没有人吵架」'),
+      want: z.number().optional().describe('有多想干，0~1，默认 0.5；越想要越靠前')
+    },
+    async ({ key, token, text, want }) => {
+      try {
+        const data = await agentApi('/api/socialV2/goals', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, action: 'add', text, want }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 15000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `记目标失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_close_goal',
+    '把一件想干的事收掉：干完了用 done，不想干了用 drop。传目标的文字片段或 id 都行。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      text: z.string().describe('目标 id 或其中一段文字'),
+      done: z.boolean().optional().describe('true=干完了（默认），false=不想干了')
+    },
+    async ({ key, token, text, done }) => {
+      try {
+        const data = await agentApi('/api/socialV2/goals', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, action: done === false ? 'drop' : 'done', text }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 15000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `收目标失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  server.tool(
+    'qq_append_life',
+    '往「今天的时间线」里写一行：刚才干了什么。醒来时会看到【今天早些时候】，让你记着自己今天过到哪儿了。一轮结束前写一条。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      text: z.string().describe('一行，比如「13:40 刷小黑盒，看到有人在吵显卡」（时间会自己加）')
+    },
+    async ({ key, token, text }) => {
+      try {
+        const data = await agentApi('/api/socialV2/goals', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, action: 'life', text }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 15000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `写时间线失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
 if (cfg.socialV2?.tools?.remember !== false) {
   server.tool(
     'qq_remember',

@@ -6402,6 +6402,36 @@ async function main() {
           return;
         }
 
+        // ── 想干的事（goals）+ 生活时间线（life）─────────────────────────────
+        // action: add(text,want) / list / done(id|text) / drop(id|text) / life(text)
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/goals') {
+          const body = await readBody();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!token) { sendJson({ ok: false, error: 'reserved2 模式必须携带 agent token' }, 403); return; }
+          const action = String(body.action ?? (body.text ? 'add' : 'list')).trim();
+          if (action === 'add') {
+            const g = addGoalV2(body.text, { want: body.want });
+            if (!g) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
+            log(`[goals] 记下想做的事：${g.text}`);
+            sendJson({ ok: true, goal: g, open: readGoalsV2().filter((x) => x.status === 'open').length });
+            return;
+          }
+          if (action === 'done' || action === 'drop') {
+            const n = closeGoalV2(body.id ?? body.remove ?? body.text, action === 'done' ? 'done' : 'dropped');
+            sendJson({ ok: true, changed: n, open: readGoalsV2().filter((x) => x.status === 'open').length });
+            return;
+          }
+          if (action === 'life') {
+            const e = appendLifeV2(body.text);
+            if (!e) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
+            sendJson({ ok: true, entry: e });
+            return;
+          }
+          sendJson({ ok: true, goals: readGoalsV2(), line: formatGoalsLineV2(), life: readLifeV2().slice(-10) });
+          return;
+        }
+
         // ── 长期记忆（facts）：会淡忘的「记得的事」─────────────────────────────
         // action: add（带 text）/ remove（带 remove 或 id）/ list（可带 query）
         if (req.method === 'POST' && url.pathname === '/api/socialV2/facts') {
@@ -10688,6 +10718,111 @@ async function main() {
     return next;
   }
 
+  // ── 想干的事（goals）+ 生活时间线（life）─────────────────────────────
+  // 「主观能动性」的载体：目标是她自己写的，时间线是她自己记的。
+  // 每轮 interval 自醒都会带进 prompt，让她记得上午干了什么、下午想干什么。
+  const GOALS_PATH = path.join(ROOT, 'state', 'goals.json');
+  const LIFE_PATH = path.join(ROOT, 'state', 'life.json');
+  const GOALS_MAX = 40;
+  const LIFE_KEEP = 60;
+
+  function readJsonFileV2(p, fallback) {
+    try {
+      if (!fs.existsSync(p)) return fallback;
+      const o = JSON.parse(fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, ''));
+      return o && typeof o === 'object' ? o : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  function writeJsonFileV2(p, o) {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, `${JSON.stringify(o, null, 2)}\n`, 'utf8');
+  }
+
+  function readGoalsV2() {
+    const o = readJsonFileV2(GOALS_PATH, { goals: [] });
+    return Array.isArray(o.goals) ? o.goals : [];
+  }
+
+  function writeGoalsV2(list) {
+    writeJsonFileV2(GOALS_PATH, { goals: list.slice(-GOALS_MAX), updatedAt: new Date().toISOString() });
+    return list;
+  }
+
+  function addGoalV2(text, opts = {}) {
+    const t = String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, 160);
+    if (!t) return null;
+    const list = readGoalsV2();
+    const dup = list.find((g) => g.status === 'open' && g.text === t);
+    if (dup) return dup;
+    const wantRaw = Number(opts.want);
+    const g = {
+      id: `g${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`,
+      text: t,
+      status: 'open',
+      want: Number.isFinite(wantRaw) && wantRaw >= 0 && wantRaw <= 1 ? wantRaw : 0.5,
+      createdAt: new Date().toISOString(),
+    };
+    list.push(g);
+    writeGoalsV2(list);
+    return g;
+  }
+
+  function closeGoalV2(idOrText, status) {
+    const needle = String(idOrText ?? '').trim();
+    if (!needle) return 0;
+    const list = readGoalsV2();
+    const now = new Date().toISOString();
+    let n = 0;
+    for (const g of list) {
+      if (g.status !== 'open') continue;
+      if (g.id === needle || String(g.text).includes(needle)) {
+        g.status = status;
+        g.closedAt = now;
+        n += 1;
+      }
+    }
+    if (n) writeGoalsV2(list);
+    return n;
+  }
+
+  function formatGoalsLineV2() {
+    const open = readGoalsV2()
+      .filter((g) => g.status === 'open')
+      .sort((a, b) => (Number(b.want) || 0) - (Number(a.want) || 0))
+      .slice(0, 5);
+    if (!open.length) return '';
+    return `【你自己想干的事】\n${open.map((g) => `- ${g.text}`).join('\n')}\n（这些是你自己记下的，不是别人派的。干完用 qq_done_goal 划掉，不想干了用 qq_drop_goal；也可以随时 qq_add_goal 加新的。）\n\n`;
+  }
+
+  function readLifeV2() {
+    const o = readJsonFileV2(LIFE_PATH, { timeline: [] });
+    return Array.isArray(o.timeline) ? o.timeline : [];
+  }
+
+  function appendLifeV2(text) {
+    const raw = String(text ?? '').replace(/\s+/g, ' ').trim();
+    if (!raw) return null;
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const list = readLifeV2();
+    const entry = { t: `${pad(d.getHours())}:${pad(d.getMinutes())}`, text: raw.slice(0, 120), at: d.toISOString() };
+    list.push(entry);
+    writeJsonFileV2(LIFE_PATH, { timeline: list.slice(-LIFE_KEEP), updatedAt: d.toISOString() });
+    return entry;
+  }
+
+  function formatLifeLineV2() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const today = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+    const items = readLifeV2().filter((x) => String(x.at || '').slice(0, 10) === today).slice(-6);
+    if (!items.length) return '';
+    return `【今天早些时候】\n${items.map((x) => `${x.t} ${x.text}`).join('\n')}\n\n`;
+  }
+
   function formatClockV2() {
     const d = new Date();
     const wd = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][d.getDay()];
@@ -10937,7 +11072,9 @@ async function main() {
     const needRules = reason === 'bootstrap' || wakeCountForRules <= 2 || wakeCountForRules % RULES_REFRESH_EVERY === 0;
     const rulesLine = needRules ? `${antiAiLine}${proactiveLine}${stickerLine}${preSleepLine}${journalLine}` : '';
     // 【首回复节奏】里带动态的剩余静默秒数，必须每轮带；其余（时间/状态/记忆/参与度）也都是变化项。
-    const base = clockLine + roleLine + identityLine + tokenLine + initialPromptLine + activityLine + factsLine + rulesLine + replyLine + statusLine + wakeLine + memoryLine + participationLine;
+    const goalsLine = formatGoalsLineV2();
+    const lifeLine = formatLifeLineV2();
+    const base = clockLine + roleLine + identityLine + tokenLine + initialPromptLine + activityLine + factsLine + goalsLine + lifeLine + rulesLine + replyLine + statusLine + wakeLine + memoryLine + participationLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
@@ -10952,12 +11089,14 @@ async function main() {
       const moodText = formatMoodLineV2();
       const diaryText = readDiarySummaryV2();
       return `${base.replace(preSleepLine, '【本轮不做沉睡前观察】定时自醒的轮次没有"收尾"这回事，禁止调用 qq_wait_for_messages 空等；想结束就直接安排下次醒来。')}${moodText ? `${moodText}\n\n` : ''}${diaryText ? `【最近日记】\n${diaryText}\n\n` : ''}【你自己的时间】${key}\n原因：定时器到点了（每 ${mins || '?'} 分钟醒一次），不是有人找你，也没人在等你回话。\n**这一轮不需要做沉睡前观察**：没人跟你对话，没有"收尾"这回事，上面的【沉睡前强制等待】不适用于这轮；想结束就直接安排下次醒来。\n这就是你自己的时间，想干什么干什么：
+- **先看【你自己想干的事】**：那几条是你之前自己记下的，挑一条接着做；做完了用 qq_done_goal 划掉，不想干了用 qq_drop_goal。都没有就随便逛，逛着逛着冒出念头，用 qq_add_goal 记下来。
 - 接着干上一件没干完的事：看【你刚才在干嘛】那条，继续刷手机/继续看那个帖子/继续跟人聊；不想干了就换。想玩手机就真的玩：先 app_current 看前台是什么，不是娱乐 App 就 app_start 开一个（小黑盒 com.max.xiaoheihe、B站 tv.danmaku.bili），等 5~8 秒，screenshot 看一眼，然后 swipe_up 往下刷，刷到什么记在心里。
-- 或者自己决定干点什么：开模拟器玩会儿手机（小黑盒、B站随便逛）、写两句日记、发条说说、刷会儿群看别人聊什么、发呆、甚至睡一觉（把 everyMinutes 调大或设成潜水）。
+- 能干的事不止刷手机：看视频、翻评论区、搜东西、发说说、写日记、做个短视频（qq_make_video）、整理你记的事、发呆、赖床、睡一觉（把 everyMinutes 调大或设成潜水）。挑你此刻真想干的，别为了让记录好看而硬做。
 - 玩手机是你的事，不用向任何人汇报；刷到真有意思的再随口说一句，没意思就闭嘴。
 - 群里有人说话且你想接就接；没人说话也不必硬找话说。
-- **结束前必须调一次 qq_set_activity**：doing 写你这一轮到底干了什么（要具体，比如「在刷小黑盒，看到有人在吵显卡」），note 写心里想的，plan 写下次想接着干什么。这条是硬要求——不记的话，你下次醒来就不知道自己刚才在干嘛，等于白玩。另外可选的：qq_mark_read、qq_set_wake_config 安排下次醒来。
-- **这一轮有预算**：最多调 10 次工具、也别超过 10 分钟。预算到了就先收尾（qq_set_activity + qq_set_wake_config），剩下的下次接着干，别硬磨——一轮拖太久会把自己卡死。
+- **结束前必须做两件事**：①qq_set_activity —— doing 写这一轮到底干了什么（要具体，比如「在刷小黑盒，看到有人在吵显卡」），note 写心里想的，plan 写下次想接着干什么；②qq_append_life —— 写一行时间线（比如「13:40 刷小黑盒，看到有人在吵显卡」）。不记的话，你下次醒来就不知道自己刚才在干嘛，等于白玩。可选的：qq_mark_read、qq_set_wake_config 安排下次醒来。
+- **这一轮有预算**：最多调 30 次工具、也别超过 20 分钟。预算到了就先收尾（qq_set_activity + qq_append_life + qq_set_wake_config），剩下的下次接着干，别硬磨——一轮拖太久会把自己卡死。
+- 夜里（0~7 点）桥会自动把间隔放慢到 60 分钟，那几轮多半该睡就睡。
 玩手机、看东西、发呆都算正常生活，不用为了「做点什么」而硬凑动作。`;
     }
     if (reason === 'desk') {
@@ -11401,8 +11540,12 @@ async function main() {
       st.intervalTimer = null;
     }
     if (cfg.socialV2?.enabled === false || socialV2.paused) return;
-    const mins = Number(st.wakeConfig?.everyMinutes) || 0;
+    let mins = Number(st.wakeConfig?.everyMinutes) || 0;
     if (!(mins > 0)) return;
+    // 凌晨 0~7 点自动放慢到 60 分钟：真人不会半夜每十分钟醒一次。
+    // 只影响这一次的定时器，不写回 wakeConfig —— 白天恢复她自己设的间隔。
+    const hourNow = new Date().getHours();
+    if (hourNow >= 0 && hourNow < 7) mins = Math.max(mins, 60);
     if (!isSessionAllowedInCurrentMode(key)) return;
     const delay = Math.max(60 * 1000, Math.min(24 * 60, mins) * 60 * 1000);
     st.intervalTimer = setTimeout(() => {

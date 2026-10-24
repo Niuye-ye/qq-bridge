@@ -209,8 +209,10 @@ async function boot() {
   api.layout();
   say('ready | words=' + (api.words || []).length + ' | ' + W + 'x' + H + ' S=' + S.toFixed(3));
 
+  animPaused = !!(CFG.petState && CFG.petState.noAnim);
   let last = performance.now();
   const loop = (t) => {
+    if (animPaused) { last = t; setTimeout(() => requestAnimationFrame(loop), 250); return; }
     const dt = Math.min((t - last) / 1000, 0.05);
     last = t;
     try { api.step(dt); } catch (e) { say('step 崩', e.message); return; }
@@ -228,6 +230,9 @@ const bubble = document.getElementById('bubble');
 const chat = document.getElementById('chat');
 const chatIn = document.getElementById('chatIn');
 const chatSend = document.getElementById('chatSend');
+
+// 动画开关（右键「暂停动画」）：停掉呼吸/走路/待机动作，画面定格
+let animPaused = false;
 
 // 气泡不常显：只有她刚说过话 / 在等她回 / 鼠标靠过来 才冒出来
 const BUBBLE_FRESH_MS = 120 * 1000;
@@ -386,6 +391,7 @@ window.pet?.onUi?.((m) => {
   }
   else if (m.t === 'chat') openChat();
   else if (m.t === 'blur') closeChat();
+  else if (m.t === 'anim') { animPaused = !m.on; say('动画', animPaused ? '暂停' : '恢复'); }
   else if (m.t === 'bubble') flashBubble(m.text, m.ms || 4000);
 });
 
