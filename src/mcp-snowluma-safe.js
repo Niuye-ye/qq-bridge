@@ -1583,7 +1583,7 @@ if (cfg.socialV2?.tools?.getSelfImage !== false) {
 
 server.tool(
   'qq_see_screen',
-  '看一眼模拟器现在的屏幕，返回真正的画面（图片会直接进入你的视觉上下文，你能看见）。刷 feed、看视频、玩游戏、任何需要知道「屏幕现在长什么样」的时候都用它。**不要再用 mcp__android__screenshot** —— 那个只返回一段文字字符串，你看不见画面，会误判成白屏。',
+  '看一眼模拟器现在的屏幕，返回真正的画面（图片会直接进入你的视觉上下文，你能看见）。刷 feed、看视频、玩游戏、任何需要知道「屏幕现在长什么样」的时候都用它。**看画面一律用它**。mcp__android__screenshot 也能看图，但它是 adb 抓屏，**网页类页面（WebView，比如小黑盒帖子详情、B站部分页）会截成白屏**，而且抓的是独立图层、不保证和你眼睛看到的一致。只有在需要精确像素坐标时才用 android 那个，判断白屏或卡住一律以 qq_see_screen 为准。',
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号')
   },
