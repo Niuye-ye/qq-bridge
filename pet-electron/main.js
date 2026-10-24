@@ -57,12 +57,23 @@ const TRAY_PNG = path.join(PET_ROOT, 'pet-tray.png');
 const FACE_PNG = path.join(PET_ROOT, 'whale', 'tex', 'face.png');
 const APP_LOG = process.env.PET_LOG || path.join(REPO_ROOT, 'logs', 'pet-app.log');
 // 「一键修复 · 启动」指向项目根的 一键启动.ps1。
-// 桌宠代码住在 <项目根>/qq-bridge/ 下，所以要先往上一级找；也兼容脚本被拷进仓库里的情况。
-// 找不到就是空串 —— 菜单里那一项不出现（不自作主张去猜别的路径）。
+// 2026-10-24 仓库分家后，桥根（F:\qq-bridge）不再住在项目根里面，
+// 「往上一级找」永远落空 → 菜单项整个消失。现在改成 config.json 的 oneClick 说了算，
+// 相对路径按桥根解析；找不到就是空串，菜单里那一项不出现（不自作主张去猜别的路径）。
 function findOneClick() {
   if (process.env.PET_ONECLICK) return process.env.PET_ONECLICK;
+  // config.json 的 oneClick：仓库分家后脚本不可能靠相对路径猜到了（桥根已经不在项目根里），
+  // 本机路径一律写在 config.json（gitignore），别人部署时填自己的，代码里不写死盘符。
+  try {
+    const cfg = JSON.parse(fs.readFileSync(BRIDGE_CFG, 'utf8'));
+    const p = typeof cfg.oneClick === 'string' ? cfg.oneClick.trim() : '';
+    if (p) {
+      const abs = path.isAbsolute(p) ? p : path.resolve(REPO_ROOT, p);
+      if (fs.existsSync(abs)) return abs;
+    }
+  } catch { /* 配置缺失或坏掉 → 继续走下面的候选 */ }
   const cands = [
-    path.join(REPO_ROOT, '..', '一键启动.ps1'),   // qq-bridge 的兄弟目录（现在的真实位置）
+    path.join(REPO_ROOT, '..', '一键启动.ps1'),   // 老布局：桥嵌在项目根里时的位置（分家后一般落空）
     path.join(REPO_ROOT, '一键启动.ps1'),
   ];
   for (const p of cands) {
