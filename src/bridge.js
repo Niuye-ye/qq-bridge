@@ -10915,7 +10915,16 @@ async function main() {
 
   function buildWakePromptV2(key, reason) {
     const roleState = readRoleState();
-    const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    // 人格卡正文进 prompt：2026-10-24 实测整场 QQ 会话 qq_get_prompt 调用 0 次，
+    // 卡片不进上下文就等于没有（人设只剩 system 里 dsh-purge 注入的那套通用人格）。
+    // 常驻一~六节（身份 + 去 AI 味铁律 + 说话方式 + 节奏 + 梗 + AI 味黑名单），约 4000 字符；
+    // 第七节往后（回复示例、群文化、表情包、独处、底线、动手机、做视频、自主时间）靠 qq_get_prompt 看全文。
+    const roleCardText = roleState.role ? currentRoleHint() : '';
+    const roleCardCut = roleCardText.indexOf('\n## 七、');
+    const roleCardCore = roleCardCut > 0 ? roleCardText.slice(0, roleCardCut) : roleCardText;
+    const roleLine = roleState.role
+      ? `【当前角色】${roleState.role}\n${roleCardCore}\n（其余几节：回复示例、群文化、表情包、长啥样、发说说、独处、底线、动手机、做视频、自主时间 —— 需要时调 qq_get_prompt 看全文）\n\n`
+      : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
@@ -11024,7 +11033,16 @@ async function main() {
 
   function buildWakeReminderPromptV2(key) {
     const roleState = readRoleState();
-    const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
+    // 人格卡正文进 prompt：2026-10-24 实测整场 QQ 会话 qq_get_prompt 调用 0 次，
+    // 卡片不进上下文就等于没有（人设只剩 system 里 dsh-purge 注入的那套通用人格）。
+    // 常驻一~六节（身份 + 去 AI 味铁律 + 说话方式 + 节奏 + 梗 + AI 味黑名单），约 4000 字符；
+    // 第七节往后（回复示例、群文化、表情包、独处、底线、动手机、做视频、自主时间）靠 qq_get_prompt 看全文。
+    const roleCardText = roleState.role ? currentRoleHint() : '';
+    const roleCardCut = roleCardText.indexOf('\n## 七、');
+    const roleCardCore = roleCardCut > 0 ? roleCardText.slice(0, roleCardCut) : roleCardText;
+    const roleLine = roleState.role
+      ? `【当前角色】${roleState.role}\n${roleCardCore}\n（其余几节：回复示例、群文化、表情包、长啥样、发说说、独处、底线、动手机、做视频、自主时间 —— 需要时调 qq_get_prompt 看全文）\n\n`
+      : '';
     const identityLine = selfIdentityTextV2();
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
