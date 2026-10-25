@@ -2693,18 +2693,18 @@ async function comfyDownload(img) {
 
 server.tool(
   'qq_draw_image',
-  '用本机 ComfyUI 画图（一句提示词 -> png）。做视频要配图、封面、插图时用它，产出落在 state/draw/<id>/ 下并返回绝对路径，可以直接填进 qq_make_video 的 image 段 src，或用 qq_send_image path=<绝对路径> 发到 QQ。默认模型 Z-Image Turbo：8 步，1024x1024 约 20~40 秒一张，插画/角色/场景都画得干净，写中文主体也认得。想换 SDXL 画风传 model="sdxl"。',
+  '用本机 ComfyUI 画图（一句提示词 -> png）。做视频要配图、封面、插图时用它，产出落在 state/draw/<id>/ 下并返回绝对路径，可以直接填进 qq_make_video 的 image 段 src，或用 qq_send_image path=<绝对路径> 发到 QQ。默认模型 Z-Image Turbo：8 步，1024x1024 约 20~40 秒一张，插画/角色/场景都画得干净，写中文主体也认得。本机现在只有 Z-Image 这一个生图模型（SDXL 与 Wan 视频模型已于 2026-10-25 卸载腾空间）。',
   {
     prompt: z.string().describe('想要什么画面。写具体：主体 + 场景 + 风格 + 光线，例如 a cute cartoon whale mascot girl sitting on a desk at night, cozy room, soft rim light, illustration, clean lines'),
-    model: z.enum(['zimage', 'sdxl']).optional().describe('画图模型，默认 zimage（Z-Image Turbo，8 步、更懂提示词）；sdxl 是旧的 SDXL base（25 步，画风更“老派插画”）'),
+    model: z.enum(['zimage']).optional().describe('画图模型，目前只有 zimage（Z-Image Turbo，8 步、更懂提示词）'),
     negative: z.string().optional().describe('不想要的东西，默认已经排掉糊图/水印/文字/畸形手'),
     width: z.number().optional().describe('宽，默认 1024，会按 64 对齐，范围 384~1536'),
     height: z.number().optional().describe('高，默认 1024'),
-    steps: z.number().optional().describe('采样步数；默认 zimage 8 步、sdxl 25 步。Z-Image 是蒸馏模型，加到 12 以上基本没用；sdxl 想更快给 18~20'),
-    cfg: z.number().optional().describe('提示词强度；默认 zimage 1、sdxl 7。Z-Image 固定 1 附近，别调高'),
+    steps: z.number().optional().describe('采样步数，默认 8。Z-Image 是蒸馏模型，加到 12 以上基本没用'),
+    cfg: z.number().optional().describe('提示词强度，默认 1。Z-Image 固定 1 附近，别调高'),
     seed: z.number().optional().describe('种子；不填随机。想微调同一张就带上上一次的 seed 再改提示词'),
     count: z.number().optional().describe('一次画几张，1~4，默认 1'),
-    checkpoint: z.string().optional().describe('只在 sdxl 下有用：指定模型文件名；不填用 config.json comfyui.checkpoint 或第一个'),
+    checkpoint: z.string().optional().describe('（已废弃，SDXL 模型已卸载，传了也不生效）'),
     sampler: z.string().optional().describe('采样器，默认 dpmpp_2m（zimage 固定用 euler）'),
     scheduler: z.string().optional().describe('调度器，默认 karras（zimage 固定用 simple）'),
     timeoutSec: z.number().optional().describe('最多等多少秒，默认 180，上限 600'),
@@ -2776,7 +2776,7 @@ server.tool(
         '',
         '怎么用：',
         '- 视频配图：qq_make_video 的 segments 里写 { kind:"image", src:"<上面那个绝对路径>", caption:"说明" }',
-        '- 让它动起来：qq_animate_image image=<上面那个绝对路径> prompt="..."',
+        '- 想做片子：把它填进 qq_make_video 的 image 段，成片会自动缓慢推近、淡入，比硬让它动起来干净',
         '- 发到 QQ 看效果：qq_send_image path=<上面那个绝对路径>',
         '- 不满意就改 prompt 再画一张（Z-Image 一张 20~40 秒，别一次画太多）',
       ];
@@ -2799,6 +2799,15 @@ const ANIM_UNET = 'wan2.2_ti2v_5B_fp16.safetensors';
 const ANIM_CLIP = 'umt5_xxl_fp8_e4m3fn_scaled.safetensors';
 const ANIM_VAE = 'wan2.2_vae.safetensors';
 const ANIM_NEG_DEFAULT = 'blurry, low quality, distorted, watermark, text, jitter, flicker, static, frozen frame';
+// 2026-10-25：Wan2.2 视频模型已被主人删掉腾空间，只留 Z-Image 生图。
+// 缺失时下面 handler 直接给可操作的回执，别让她撞一堵 ComfyUI 的英文报错。
+function animMissingModels() {
+  const dir = String(readBridgeConfig()?.comfyui?.dir || process.env.PET_COMFYUI_DIR || '').trim();
+  if (!dir) return [];
+  const root = path.join(dir, 'ComfyUI', 'models');
+  const need = [['diffusion_models', ANIM_UNET], ['text_encoders', ANIM_CLIP], ['vae', ANIM_VAE]];
+  return need.filter(([sub, f]) => !fs.existsSync(path.join(root, sub, f))).map(([sub, f]) => sub + '/' + f);
+}
 
 function roundTo16(n, fb, lo, hi) {
   const v = Number(n);
@@ -2896,6 +2905,13 @@ server.tool(
     timeoutSec: z.number().optional().describe('最多等多少秒，默认 900，上限 1800'),
   },
   async ({ image, prompt, negative, width, height, length, steps, cfg, fps, seed, timeoutSec }) => {
+    const miss = animMissingModels();
+    if (miss.length) {
+      return {
+        content: [{ type: 'text', text: '本机没装图生视频模型，跑不了这条（缺 ' + miss.join('、') + '）。Wan2.2 那三个文件 2026-10-25 已经被主人删掉腾空间了，现在只留 Z-Image 生图。要做动态画面可以：① 用 qq_make_video 的 { kind:"image", src:"<绝对路径>" } 段，静态图会自动缓慢推近 + 淡入，做成片比微动视频干净；② 用 qq_draw_image 多画几张同风格图，再用 image 段串起来。' }],
+        isError: true,
+      };
+    }
     const guard = await startMemGuard(memMinGB('animate', 2.5), '图生视频');
     try {
       const imgPath = String(image ?? '').trim().replace(/^"+|"+$/g, '');
