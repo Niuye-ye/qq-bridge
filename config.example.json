@@ -113,7 +113,10 @@
       "enabled": true,
       "adbPath": "",
       "serial": "auto",
-      "adbPorts": [16384, 16385],
+      "adbPorts": [
+        16384,
+        16385
+      ],
       "maxPerMinute": 6
     },
     "provideRecommendations": true,
@@ -280,5 +283,10 @@
     "ffmpeg": "",
     "python": "",
     "adb": ""
+  },
+  "comfyui": {
+    "url": "http://127.0.0.1:8188",
+    "checkpoint": "",
+    "dir": ""
   }
 }

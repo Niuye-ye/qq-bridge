@@ -2403,4 +2403,252 @@ server.tool(
   }
 );
 
+
+// ---------- 生图（ComfyUI，2026-10-25） ----------
+// 她做视频需要配图，但 ComfyUI 那套节点她既看不见也没法调。这里把"一句提示词 -> 一张 png"
+// 包成工具，直接落到 state/draw/<id>/，返回绝对路径，qq_make_video 的 image 段直接引用。
+const DRAW_ROOT = path.join(ROOT, 'state', 'draw');
+const DRAW_TIMEOUT_DEFAULT = 180;
+const DRAW_TIMEOUT_MAX = 600;
+const DRAW_NEG_DEFAULT = 'blurry, lowres, bad anatomy, watermark, signature, text, jpeg artifacts, extra fingers';
+
+function comfyBase() {
+  let u = '';
+  try {
+    const c = readBridgeConfig()?.comfyui;
+    if (c && typeof c.url === 'string') u = c.url.trim();
+  } catch { /* ignore */ }
+  if (!u) u = process.env.PET_COMFYUI || 'http://127.0.0.1:8188';
+  return u.replace(/\/+$/, '');
+}
+
+const drawSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const DRAW_AUTOSTART_WAIT_MS = 120000;
+let comfyStarting = null;
+
+// ComfyUI 不常驻（空载也要占 1GB 内存，这台机器本来就紧），她要用的时候没开就替她拉起来。
+function comfyStartBat() {
+  try {
+    const c = readBridgeConfig()?.comfyui || {};
+    let p = typeof c.startBat === 'string' ? c.startBat.trim() : '';
+    if (!p && typeof c.dir === 'string' && c.dir.trim()) {
+      p = path.join(path.dirname(path.resolve(c.dir.trim())), 'start-comfyui.bat');
+    }
+    if (!p) return '';
+    const abs = path.resolve(p);
+    return fs.existsSync(abs) ? abs : '';
+  } catch { return ''; }
+}
+
+async function comfyEnsureUp() {
+  if (comfyStarting) return comfyStarting;
+  const bat = comfyStartBat();
+  if (!bat) return false;
+  comfyStarting = (async () => {
+    try {
+      const child = spawn('cmd.exe', ['/c', bat], {
+        cwd: path.dirname(bat), detached: true, stdio: 'ignore', windowsHide: true,
+      });
+      child.unref();
+    } catch { return false; }
+    const t0 = Date.now();
+    while (Date.now() - t0 < DRAW_AUTOSTART_WAIT_MS) {
+      await drawSleep(3000);
+      try {
+        const r = await fetch(comfyBase() + '/system_stats');
+        if (r.ok) return true;
+      } catch { /* 还没起来，接着等 */ }
+    }
+    return false;
+  })();
+  try { return await comfyStarting; } finally { comfyStarting = null; }
+}
+
+async function comfyFetch(url, opts = {}) {
+  let res;
+  try {
+    res = await fetch(url, opts);
+  } catch (e) {
+    const up = await comfyEnsureUp();
+    try {
+      res = await fetch(url, opts);
+    } catch (e2) {
+      throw new Error('连不上 ComfyUI（' + comfyBase() + '）：' + (e2?.message ?? e2) +
+        (up ? '。已经试着拉起来了，等半分钟再画一张。' : '。ComfyUI 没在跑，自动拉起也没成功，喊主人开一下。'));
+    }
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  return { res, buf };
+}
+
+async function comfyJson(url, opts) {
+  const { res, buf } = await comfyFetch(url, opts);
+  const txt = buf.toString('utf8');
+  let j = null;
+  try { j = JSON.parse(txt); } catch { /* ignore */ }
+  if (!res.ok) {
+    const msg = j?.error?.message || j?.error || txt.slice(0, 200) || ('HTTP ' + res.status);
+    throw new Error('ComfyUI 说：' + (typeof msg === 'string' ? msg : JSON.stringify(msg).slice(0, 240)));
+  }
+  return j;
+}
+
+async function comfyPickCheckpoint(want) {
+  const info = await comfyJson(comfyBase() + '/object_info/CheckpointLoaderSimple');
+  const raw = info?.CheckpointLoaderSimple?.input?.required?.ckpt_name;
+  const list = Array.isArray(raw) ? raw[0] : (Array.isArray(raw?.options) ? raw.options : []);
+  const names = (list || []).filter((x) => typeof x === 'string' && x);
+  if (!names.length) throw new Error('ComfyUI 的 models/checkpoints 是空的，先往里放一个 checkpoint。');
+  if (want && names.includes(want)) return want;
+  try {
+    const ck = readBridgeConfig()?.comfyui?.checkpoint;
+    if (ck && names.includes(ck)) return ck;
+  } catch { /* ignore */ }
+  return names.find((n) => /xl/i.test(n)) || names[0];
+}
+
+function roundTo64(n, fallback) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v <= 0) return fallback;
+  return Math.min(1536, Math.max(384, Math.round(v / 64) * 64));
+}
+
+function buildSdxlWorkflow(o) {
+  const wf = {
+    '4': { class_type: 'CheckpointLoaderSimple', inputs: { ckpt_name: o.ckpt } },
+    '6': { class_type: 'CLIPTextEncode', inputs: { text: o.prompt, clip: ['4', 1] } },
+    '7': { class_type: 'CLIPTextEncode', inputs: { text: o.negative, clip: ['4', 1] } },
+    '5': { class_type: 'EmptyLatentImage', inputs: { width: o.width, height: o.height, batch_size: o.count } },
+    '3': {
+      class_type: 'KSampler',
+      inputs: {
+        seed: o.seed, steps: o.steps, cfg: o.cfg,
+        sampler_name: o.sampler, scheduler: o.scheduler, denoise: 1,
+        model: ['4', 0], positive: ['6', 0], negative: ['7', 0], latent_image: ['5', 0],
+      },
+    },
+    '8': { class_type: 'VAEDecode', inputs: { samples: ['3', 0], vae: ['4', 2] } },
+    '9': { class_type: 'SaveImage', inputs: { filename_prefix: o.prefix, images: ['8', 0] } },
+  };
+  return wf;
+}
+
+async function comfySubmit(workflow) {
+  const j = await comfyJson(comfyBase() + '/prompt', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: workflow }),
+  });
+  if (!j?.prompt_id) throw new Error('ComfyUI 没给 prompt_id：' + JSON.stringify(j).slice(0, 200));
+  return j.prompt_id;
+}
+
+async function comfyWaitDone(promptId, timeoutSec) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutSec * 1000) {
+    await drawSleep(1500);
+    const h = await comfyJson(comfyBase() + '/history/' + promptId);
+    const entry = h?.[promptId];
+    if (!entry) continue;
+    const st = entry.status || {};
+    if (st.status_str === 'error') {
+      const msgs = JSON.stringify(st.messages ?? '').slice(0, 400);
+      throw new Error('ComfyUI 执行失败：' + msgs);
+    }
+    if (st.completed || entry.outputs) return entry;
+  }
+  throw new Error('等了 ' + timeoutSec + ' 秒还没出图。可能显存/内存吃紧在换页，试试把尺寸降到 768 或步数降到 20。');
+}
+
+async function comfyCollectImages(entry) {
+  const files = [];
+  for (const nodeOut of Object.values(entry.outputs || {})) {
+    for (const img of nodeOut?.images || []) {
+      if (!img?.filename) continue;
+      files.push({ filename: img.filename, subfolder: img.subfolder || '', type: img.type || 'output' });
+    }
+  }
+  return files;
+}
+
+async function comfyDownload(img) {
+  const qs = new URLSearchParams({ filename: img.filename, subfolder: img.subfolder, type: img.type });
+  const { res, buf } = await comfyFetch(comfyBase() + '/view?' + qs.toString());
+  if (!res.ok) throw new Error('取图失败 HTTP ' + res.status);
+  return buf;
+}
+
+server.tool(
+  'qq_draw_image',
+  '用本机 ComfyUI 画图（一句提示词 -> png）。做视频要配图、封面、插图时用它，产出落在 state/draw/<id>/ 下并返回绝对路径，可以直接填进 qq_make_video 的 image 段 src，或用 qq_send_image path=<绝对路径> 发到 QQ。1024x1024 大约 30 秒一张。',
+  {
+    prompt: z.string().describe('想要什么画面。写具体：主体 + 动作/场景 + 风格 + 光线，例如 “a cute cartoon whale mascot girl sitting on a desk at night, cozy room, soft rim light, illustration, clean lines”'),
+    negative: z.string().optional().describe('不想要的东西，默认已经排掉糊图/水印/文字/畸形手'),
+    width: z.number().optional().describe('宽，默认 1024，会按 64 对齐，范围 384~1536'),
+    height: z.number().optional().describe('高，默认 1024'),
+    steps: z.number().optional().describe('采样步数，默认 25；要快就 18~20，要细就 30~35'),
+    cfg: z.number().optional().describe('提示词强度，默认 7；数值越大越贴提示词但越僵，常用 5~8'),
+    seed: z.number().optional().describe('种子；不填随机。想微调同一张就带上上一次的 seed 再改提示词'),
+    count: z.number().optional().describe('一次画几张，1~4，默认 1'),
+    checkpoint: z.string().optional().describe('指定模型文件名；不填用 config.json comfyui.checkpoint 或第一个'),
+    sampler: z.string().optional().describe('采样器，默认 dpmpp_2m'),
+    scheduler: z.string().optional().describe('调度器，默认 karras'),
+    timeoutSec: z.number().optional().describe('最多等多少秒，默认 180，上限 600'),
+  },
+  async ({ prompt, negative, width, height, steps, cfg, seed, count, checkpoint, sampler, scheduler, timeoutSec }) => {
+    try {
+      const text = String(prompt ?? '').trim();
+      if (!text) return { content: [{ type: 'text', text: '得给个 prompt，不然不知道画什么。' }], isError: true };
+      const t0 = Date.now();
+      const ckpt = await comfyPickCheckpoint(checkpoint);
+      const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      const dir = path.join(DRAW_ROOT, id);
+      fs.mkdirSync(dir, { recursive: true });
+      const wait = Math.min(DRAW_TIMEOUT_MAX, Math.max(20, Number(timeoutSec) || DRAW_TIMEOUT_DEFAULT));
+      const o = {
+        ckpt,
+        prompt: text,
+        negative: String(negative ?? '').trim() || DRAW_NEG_DEFAULT,
+        width: roundTo64(width, 1024),
+        height: roundTo64(height, 1024),
+        steps: Math.min(60, Math.max(4, Math.round(Number(steps) || 25))),
+        cfg: Math.min(20, Math.max(1, Number(cfg) || 7)),
+        seed: Number.isFinite(Number(seed)) && Number(seed) > 0 ? Math.floor(Number(seed)) : Math.floor(Math.random() * 1e12),
+        count: Math.min(4, Math.max(1, Math.round(Number(count) || 1))),
+        sampler: String(sampler ?? '').trim() || 'dpmpp_2m',
+        scheduler: String(scheduler ?? '').trim() || 'karras',
+        prefix: 'draw_' + id,
+      };
+      const promptId = await comfySubmit(buildSdxlWorkflow(o));
+      const entry = await comfyWaitDone(promptId, wait);
+      const files = await comfyCollectImages(entry);
+      if (!files.length) throw new Error('跑完了但没拿到图（workflow 里没有输出节点？）');
+      const saved = [];
+      for (const f of files) {
+        const buf = await comfyDownload(f);
+        const name = path.basename(f.filename) || (id + '.png');
+        const abs = path.join(dir, name);
+        fs.writeFileSync(abs, buf);
+        saved.push({ abs, bytes: buf.length });
+      }
+      const secs = Math.round((Date.now() - t0) / 1000);
+      const lines = [
+        '画好了：' + saved.length + ' 张，' + o.width + 'x' + o.height + '，' + o.steps + ' 步，用了 ' + secs + ' 秒。',
+        '模型 ' + o.ckpt + '，seed ' + o.seed + '（想在同一张上微调就用这个 seed）。',
+        '目录 ' + dir,
+        ...saved.map((s) => '  ' + s.abs),
+        '',
+        '怎么用：',
+        '- 视频配图：qq_make_video 的 segments 里写 { kind:"image", src:"<上面那个绝对路径>", caption:"说明" }',
+        '- 发到 QQ 看效果：qq_send_image path=<上面那个绝对路径>',
+        '- 不满意就改 prompt 再画一张（别一次画太多，一张 30 秒）',
+      ];
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: '画不出来：' + (error?.message ?? error) }], isError: true };
+    }
+  }
+);
+
 await server.connect(new StdioServerTransport());
