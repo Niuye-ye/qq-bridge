@@ -9,7 +9,7 @@
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -2407,6 +2407,90 @@ server.tool(
 // ---------- 生图（ComfyUI，2026-10-25） ----------
 // 她做视频需要配图，但 ComfyUI 那套节点她既看不见也没法调。这里把"一句提示词 -> 一张 png"
 // 包成工具，直接落到 state/draw/<id>/，返回绝对路径，qq_make_video 的 image 段直接引用。
+
+// ---------- 内存守护（画图/做视频前腾内存，完事再恢复链路，2026-10-25） ----------
+// 本机 15.6GB 内存，Wan 那次就是内存吃满卡死。脚本在运维项目 bin/mem-saver.ps1：
+//   check  -> 读可用物理内存；free -> 关掉 pet-guard/桌宠/MuMu/哔哩哔哩并写清单；restore -> 按清单起回来。
+const MEM_TIMEOUT_MS = 120000;
+
+function memSaverScript() {
+  try {
+    const p = String(readBridgeConfig()?.memory?.saver || "").trim();
+    if (p && fs.existsSync(p)) return p;
+  } catch {}
+  const alt = [
+    path.join(ROOT, "..", "bin", "mem-saver.ps1"),
+    "F:/项目/手机上使用dsh/bin/mem-saver.ps1",
+    "C:/dsh/bin/mem-saver.ps1",
+  ];
+  for (const cand of alt) { if (cand && fs.existsSync(cand)) return cand; }
+  return "";
+}
+
+function runMemSaver(action) {
+  const script = memSaverScript();
+  if (!script) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    execFile(
+      "powershell.exe",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Action", action],
+      { windowsHide: true, timeout: MEM_TIMEOUT_MS, encoding: "buffer" },
+      (err, stdout) => {
+        if (err) { console.error("[mem] " + action + " 失败: " + (err.message || err)); resolve(null); return; }
+        const s = String(stdout ?? "").trim();
+        const i = s.indexOf("{");
+        if (i < 0) { resolve(null); return; }
+        try { resolve(JSON.parse(s.slice(i))); } catch { resolve(null); }
+      }
+    );
+  });
+}
+
+function memRestoreLater() {
+  const script = memSaverScript();
+  if (!script) return;
+  try {
+    const child = spawn(
+      "powershell.exe",
+      ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Action", "restore"],
+      // 别加 detached：powershell + detached + stdio ignore 会静默退出（见 AGENTS 17.15 实测）
+      { windowsHide: true, stdio: "ignore" }
+    );
+    child.unref();
+    console.error("[mem] 生成完成，已派发恢复链路");
+  } catch (e) {
+    console.error("[mem] 恢复派发失败: " + (e?.message ?? e));
+  }
+}
+
+// 阈值可按机器调：config.json 的 memory.minFreeDraw / minFreeAnimate（单位 GB）。
+function memMinGB(kind, dflt) {
+  try {
+    const c = readBridgeConfig()?.memory || {};
+    const v = Number(kind === 'animate' ? c.minFreeAnimate : c.minFreeDraw);
+    if (Number.isFinite(v) && v > 0) return v;
+  } catch {}
+  return dflt;
+}
+// 用前检查；不够就腾。返回的 finish() 在 finally 里调，负责把链路起回来。
+async function startMemGuard(minFreeGB, tag) {
+  let freed = false;
+  try {
+    const st = await runMemSaver("check");
+    if (st && typeof st.freeGB === "number" && st.freeGB < minFreeGB) {
+      console.error("[mem] " + tag + " 前可用 " + st.freeGB + "GB，低于 " + minFreeGB + "GB，先腾内存");
+      const r = await runMemSaver("free");
+      if (r && r.action === "free") {
+        freed = true;
+        console.error("[mem] 腾出 " + r.freedGB + "GB（现 " + r.afterGB + "GB）");
+      }
+    }
+  } catch {}
+  return {
+    freed,
+    finish() { if (freed) memRestoreLater(); },
+  };
+}
 const DRAW_ROOT = path.join(ROOT, 'state', 'draw');
 const DRAW_TIMEOUT_DEFAULT = 180;
 const DRAW_TIMEOUT_MAX = 600;
@@ -2626,6 +2710,7 @@ server.tool(
     timeoutSec: z.number().optional().describe('最多等多少秒，默认 180，上限 600'),
   },
   async ({ prompt, model, negative, width, height, steps, cfg, seed, count, checkpoint, sampler, scheduler, timeoutSec }) => {
+    const guard = await startMemGuard(memMinGB('draw', 1.0), '画图');
     try {
       const text = String(prompt ?? '').trim();
       if (!text) return { content: [{ type: 'text', text: '得给个 prompt，不然不知道画什么。' }], isError: true };
@@ -2698,6 +2783,8 @@ server.tool(
       return { content: [{ type: 'text', text: lines.join(String.fromCharCode(10)) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: '画不出来：' + (error?.message ?? error) }], isError: true };
+    } finally {
+      guard.finish();
     }
   }
 );
@@ -2809,6 +2896,7 @@ server.tool(
     timeoutSec: z.number().optional().describe('最多等多少秒，默认 900，上限 1800'),
   },
   async ({ image, prompt, negative, width, height, length, steps, cfg, fps, seed, timeoutSec }) => {
+    const guard = await startMemGuard(memMinGB('animate', 2.5), '图生视频');
     try {
       const imgPath = String(image ?? '').trim().replace(/^"+|"+$/g, '');
       if (!imgPath) return { content: [{ type: 'text', text: '得给一张起始图的绝对路径。' }], isError: true };
@@ -2868,6 +2956,8 @@ server.tool(
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     } catch (error) {
       return { content: [{ type: 'text', text: '动不起来：' + (error?.message ?? error) }], isError: true };
+    } finally {
+      guard.finish();
     }
   }
 );

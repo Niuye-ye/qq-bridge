@@ -293,5 +293,10 @@
       "clip": "qwen_3_4b.safetensors",
       "vae": "ae.safetensors"
     }
+  },
+  "memory": {
+    "saver": "",
+    "minFreeDraw": 1,
+    "minFreeAnimate": 2.5
   }
 }
