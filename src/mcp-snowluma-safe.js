@@ -2203,4 +2203,204 @@ server.tool(
   }
 );
 
+// ── 自由执行：她写代码自己画（qq_run_code / qq_run_status）─────────────────
+// 她只会调 MCP 工具，没有 shell。想「自己用代码画视频」就需要一个能跑代码的地方：
+// 每次调用给她一个专属工作目录（state/code-jobs/<id>/），cwd 就在里面，
+// 能 import PIL / numpy / edge-tts，能直接调 ffmpeg（PET_FFMPEG 已设好、也塞进了 PATH）。
+const CODE_JOBS = path.join(MCP_HERE, '..', 'state', 'code-jobs');
+const CODE_TIMEOUT_DEFAULT = 240;
+const CODE_TIMEOUT_MAX = 900;
+const CODE_SRC_MAX = 200000;
+
+function codeJobDir(id) { return path.join(CODE_JOBS, String(id).trim()); }
+
+function readCodeStatus(dir) {
+  try { return JSON.parse(fs.readFileSync(path.join(dir, 'status.json'), 'utf8')); } catch { return null; }
+}
+
+function writeCodeStatus(dir, obj) {
+  try { fs.writeFileSync(path.join(dir, 'status.json'), JSON.stringify(obj, null, 2), 'utf8'); } catch { /* ignore */ }
+}
+
+function pidAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isFinite(n) || n <= 0) return false;
+  try { process.kill(n, 0); return true; } catch (e) { return e && e.code === 'EPERM'; }
+}
+
+/** 目录里她的产出（跳过 run.log / status.json / main.py），新的在前。 */
+function listCodeOutputs(dir, limit = 40) {
+  const out = [];
+  const walk = (d, depth) => {
+    if (depth > 3 || out.length >= limit) return;
+    let ents = [];
+    try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of ents) {
+      if (out.length >= limit) return;
+      if (depth === 0 && (e.name === 'run.log' || e.name === 'status.json' || e.name === 'main.py')) continue;
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) { walk(p, depth + 1); continue; }
+      let bytes = 0;
+      let mtime = 0;
+      try { const st = fs.statSync(p); bytes = st.size; mtime = st.mtimeMs; } catch { /* ignore */ }
+      out.push({ rel: path.relative(dir, p).split(path.sep).join('/'), abs: p, bytes, mtime });
+    }
+  };
+  walk(dir, 0);
+  out.sort((a, b) => b.mtime - a.mtime);
+  return out;
+}
+
+/** 只允许相对路径、不许 .. 逃出去。 */
+function safeRelName(name) {
+  const s = String(name || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!s || s.includes('..')) return null;
+  const parts = s.split('/').filter(Boolean);
+  if (!parts.length) return null;
+  return parts.join('/');
+}
+
+server.tool(
+  'qq_run_code',
+  '自己写 Python 代码去做东西——画视频、合成图片、做图表、算数据都行，不用只套现成模板。每次调用给你一个专属工作目录（cwd 就是它），能直接 import PIL / numpy / edge-tts，能直接跑 ffmpeg（PET_FFMPEG 已设好，也进了 PATH）。把产出写到当前目录，比如 out.mp4 / out.png。后台执行、不占这一轮，过一会儿用 qq_run_status 查结果和文件清单；mp4 想进手机再调 qq_push_video（传绝对路径）。',
+  {
+    code: z.string().describe('完整的 Python 源码（单文件，会写进工作目录的 main.py，用 __file__ 定位自己）'),
+    files: z.record(z.string(), z.string()).optional().describe('额外的辅助文件：文件名 -> 文本内容（如 data.json、字幕.csv、配色.json），都写在工作目录下'),
+    name: z.string().optional().describe('这次任务叫什么（只进日志，方便事后认）'),
+    timeoutSec: z.number().optional().describe('最长运行秒数，默认 240，最大 900；超了会被杀掉'),
+  },
+  async ({ code, files, name, timeoutSec }) => {
+    try {
+      const src = String(code || '');
+      if (!src.trim()) return { content: [{ type: 'text', text: 'code 是空的' }], isError: true };
+      if (src.length > CODE_SRC_MAX) return { content: [{ type: 'text', text: '代码太长了（' + src.length + ' 字符，上限 ' + CODE_SRC_MAX + '）' }], isError: true };
+      const tmo = Math.max(10, Math.min(CODE_TIMEOUT_MAX, Number(timeoutSec) || CODE_TIMEOUT_DEFAULT));
+      fs.mkdirSync(CODE_JOBS, { recursive: true });
+      const id = 'r' + Date.now().toString(36);
+      const dir = codeJobDir(id);
+      fs.mkdirSync(dir, { recursive: true });
+      const mainPy = path.join(dir, 'main.py');
+      fs.writeFileSync(mainPy, src, 'utf8');
+      const badFiles = [];
+      if (files && typeof files === 'object') {
+        for (const [rawName, content] of Object.entries(files)) {
+          const rel = safeRelName(rawName);
+          if (!rel) { badFiles.push(rawName); continue; }
+          const target = path.join(dir, rel);
+          fs.mkdirSync(path.dirname(target), { recursive: true });
+          fs.writeFileSync(target, String(content ?? ''), 'utf8');
+        }
+      }
+      const logPath = path.join(dir, 'run.log');
+      const fd = fs.openSync(logPath, 'a');
+      fs.writeSync(fd, '[task] ' + (name ? String(name) : '(未命名)') + '  起于 ' + new Date().toISOString() + '\r\n');
+      const ffmpeg = pickFfmpeg();
+      const childEnv = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1', PET_JOB_DIR: dir };
+      if (ffmpeg) {
+        childEnv.PET_FFMPEG = ffmpeg;
+        childEnv.PATH = path.dirname(ffmpeg) + path.delimiter + (process.env.PATH || '');
+      }
+      const child = spawn(pickPython(), ['-u', mainPy], {
+        cwd: dir,
+        detached: true,
+        stdio: ['ignore', fd, fd],
+        windowsHide: true,
+        env: childEnv,
+      });
+      const startedAt = Date.now();
+      writeCodeStatus(dir, { id, name: name || '', status: 'running', pid: child.pid ?? 0, startedAt, timeoutSec: tmo, dir });
+      child.on('exit', (exitCode, signal) => {
+        const st = readCodeStatus(dir) || {};
+        const ok = exitCode === 0;
+        writeCodeStatus(dir, {
+          ...st,
+          status: ok ? 'done' : 'failed',
+          exitCode: typeof exitCode === 'number' ? exitCode : null,
+          signal: signal || null,
+          endedAt: Date.now(),
+          elapsedSec: Math.round((Date.now() - startedAt) / 100) / 10,
+        });
+        try { fs.writeSync(fd, '\r\n[task] 结束 exit=' + String(exitCode) + (signal ? ' signal=' + signal : '') + '\r\n'); } catch { /* ignore */ }
+        try { fs.closeSync(fd); } catch { /* ignore */ }
+      });
+      child.unref();
+      return {
+        content: [{
+          type: 'text',
+          text: [
+            '✅ 已经在跑了：' + id + (name ? '（' + name + '）' : ''),
+            '工作目录：' + dir,
+            '代码就是那个目录里的 main.py，cwd 也在那儿 —— 产出直接写相对路径，例如 out.mp4、frames/x.png。',
+            ffmpeg ? 'ffmpeg：' + ffmpeg : '⚠️ 没定位到 ffmpeg.exe（config.json 的 video.ffmpeg 没配、PATH 也没有），要编码视频可能失败。',
+            badFiles.length ? '⚠️ 这些辅助文件名不合法（不许绝对路径或 ..）：' + badFiles.join(', ') : '',
+            '最长跑 ' + tmo + ' 秒。过一会儿用 qq_run_status 传 id=' + id + ' 看结果、拿文件清单。',
+          ].filter(Boolean).join('\n'),
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: 'text', text: '没能开始：' + (error?.message ?? error) }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  'qq_run_status',
+  '查 qq_run_code 的进度：还在跑 / 成功 / 失败，附日志尾巴和这个工作目录里所有产出（路径 + 大小）。不传 id 就列最近几个任务。',
+  {
+    id: z.string().optional().describe('qq_run_code 返回的 id，例如 rk3f9a；留空列最近 5 个'),
+  },
+  async ({ id }) => {
+    try {
+      if (!fs.existsSync(CODE_JOBS)) return { content: [{ type: 'text', text: '还没跑过代码任务。' }] };
+      if (!id) {
+        const dirs = fs.readdirSync(CODE_JOBS, { withFileTypes: true })
+          .filter((e) => e.isDirectory())
+          .map((e) => ({ id: e.name, mtime: (() => { try { return fs.statSync(path.join(CODE_JOBS, e.name)).mtimeMs; } catch { return 0; } })() }))
+          .sort((a, b) => b.mtime - a.mtime)
+          .slice(0, 5);
+        if (!dirs.length) return { content: [{ type: 'text', text: '还没跑过代码任务。' }] };
+        return { content: [{ type: 'text', text: '最近的任务：\n' + dirs.map((d) => {
+          const st = readCodeStatus(codeJobDir(d.id)) || {};
+          const outs = listCodeOutputs(codeJobDir(d.id), 40);
+          return [d.id, (st.name || '(未命名)'), (st.status || '?'), outs.length + ' 个文件'].join('  |  ');
+        }).join('\n') }] };
+      }
+      const dir = codeJobDir(id);
+      if (!fs.existsSync(dir)) return { content: [{ type: 'text', text: '没有这个任务：' + id }], isError: true };
+      let st = readCodeStatus(dir) || { id, status: 'running' };
+      if (st.status === 'running') {
+        if (!pidAlive(st.pid)) {
+          st = { ...st, status: 'failed', note: '进程已经不在了（被杀或崩了），看日志尾巴' };
+          writeCodeStatus(dir, st);
+        } else if (st.startedAt && Date.now() - st.startedAt > (Number(st.timeoutSec) || CODE_TIMEOUT_DEFAULT) * 1000) {
+          try { process.kill(Number(st.pid)); } catch { /* ignore */ }
+          st = { ...st, status: 'failed', note: '超过 ' + (st.timeoutSec || CODE_TIMEOUT_DEFAULT) + ' 秒还没跑完，已杀掉' };
+          writeCodeStatus(dir, st);
+        }
+      }
+      const tail = readTailLines(path.join(dir, 'run.log'), 15);
+      const outs = listCodeOutputs(dir, 40);
+      const show = outs.slice(0, 12);
+      const media = /^(mp4|mov|webm|mkv|png|jpg|jpeg|gif|webp|wav|mp3|flac)$/i;
+      const lines = [
+        (st.status === 'done' ? '✅ 跑完了' : st.status === 'failed' ? '❌ 失败了' : '⏳ 还在跑') + '：' + id + (st.name ? '（' + st.name + '）' : ''),
+        st.startedAt ? ('起于 ' + new Date(st.startedAt).toLocaleTimeString() + (st.elapsedSec ? '，用了 ' + st.elapsedSec + ' 秒' : '')) : '',
+        st.note ? ('备注：' + st.note) : '',
+        '工作目录：' + dir,
+        outs.length ? ('产出 ' + outs.length + ' 个文件：') : '还没有产出文件',
+        ...show.map((o) => '  ' + o.rel + '  ' + (o.bytes >= 1048576 ? (o.bytes / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(o.bytes / 1024)) + ' KB') + '\n    ' + o.abs),
+        outs.length > show.length ? '  …还有 ' + (outs.length - show.length) + ' 个' : '',
+        tail.length ? ('日志尾巴：\n' + tail.join('\n')) : '',
+      ].filter(Boolean);
+      const mp4 = outs.find((o) => /\.(mp4|mov|webm|mkv)$/i.test(o.rel));
+      if (st.status === 'done' && mp4 && media.test(mp4.rel.split('.').pop())) {
+        lines.push('想进手机就 qq_push_video 传 path=' + mp4.abs + '（会进 /sdcard/Movies/qq/ 并扫进相册）。');
+      }
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: '查不了：' + (error?.message ?? error) }], isError: true };
+    }
+  }
+);
+
 await server.connect(new StdioServerTransport());
