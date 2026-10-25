@@ -2011,7 +2011,7 @@ server.tool(
           type: 'text',
           text: [
             `开始做了：《${job.title}》`,
-            `id=${id}，${segments.length} 段，${hd ? '1080p' : '720p'}，预计 ${est} 秒左右出片。`,
+            `id=${id}，${segments.length} 段，${job.width}x${job.height}，预计 ${est} 秒左右出片。`,
             `文件会出在 videos/${id}.mp4。`,
             ffmpeg ? '' : '⚠️ 没定位到 ffmpeg.exe（config.json 的 video.ffmpeg 没配、PATH 里也没有），渲染那步很可能失败。',
             `过一会儿用 qq_video_status 传 id=${id} 看做好了没（做完了会把路径给你，可以直接发给主人）。`,
