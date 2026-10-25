@@ -2534,6 +2534,34 @@ function buildSdxlWorkflow(o) {
   return wf;
 }
 
+function buildZImageWorkflow(o) {
+  // Z-Image Turbo：Qwen3-4B 文本编码 + ae VAE + 8 步 cfg1（蒸馏模型，步数别乱加）
+  return {
+    '1': { class_type: 'UNETLoader', inputs: { unet_name: o.unet, weight_dtype: 'default' } },
+    '2': { class_type: 'CLIPLoader', inputs: { clip_name: o.clip, type: 'qwen_image' } },
+    '3': { class_type: 'VAELoader', inputs: { vae_name: o.vae } },
+    '4': { class_type: 'TextEncodeZImageOmni', inputs: { clip: ['2', 0], prompt: o.prompt, auto_resize_images: true } },
+    '5': { class_type: 'TextEncodeZImageOmni', inputs: { clip: ['2', 0], prompt: o.negative, auto_resize_images: true } },
+    '6': { class_type: 'EmptySD3LatentImage', inputs: { width: o.width, height: o.height, batch_size: o.count } },
+    '7': {
+      class_type: 'KSampler',
+      inputs: {
+        model: ['1', 0], seed: o.seed, steps: o.steps, cfg: o.cfg,
+        sampler_name: 'euler', scheduler: 'simple',
+        positive: ['4', 0], negative: ['5', 0], latent_image: ['6', 0], denoise: 1,
+      },
+    },
+    '8': { class_type: 'VAEDecode', inputs: { samples: ['7', 0], vae: ['3', 0] } },
+    '9': { class_type: 'SaveImage', inputs: { filename_prefix: o.prefix, images: ['8', 0] } },
+  };
+}
+
+const ZIMAGE_DEFAULTS = {
+  unet: 'z_image_turbo_bf16.safetensors',
+  clip: 'qwen_3_4b.safetensors',
+  vae: 'ae.safetensors',
+};
+
 async function comfySubmit(workflow) {
   const j = await comfyJson(comfyBase() + '/prompt', {
     method: 'POST',
@@ -2581,46 +2609,68 @@ async function comfyDownload(img) {
 
 server.tool(
   'qq_draw_image',
-  '用本机 ComfyUI 画图（一句提示词 -> png）。做视频要配图、封面、插图时用它，产出落在 state/draw/<id>/ 下并返回绝对路径，可以直接填进 qq_make_video 的 image 段 src，或用 qq_send_image path=<绝对路径> 发到 QQ。1024x1024 大约 30 秒一张。',
+  '用本机 ComfyUI 画图（一句提示词 -> png）。做视频要配图、封面、插图时用它，产出落在 state/draw/<id>/ 下并返回绝对路径，可以直接填进 qq_make_video 的 image 段 src，或用 qq_send_image path=<绝对路径> 发到 QQ。默认模型 Z-Image Turbo：8 步，1024x1024 约 20~40 秒一张，插画/角色/场景都画得干净，写中文主体也认得。想换 SDXL 画风传 model="sdxl"。',
   {
-    prompt: z.string().describe('想要什么画面。写具体：主体 + 动作/场景 + 风格 + 光线，例如 “a cute cartoon whale mascot girl sitting on a desk at night, cozy room, soft rim light, illustration, clean lines”'),
+    prompt: z.string().describe('想要什么画面。写具体：主体 + 场景 + 风格 + 光线，例如 a cute cartoon whale mascot girl sitting on a desk at night, cozy room, soft rim light, illustration, clean lines'),
+    model: z.enum(['zimage', 'sdxl']).optional().describe('画图模型，默认 zimage（Z-Image Turbo，8 步、更懂提示词）；sdxl 是旧的 SDXL base（25 步，画风更“老派插画”）'),
     negative: z.string().optional().describe('不想要的东西，默认已经排掉糊图/水印/文字/畸形手'),
     width: z.number().optional().describe('宽，默认 1024，会按 64 对齐，范围 384~1536'),
     height: z.number().optional().describe('高，默认 1024'),
-    steps: z.number().optional().describe('采样步数，默认 25；要快就 18~20，要细就 30~35'),
-    cfg: z.number().optional().describe('提示词强度，默认 7；数值越大越贴提示词但越僵，常用 5~8'),
+    steps: z.number().optional().describe('采样步数；默认 zimage 8 步、sdxl 25 步。Z-Image 是蒸馏模型，加到 12 以上基本没用；sdxl 想更快给 18~20'),
+    cfg: z.number().optional().describe('提示词强度；默认 zimage 1、sdxl 7。Z-Image 固定 1 附近，别调高'),
     seed: z.number().optional().describe('种子；不填随机。想微调同一张就带上上一次的 seed 再改提示词'),
     count: z.number().optional().describe('一次画几张，1~4，默认 1'),
-    checkpoint: z.string().optional().describe('指定模型文件名；不填用 config.json comfyui.checkpoint 或第一个'),
-    sampler: z.string().optional().describe('采样器，默认 dpmpp_2m'),
-    scheduler: z.string().optional().describe('调度器，默认 karras'),
+    checkpoint: z.string().optional().describe('只在 sdxl 下有用：指定模型文件名；不填用 config.json comfyui.checkpoint 或第一个'),
+    sampler: z.string().optional().describe('采样器，默认 dpmpp_2m（zimage 固定用 euler）'),
+    scheduler: z.string().optional().describe('调度器，默认 karras（zimage 固定用 simple）'),
     timeoutSec: z.number().optional().describe('最多等多少秒，默认 180，上限 600'),
   },
-  async ({ prompt, negative, width, height, steps, cfg, seed, count, checkpoint, sampler, scheduler, timeoutSec }) => {
+  async ({ prompt, model, negative, width, height, steps, cfg, seed, count, checkpoint, sampler, scheduler, timeoutSec }) => {
     try {
       const text = String(prompt ?? '').trim();
       if (!text) return { content: [{ type: 'text', text: '得给个 prompt，不然不知道画什么。' }], isError: true };
+      const isZ = String(model ?? '').trim().toLowerCase() !== 'sdxl';
       const t0 = Date.now();
-      const ckpt = await comfyPickCheckpoint(checkpoint);
       const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
       const dir = path.join(DRAW_ROOT, id);
       fs.mkdirSync(dir, { recursive: true });
       const wait = Math.min(DRAW_TIMEOUT_MAX, Math.max(20, Number(timeoutSec) || DRAW_TIMEOUT_DEFAULT));
+      const stNum = Math.round(Number(steps));
+      const cfNum = Number(cfg);
       const o = {
-        ckpt,
         prompt: text,
         negative: String(negative ?? '').trim() || DRAW_NEG_DEFAULT,
         width: roundTo64(width, 1024),
         height: roundTo64(height, 1024),
-        steps: Math.min(60, Math.max(4, Math.round(Number(steps) || 25))),
-        cfg: Math.min(20, Math.max(1, Number(cfg) || 7)),
+        steps: isZ
+          ? Math.min(20, Math.max(4, Number.isFinite(stNum) && stNum > 0 ? stNum : 8))
+          : Math.min(60, Math.max(4, Number.isFinite(stNum) && stNum > 0 ? stNum : 25)),
+        cfg: isZ
+          ? Math.min(4, Math.max(1, Number.isFinite(cfNum) && cfNum > 0 ? cfNum : 1))
+          : Math.min(20, Math.max(1, Number.isFinite(cfNum) && cfNum > 0 ? cfNum : 7)),
         seed: Number.isFinite(Number(seed)) && Number(seed) > 0 ? Math.floor(Number(seed)) : Math.floor(Math.random() * 1e12),
         count: Math.min(4, Math.max(1, Math.round(Number(count) || 1))),
         sampler: String(sampler ?? '').trim() || 'dpmpp_2m',
         scheduler: String(scheduler ?? '').trim() || 'karras',
         prefix: 'draw_' + id,
       };
-      const promptId = await comfySubmit(buildSdxlWorkflow(o));
+      let wf;
+      let modelName;
+      if (isZ) {
+        const cfgZ = (() => {
+          try { return readBridgeConfig()?.comfyui?.zimage || {}; } catch { return {}; }
+        })();
+        o.unet = String(cfgZ.unet || '').trim() || ZIMAGE_DEFAULTS.unet;
+        o.clip = String(cfgZ.clip || '').trim() || ZIMAGE_DEFAULTS.clip;
+        o.vae = String(cfgZ.vae || '').trim() || ZIMAGE_DEFAULTS.vae;
+        wf = buildZImageWorkflow(o);
+        modelName = 'Z-Image Turbo（' + o.unet + '）';
+      } else {
+        o.ckpt = await comfyPickCheckpoint(checkpoint);
+        wf = buildSdxlWorkflow(o);
+        modelName = 'SDXL（' + o.ckpt + '）';
+      }
+      const promptId = await comfySubmit(wf);
       const entry = await comfyWaitDone(promptId, wait);
       const files = await comfyCollectImages(entry);
       if (!files.length) throw new Error('跑完了但没拿到图（workflow 里没有输出节点？）');
@@ -2635,18 +2685,189 @@ server.tool(
       const secs = Math.round((Date.now() - t0) / 1000);
       const lines = [
         '画好了：' + saved.length + ' 张，' + o.width + 'x' + o.height + '，' + o.steps + ' 步，用了 ' + secs + ' 秒。',
-        '模型 ' + o.ckpt + '，seed ' + o.seed + '（想在同一张上微调就用这个 seed）。',
+        '模型 ' + modelName + '，seed ' + o.seed + '（想在同一张上微调就用这个 seed）。',
         '目录 ' + dir,
         ...saved.map((s) => '  ' + s.abs),
         '',
         '怎么用：',
         '- 视频配图：qq_make_video 的 segments 里写 { kind:"image", src:"<上面那个绝对路径>", caption:"说明" }',
+        '- 让它动起来：qq_animate_image image=<上面那个绝对路径> prompt="..."',
         '- 发到 QQ 看效果：qq_send_image path=<上面那个绝对路径>',
-        '- 不满意就改 prompt 再画一张（别一次画太多，一张 30 秒）',
+        '- 不满意就改 prompt 再画一张（Z-Image 一张 20~40 秒，别一次画太多）',
+      ];
+      return { content: [{ type: 'text', text: lines.join(String.fromCharCode(10)) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: '画不出来：' + (error?.message ?? error) }], isError: true };
+    }
+  }
+);
+
+// ---------- 图生视频（Wan2.2 TI2V-5B，2026-10-25） ----------
+// 她画了图想让它动起来：一张起始图 + 一句提示词 -> mp4（2 秒左右）。
+// ComfyUI 那套 12 个节点她看不见也没法调，这里全包掉。产出落 state/animate/<id>/。
+const ANIM_ROOT = path.join(ROOT, 'state', 'animate');
+const ANIM_TIMEOUT_DEFAULT = 900;
+const ANIM_TIMEOUT_MAX = 1800;
+const ANIM_UNET = 'wan2.2_ti2v_5B_fp16.safetensors';
+const ANIM_CLIP = 'umt5_xxl_fp8_e4m3fn_scaled.safetensors';
+const ANIM_VAE = 'wan2.2_vae.safetensors';
+const ANIM_NEG_DEFAULT = 'blurry, low quality, distorted, watermark, text, jitter, flicker, static, frozen frame';
+
+function roundTo16(n, fb, lo, hi) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v <= 0) return fb;
+  return Math.min(hi, Math.max(lo, Math.round(v / 16) * 16));
+}
+
+// WanImageToVideo 要求 length = 4n + 1
+function roundFrames(n, fb) {
+  const v = Number(n);
+  const base = Number.isFinite(v) && v > 0 ? v : fb;
+  const r = Math.round((base - 1) / 4) * 4 + 1;
+  return Math.min(121, Math.max(17, r));
+}
+
+function buildWanI2VWorkflow(o) {
+  return {
+    '1': { class_type: 'UNETLoader', inputs: { unet_name: ANIM_UNET, weight_dtype: 'default' } },
+    '2': { class_type: 'ModelSamplingSD3', inputs: { model: ['1', 0], shift: 8 } },
+    '3': { class_type: 'CLIPLoader', inputs: { clip_name: ANIM_CLIP, type: 'wan' } },
+    '4': { class_type: 'CLIPTextEncode', inputs: { clip: ['3', 0], text: o.prompt } },
+    '5': { class_type: 'CLIPTextEncode', inputs: { clip: ['3', 0], text: o.negative } },
+    '6': { class_type: 'VAELoader', inputs: { vae_name: ANIM_VAE } },
+    '7': { class_type: 'LoadImage', inputs: { image: o.imageName } },
+    '8': {
+      class_type: 'WanImageToVideo',
+      inputs: {
+        positive: ['4', 0], negative: ['5', 0], vae: ['6', 0],
+        width: o.width, height: o.height, length: o.length, batch_size: 1, start_image: ['7', 0],
+      },
+    },
+    '9': {
+      class_type: 'KSampler',
+      inputs: {
+        model: ['2', 0], seed: o.seed, steps: o.steps, cfg: o.cfg,
+        sampler_name: 'euler', scheduler: 'simple',
+        positive: ['8', 0], negative: ['8', 1], latent_image: ['8', 2], denoise: 1,
+      },
+    },
+    '10': {
+      class_type: 'VAEDecodeTiled',
+      inputs: { samples: ['9', 0], vae: ['6', 0], tile_size: 256, overlap: 64, temporal_size: 16, temporal_overlap: 4 },
+    },
+    '11': { class_type: 'CreateVideo', inputs: { images: ['10', 0], fps: o.fps } },
+    '12': { class_type: 'SaveVideo', inputs: { video: ['11', 0], filename_prefix: o.prefix, format: 'mp4' } },
+  };
+}
+
+// 起始图要先塞进 ComfyUI 的 input 目录，走官方 /upload/image 传（不依赖它装在哪）
+async function comfyUploadImage(absPath) {
+  const bytes = fs.readFileSync(absPath);
+  const ext = (path.extname(absPath) || '.png').toLowerCase();
+  const name = 'anim_in_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5) + ext;
+  const fd = new FormData();
+  fd.append('image', new Blob([bytes]), name);
+  fd.append('overwrite', 'true');
+  fd.append('type', 'input');
+  const { res, buf } = await comfyFetch(comfyBase() + '/upload/image', { method: 'POST', body: fd });
+  const txt = buf.toString('utf8');
+  if (!res.ok) throw new Error('传起始图失败 HTTP ' + res.status + '：' + txt.slice(0, 200));
+  let j = null;
+  try { j = JSON.parse(txt); } catch { /* ignore */ }
+  const saved = j?.name || name;
+  const sub = j?.subfolder ? j.subfolder + '/' : '';
+  return sub + saved;
+}
+
+function animCollectFiles(entry) {
+  const files = [];
+  for (const nodeOut of Object.values(entry.outputs || {})) {
+    for (const key of ['images', 'videos', 'gifs']) {
+      for (const it of (nodeOut?.[key] || [])) {
+        if (!it?.filename) continue;
+        files.push({ filename: it.filename, subfolder: it.subfolder || '', type: it.type || 'output' });
+      }
+    }
+  }
+  return files;
+}
+
+server.tool(
+  'qq_animate_image',
+  '让一张图动起来：给一张起始图和一句描述，用 Wan2.2 生成 2 秒左右的小视频（mp4）。做片头/转场/让插画动一下时用它，产出落在 state/animate/<id>/ 并返回绝对路径。速度：704x480、49 帧、20 步约 7 分钟；竖屏 480x704 差不多；帧数减到 33 或步数降到 15 能快三分之一。提示词务必把起始图的场景一起描述（主体+环境+动作），只写动作会让模型自己换场景。别一次做很多条。',
+  {
+    image: z.string().describe('起始图的绝对路径（qq_draw_image 给的路径、或主人发来的图都行），png/jpg/webp'),
+    prompt: z.string().describe('画面怎么动。必须写全三样：①起始图里那个主体（是什么材质/什么东西）②它在什么环境背景里 ③动作。示例：a blue whale plush toy on a wooden shelf slowly raises its head and blinks, its fin lifting gently, warm afternoon light, gentle camera push in。⚠️ 实测教训：把“它在哪”省掉，模型会把玩偶直接扔进真实大海、连场景都换掉——环境描半句都不能少'),
+    negative: z.string().optional().describe('不想要的效果，默认排掉糊/水印/文字/抖动/闪烁/定格'),
+    width: z.number().optional().describe('宽，默认 704（竖屏图给 480），按 16 对齐'),
+    height: z.number().optional().describe('高，默认 480（竖屏图给 704）'),
+    length: z.number().optional().describe('帧数，默认 49（约 2 秒 @24fps），会按 4n+1 取整，上限 121'),
+    steps: z.number().optional().describe('步数，默认 20；15 快 25%，24 更顺但慢'),
+    cfg: z.number().optional().describe('提示词强度，默认 5'),
+    fps: z.number().optional().describe('帧率，默认 24'),
+    seed: z.number().optional().describe('种子；不填随机。想重做同一条就用上次的 seed'),
+    timeoutSec: z.number().optional().describe('最多等多少秒，默认 900，上限 1800'),
+  },
+  async ({ image, prompt, negative, width, height, length, steps, cfg, fps, seed, timeoutSec }) => {
+    try {
+      const imgPath = String(image ?? '').trim().replace(/^"+|"+$/g, '');
+      if (!imgPath) return { content: [{ type: 'text', text: '得给一张起始图的绝对路径。' }], isError: true };
+      const abs = path.resolve(imgPath);
+      if (!fs.existsSync(abs)) return { content: [{ type: 'text', text: '找不到这张图：' + abs }], isError: true };
+      const ext = path.extname(abs).toLowerCase();
+      if (!['.png', '.jpg', '.jpeg', '.webp'].includes(ext)) {
+        return { content: [{ type: 'text', text: '起始图得是 png/jpg/webp，这个是 ' + (ext || '无扩展名') + '。' }], isError: true };
+      }
+      const text = String(prompt ?? '').trim();
+      if (!text) return { content: [{ type: 'text', text: '得说它怎么动，不然只能一动不动。' }], isError: true };
+
+      const t0 = Date.now();
+      const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      const dir = path.join(ANIM_ROOT, id);
+      fs.mkdirSync(dir, { recursive: true });
+      const wait = Math.min(ANIM_TIMEOUT_MAX, Math.max(60, Number(timeoutSec) || ANIM_TIMEOUT_DEFAULT));
+      const o = {
+        prompt: text,
+        negative: String(negative ?? '').trim() || ANIM_NEG_DEFAULT,
+        width: roundTo16(width, 704, 256, 1280),
+        height: roundTo16(height, 480, 256, 1280),
+        length: roundFrames(length, 49),
+        steps: Math.min(40, Math.max(6, Math.round(Number(steps) || 20))),
+        cfg: Math.min(12, Math.max(1, Number(cfg) || 5)),
+        fps: Math.min(30, Math.max(8, Math.round(Number(fps) || 24))),
+        seed: Number.isFinite(Number(seed)) && Number(seed) > 0 ? Math.floor(Number(seed)) : Math.floor(Math.random() * 1e9),
+        prefix: 'anim_' + id,
+      };
+      o.imageName = await comfyUploadImage(abs);
+      const promptId = await comfySubmit(buildWanI2VWorkflow(o));
+      const entry = await comfyWaitDone(promptId, wait);
+      const files = animCollectFiles(entry);
+      const vids = files.filter((f) => /\.(mp4|webm|gif)$/i.test(f.filename));
+      if (!vids.length) throw new Error('跑完了但没拿到视频文件（SaveVideo 没输出？）');
+      const saved = [];
+      for (const f of vids) {
+        const buf = await comfyDownload(f);
+        const name = path.basename(f.filename) || (id + '.mp4');
+        const outAbs = path.join(dir, name);
+        fs.writeFileSync(outAbs, buf);
+        saved.push({ abs: outAbs, bytes: buf.length });
+      }
+      const secs = Math.round((Date.now() - t0) / 1000);
+      const dur = (o.length / o.fps).toFixed(1);
+      const lines = [
+        '动起来了：' + saved.length + ' 条，' + o.width + 'x' + o.height + '，' + o.length + ' 帧 / ' + dur + ' 秒 / ' + o.fps + 'fps，' + o.steps + ' 步，用了 ' + secs + ' 秒。',
+        'seed ' + o.seed + '（想重做同一条就带上它，再改 prompt）。',
+        '目录 ' + dir,
+        ...saved.map((s) => '  ' + s.abs),
+        '',
+        '怎么用：',
+        '- 推去手机：qq_push_video path=<上面那个绝对路径>',
+        '- 想先自己看：目录里的 mp4 直接播',
+        '- 动作太小就加具体动作词（抬头/眨眼/尾巴摆/镜头推进），或把 steps 提到 24',
       ];
       return { content: [{ type: 'text', text: lines.join('\n') }] };
     } catch (error) {
-      return { content: [{ type: 'text', text: '画不出来：' + (error?.message ?? error) }], isError: true };
+      return { content: [{ type: 'text', text: '动不起来：' + (error?.message ?? error) }], isError: true };
     }
   }
 );

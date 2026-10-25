@@ -287,6 +287,11 @@
   "comfyui": {
     "url": "http://127.0.0.1:8188",
     "checkpoint": "",
-    "dir": ""
+    "dir": "",
+    "zimage": {
+      "unet": "z_image_turbo_bf16.safetensors",
+      "clip": "qwen_3_4b.safetensors",
+      "vae": "ae.safetensors"
+    }
   }
 }
