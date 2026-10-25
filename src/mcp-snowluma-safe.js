@@ -1945,8 +1945,9 @@ server.tool(
     ).describe('分段，按顺序播'),
     voice: z.string().optional().describe('音色，默认 zh-CN-XiaoxiaoNeural（女声）；男声可用 zh-CN-YunxiNeural'),
     size: z.enum(['720p', '1080p']).optional().describe('分辨率，默认 1080p；赶时间用 720p'),
+    bgm: z.boolean().optional().describe('背景乐，默认开（现场合成的氛围垫音，旁白时自动压低）；想要纯人声就传 false'),
   },
-  async ({ title, segments, voice, size }) => {
+  async ({ title, segments, voice, size, bgm }) => {
     try {
       if (!Array.isArray(segments) || segments.length === 0) {
         return { content: [{ type: 'text', text: 'segments 是空的，至少给一段' }], isError: true };
@@ -1968,6 +1969,7 @@ server.tool(
         width: hd ? 1920 : 1280,
         height: hd ? 1080 : 720,
         fps: 30,
+        bgm: bgm !== false,
         segments,
       };
       const jobPath = path.join(VIDEO_JOBS, `${id}.json`);

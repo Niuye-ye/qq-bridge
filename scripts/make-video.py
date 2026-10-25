@@ -28,6 +28,7 @@ say 为空时用 dur 当段时长（纯画面段）。
 """
 
 import os
+import re
 import sys
 import json
 import shutil
@@ -206,6 +207,15 @@ class Renderer:
         self.f_meta = _font(30)
 
         self.background = self._make_background()
+        self.kenburns = job.get("kenburns", True) is not False
+        self.motion = job.get("motion", True) is not False
+        # Ken Burns 用「放大一圈的背景 + 裁切」实现：每帧只做 crop，零重采样预算
+        self.zoom_max = 0.05
+        self.bg_big = None
+        if self.kenburns:
+            zw = int(self.W * (1 + self.zoom_max * 2))
+            zh = int(self.H * (1 + self.zoom_max * 2))
+            self.bg_big = self.background.resize((zw, zh), Image.BILINEAR)
         self.timeline = []      # [(start, dur, seg)]
 
     # ── 背景只画一次 ──
@@ -226,13 +236,30 @@ class Renderer:
         # 左上角光晕
         glow = Image.new("RGB", (self.W, self.H), (0, 0, 0))
         gd = ImageDraw.Draw(glow)
-        gd.ellipse([-400, -500, 900, 500], fill=(10, 26, 46))
+        # 光晕只留在左上角外侧：Ken Burns 推近后不会有一大块蓝弧飘到画面中间
+        gd.ellipse([-760, -820, 720, 260], fill=(9, 21, 38))
         img = ImageChops.add(img, glow)
         return img
 
     # ── 一帧 ──
+    def _bg_frame(self, t):
+        """背景缓慢推近 + 轻微横移（Ken Burns）。没开或没关系时直接复制。"""
+        if not self.bg_big:
+            return self.background.copy()
+        total = max(0.001, getattr(self, "total", 0) or 0.001)
+        p = max(0.0, min(1.0, t / total))
+        z = self.zoom_max * (0.30 + 0.70 * p)
+        bw, bh = self.bg_big.size
+        cw = max(2, int(self.W / (1 + z)))
+        ch = max(2, int(self.H / (1 + z)))
+        cx = int((bw - cw) / 2 + (p - 0.5) * cw * 0.12)
+        cy = int((bh - ch) / 2 + (p - 0.5) * ch * 0.05)
+        cx = max(0, min(bw - cw, cx))
+        cy = max(0, min(bh - ch, cy))
+        return self.bg_big.crop((cx, cy, cx + cw, cy + ch)).resize((self.W, self.H), Image.BILINEAR)
+
     def frame(self, t):
-        img = self.background.copy()
+        img = self._bg_frame(t)
         d = ImageDraw.Draw(img)
 
         seg, local, seg_dur = self._which(t)
@@ -260,6 +287,10 @@ class Renderer:
             p = min(1.0, t / total)
             d.rectangle([0, self.H - 5, self.W, self.H], fill=(18, 26, 44))
             d.rectangle([0, self.H - 5, int(self.W * p), self.H], fill=C_ACCENT2)
+            # 章节点：每段起点的位置点一颗小方块
+            for start, _dur, _seg in self.timeline[1:]:
+                x = int(self.W * min(1.0, start / total))
+                d.rectangle([x - 2, self.H - 9, x + 2, self.H - 1], fill=(80, 120, 190))
         return img
 
     def _which(self, t):
@@ -279,7 +310,8 @@ class Renderer:
             lines = wrap_text(d, show, f, int(self.W * 0.78))
             line_h = int(f.size * 1.35)
             total_h = line_h * len(lines)
-            y = (self.H - total_h) // 2 - 20
+            slide = int((1 - appear) * 36) if self.motion else 0
+            y = (self.H - total_h) // 2 - 20 + slide
             for ln in lines:
                 w = d.textlength(ln, font=f)
                 col = _blend(C_TEXT, C_BG_TOP, 1 - appear)
@@ -297,24 +329,27 @@ class Renderer:
             unit = str(seg.get("unit") or "")
             if big:
                 f = self.f_big
-                bw = d.textlength(big, font=f)
+                # 数字从 0 滚到目标值（0.85 秒），除非关闭动效
+                shown = _count_up(big, local if self.motion else 9.9)
+                bw = d.textlength(shown, font=f)
                 uw = d.textlength(unit, font=self.f_body_s) if unit else 0
                 total = bw + uw + (12 if unit else 0)
                 x = (self.W - total) / 2
-                y = self.H * 0.32
-                d.text((x, y), big, font=f, fill=_blend(C_ACCENT, C_BG_TOP, 1 - appear))
+                y = self.H * 0.32 + (int((1 - appear) * 24) if self.motion else 0)
+                d.text((x, y), shown, font=f, fill=_blend(C_ACCENT, C_BG_TOP, 1 - appear))
                 if unit:
                     d.text((x + bw + 12, y + f.size - self.f_body_s.size - 6),
                            unit, font=self.f_body_s, fill=_blend(C_TEXT, C_BG_TOP, 1 - appear))
             if show:
-                self._body_text(d, show, top=self.H * 0.60, appear=appear, dim=False)
+                self._body_text(d, show, top=self.H * 0.60, appear=appear, dim=False,
+                                local=local, seg_dur=seg_dur)
             return
 
         if kind == "end":
             f = self.f_title
             lines = wrap_text(d, show, f, int(self.W * 0.8))
             line_h = int(f.size * 1.35)
-            y = (self.H - line_h * len(lines)) // 2
+            y = (self.H - line_h * len(lines)) // 2 + (int((1 - appear) * 30) if self.motion else 0)
             for ln in lines:
                 w = d.textlength(ln, font=f)
                 d.text(((self.W - w) / 2, y), ln, font=f, fill=_blend(C_ACCENT, C_BG_TOP, 1 - appear))
@@ -322,21 +357,38 @@ class Renderer:
             return
 
         # 默认正文
-        self._body_text(d, show, top=self.H * 0.40, appear=appear, dim=False)
+        self._body_text(d, show, top=self.H * 0.40, appear=appear, dim=False,
+                        local=local, seg_dur=seg_dur)
 
-    def _body_text(self, d, text, top, appear, dim=False):
+    def _body_text(self, d, text, top, appear, dim=False, local=0.0, seg_dur=1.0):
         f = self.f_body
         lines = wrap_text(d, text, f, int(self.W * 0.74))
         line_h = int(f.size * 1.5)
         block_h = line_h * len(lines)
-        y = top - block_h / 2 + line_h / 2
+        slide = int((1 - appear) * 26) if self.motion else 0
+        y = top - block_h / 2 + line_h / 2 + slide
         base = C_DIM if dim else C_TEXT
+        n = max(1, len(lines))
+        # 逐行高亮：把该段时长按行数均分，念到哪行哪行最亮，念过的略暗，没念的暗
+        per = max(0.30, (max(0.6, seg_dur) - 0.35) / n)
+        active = int((local - 0.28) / per) if local > 0.28 else -1
+        if active >= n:
+            active = n - 1
         for i, ln in enumerate(lines):
             # 逐行错开一点淡入
             a = max(0.0, min(1.0, appear * 1.6 - i * 0.18))
             a = a * a * (3 - 2 * a)
+            if i == active:
+                col = base
+            elif i < active:
+                col = _mix(base, C_DIM, 0.72)
+            else:
+                col = _mix(base, C_DIM, 0.28)
             w = d.textlength(ln, font=f)
-            d.text(((self.W - w) / 2, y), ln, font=f, fill=_blend(base, C_BG_TOP, 1 - a))
+            x = (self.W - w) / 2
+            d.text((x, y), ln, font=f, fill=_blend(col, C_BG_TOP, 1 - a))
+            if i == active and n > 1:
+                d.rectangle([x - 26, y + 8, x - 19, y + f.size + 2], fill=C_ACCENT)
             y += line_h
 
 
@@ -348,6 +400,27 @@ def _blend(fg, bg, k):
     """k=0 用 fg，k=1 全 bg。表现淡入淡出。"""
     k = max(0.0, min(1.0, k))
     return tuple(int(fg[i] * (1 - k) + bg[i] * k) for i in range(3))
+
+
+def _mix(a, b, k):
+    """k=0 用 a，k=1 用 b。用来在同色系里压暗/提亮。"""
+    k = max(0.0, min(1.0, k))
+    return tuple(int(a[i] * (1 - k) + b[i] * k) for i in range(3))
+
+
+def _count_up(text, t, span=0.85):
+    """把 '0.03' / '12.1' / '45%' 里的数字按进度滚出来（easeOutCubic）。"""
+    s = str(text)
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    if not m:
+        return s
+    raw = m.group(0)
+    val = float(raw)
+    dec = len(raw.split(".")[1]) if "." in raw else 0
+    p = max(0.0, min(1.0, t / span)) if span > 0 else 1.0
+    p = 1 - (1 - p) ** 3
+    shown = f"{val * p:.{dec}f}"
+    return s[:m.start()] + shown + s[m.end():]
 
 
 # ── 音频 ──────────────────────────────────────────────────────────────────────
@@ -409,6 +482,28 @@ def build_audio(job, ffmpeg, ffprobe, workdir):
     return durs, audio
 
 
+def build_bgm(ffmpeg, out, seconds):
+    """用 lavfi 现场合成一段氛围垫音（A 大三和弦 + 呼吸颤音 + 低通）。
+    不依赖任何素材文件，换机器也能跑。返回路径或 None。"""
+    out = Path(out)
+    if out.exists():
+        return str(out)
+    dur = max(3.0, float(seconds) + 1.0)
+    inputs = []
+    for fr in (220.0, 277.18, 329.63):
+        inputs += ["-f", "lavfi", "-i", f"sine=frequency={fr}:sample_rate=44100:duration={dur:.2f}"]
+    fc = ("[0:a][1:a][2:a]amix=inputs=3:normalize=1,"
+          "tremolo=f=0.14:d=0.35,lowpass=f=900,"
+          f"afade=t=in:st=0:d=2.0,afade=t=out:st={max(0.0, dur - 3.0):.2f}:d=3.0[bg]")
+    r = subprocess.run([ffmpeg, "-y", *inputs, "-filter_complex", fc, "-map", "[bg]",
+                        "-c:a", "libmp3lame", "-q:a", "4", str(out)],
+                       capture_output=True, text=True, encoding="utf-8", errors="ignore")
+    if out.exists() and out.stat().st_size > 512:
+        return str(out)
+    log("  BGM 合成失败（不影响出片）: " + (r.stderr or "")[-300:])
+    return None
+
+
 def _silence(ffmpeg, out, seconds):
     if Path(out).exists():
         return
@@ -441,6 +536,12 @@ def render(job_path, out_path=None):
         t0 += d
     r.total = t0
 
+    # 背景乐：默认开，job 里写 "bgm": false 可关
+    bgm = None
+    if job.get("bgm", True) is not False:
+        bgm = build_bgm(ffmpeg, workdir / "bgm.mp3", r.total)
+        log(f"BGM: {'已合成（旁白时压到 0.22）' if bgm else '没有'}")
+
     if not out_path:
         slug = "".join(c for c in (job.get("title") or "video") if c not in '\\/:*?"<>|')[:40] or "video"
         out_dir = Path(job.get("outDir") or (job_path.parent / "videos"))
@@ -452,18 +553,34 @@ def render(job_path, out_path=None):
     total_frames = int(r.total * r.fps) + 1
     log(f"开始渲染 {total_frames} 帧 -> {out_path}")
 
-    cmd = [
+    head = [
         ffmpeg, "-y",
         "-f", "rawvideo", "-pix_fmt", "rgb24",
         "-s", f"{r.W}x{r.H}", "-r", str(r.fps), "-i", "pipe:0",
         "-i", str(audio),
+    ]
+    tail = [
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", "-preset", "medium",
         "-c:a", "aac", "-b:a", "160k",
         "-shortest", "-movflags", "+faststart",
         str(out_path),
     ]
+    if bgm:
+        cmd = head + [
+            "-i", str(bgm),
+            "-filter_complex",
+            "[1:a]volume=1.0[v];[2:a]volume=0.22[b];"
+            "[v][b]amix=inputs=2:duration=first:normalize=0[aout]",
+            "-map", "0:v:0", "-map", "[aout]",
+        ] + tail
+    else:
+        cmd = head + tail
+    # stderr 必须落文件：ffmpeg 的日志写满 64KB 管道后会让它停读 stdin，
+    # 这边再 write 就死锁（2026-10-25 加了 -filter_complex 之后踩到）。
+    fflog = workdir / "ffmpeg.log"
+    fh = open(fflog, "wb")
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.PIPE)
+                            stderr=fh)
     t_start = time.time()
     try:
         for i in range(total_frames):
@@ -479,7 +596,11 @@ def render(job_path, out_path=None):
             proc.stdin.close()
         except Exception:
             pass
-        err = proc.stderr.read().decode("utf-8", "ignore")
+        try:
+            fh.close()
+        except Exception:
+            pass
+        err = fflog.read_text(encoding="utf-8", errors="ignore") if fflog.exists() else ""
         proc.wait()
 
     if not out_path.exists() or out_path.stat().st_size < 1024:

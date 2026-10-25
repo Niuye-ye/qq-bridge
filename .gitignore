@@ -85,3 +85,5 @@ audio/
 # 本地跑渲染器时的临时产物
 /scripts/_sample.json
 /scripts/videos/
+__pycache__/
+*.pyc
