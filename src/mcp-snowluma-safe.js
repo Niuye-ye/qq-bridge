@@ -1937,14 +1937,24 @@ server.tool(
       z.object({
         say: z.string().optional().describe('给配音念的旁白；不填就是纯画面段'),
         show: z.string().optional().describe('画面上的大字；不填就用 say'),
-        kind: z.enum(['title', 'text', 'number', 'end']).optional().describe('title=开场大标题 text=正文 number=数字放大 end=结尾'),
+        kind: z.enum(['title', 'text', 'number', 'end', 'image', 'compare', 'quote'])
+          .optional().describe('title=开场大标题 text=正文 number=数字放大 image=配图 compare=左右对比 quote=引用 end=结尾'),
         big: z.string().optional().describe('kind=number 时的大数字，例如 0.03'),
         unit: z.string().optional().describe('数字后面的单位，例如 元 / 倍 / 秒'),
         dur: z.number().optional().describe('没有 say 时这一段的秒数，默认 3'),
+        src: z.string().optional().describe('kind=image 的图片地址：本地路径或 https 链接'),
+        caption: z.string().optional().describe('kind=image 下面的一行说明'),
+        quote: z.string().optional().describe('kind=quote 的引文正文'),
+        by: z.string().optional().describe('kind=quote 的出处/说话人'),
+        left: z.object({ title: z.string().optional(), text: z.string().optional(), src: z.string().optional() })
+          .optional().describe('kind=compare 左边一栏'),
+        right: z.object({ title: z.string().optional(), text: z.string().optional(), src: z.string().optional() })
+          .optional().describe('kind=compare 右边一栏'),
       })
     ).describe('分段，按顺序播'),
     voice: z.string().optional().describe('音色，默认 zh-CN-XiaoxiaoNeural（女声）；男声可用 zh-CN-YunxiNeural'),
-    size: z.enum(['720p', '1080p']).optional().describe('分辨率，默认 1080p；赶时间用 720p'),
+    size: z.enum(['720p', '1080p', '1080p-portrait', '720p-portrait'])
+      .optional().describe('分辨率，默认 1080p；赶时间用 720p；竖屏用 1080p-portrait（抖音/快手）'),
     bgm: z.boolean().optional().describe('背景乐，默认开（现场合成的氛围垫音，旁白时自动压低）；想要纯人声就传 false'),
   },
   async ({ title, segments, voice, size, bgm }) => {
@@ -1962,12 +1972,16 @@ server.tool(
       fs.mkdirSync(VIDEO_DIR, { recursive: true });
 
       const id = 'v' + Date.now().toString(36);
-      const hd = size !== '720p';
+      const mode = String(size || '1080p');
+      const portrait = mode.includes('portrait');
+      const small = mode.includes('720');
+      const longSide = small ? 1280 : 1920;
+      const shortSide = small ? 720 : 1080;
       const job = {
         title: String(title || '一个视频'),
         voice: voice || 'zh-CN-XiaoxiaoNeural',
-        width: hd ? 1920 : 1280,
-        height: hd ? 1080 : 720,
+        width: portrait ? shortSide : longSide,
+        height: portrait ? longSide : shortSide,
         fps: 30,
         bgm: bgm !== false,
         segments,

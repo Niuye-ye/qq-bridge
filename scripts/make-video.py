@@ -44,7 +44,7 @@ try:
 except Exception:
     pass
 
-from PIL import Image, ImageDraw, ImageFont, ImageChops  # noqa: E402
+from PIL import Image, ImageDraw, ImageFont, ImageChops, ImageFilter  # noqa: E402
 
 W_DEFAULT, H_DEFAULT, FPS_DEFAULT = 1920, 1080, 30
 FONT_PATHS = [
@@ -205,6 +205,10 @@ class Renderer:
         self.f_body_s = _font(44)
         self.f_big = _font(150, True)
         self.f_meta = _font(30)
+        self.f_quote = _font(64)
+        self.f_col = _font(52, True)
+        self.f_col_s = _font(36)
+        self.img_cache = {}
 
         self.background = self._make_background()
         self.kenburns = job.get("kenburns", True) is not False
@@ -345,6 +349,110 @@ class Renderer:
                                 local=local, seg_dur=seg_dur)
             return
 
+        if kind == "image":
+            src = seg.get("src") or seg.get("img")
+            cap = str(seg.get("caption") or "").strip()
+            box_w = int(self.W * 0.78)
+            box_h = int(self.H * (0.56 if cap else 0.66))
+            cy = self.H * (0.45 if cap else 0.5)
+            zoom = 1.0 + 0.035 * min(1.0, local / max(0.6, seg_dur))
+            ok = self._paste_image(img, src, box_w, box_h, self.W / 2, cy,
+                                   appear, zoom if self.motion else 1.0)
+            if cap:
+                f = self.f_body_s
+                lines = wrap_text(d, cap, f, int(self.W * 0.8))
+                y = cy + box_h / 2 + int(self.H * 0.03)
+                for ln in lines:
+                    w = d.textlength(ln, font=f)
+                    d.text(((self.W - w) / 2, y), ln, font=f,
+                           fill=_blend(_mix(C_TEXT, C_DIM, 0.35), C_BG_TOP, 1 - appear))
+                    y += int(f.size * 1.45)
+            if not ok and show:
+                # 图取不到就退化成普通正文，别整段空白
+                self._body_text(d, show, top=self.H * 0.5, appear=appear,
+                                local=local, seg_dur=seg_dur)
+            return
+
+        if kind == "compare":
+            left = seg.get("left") or {}
+            right = seg.get("right") or {}
+            if not isinstance(left, dict):
+                left = {"text": str(left)}
+            if not isinstance(right, dict):
+                right = {"text": str(right)}
+            portrait = self.H > self.W * 1.1
+            gap = int(self.W * 0.07)
+            side = int(self.W * 0.05)
+            col_w = (self.W - gap - side * 2) // 2
+            lx = side + col_w / 2
+            rx = side + col_w + gap + col_w / 2
+            top = int(self.H * 0.30)
+            a_l = _smooth(local / 0.5)
+            a_r = _smooth((local - 0.30) / 0.5)
+            if show:
+                f = self.f_col_s
+                w = d.textlength(show, font=f)
+                sy = int(self.H * (0.10 if portrait else 0.16))
+                d.text(((self.W - w) / 2, sy), show, font=f,
+                       fill=_blend(C_DIM, C_BG_TOP, 1 - a_l))
+            if portrait:
+                # 竖屏两栏并排太挤：改成上下两屏，中间一条横线 + VS 胶囊
+                col_w = int(self.W * 0.82)
+                self._column(d, img, left, self.W / 2, int(self.H * 0.15),
+                             col_w, a_l, C_ACCENT, img_h=0.20)
+                self._column(d, img, right, self.W / 2, int(self.H * 0.55),
+                             col_w, a_r, C_ACCENT2, img_h=0.20)
+                mid = int(self.H * 0.475)
+                d.rectangle([int(self.W * 0.14), mid, int(self.W * 0.86), mid + 2],
+                            fill=_mix(C_BG_TOP, (52, 70, 96), max(a_l, a_r)))
+                vf = _font(34, True)
+                vw2 = d.textlength("VS", font=vf)
+                d.rounded_rectangle([self.W / 2 - vw2 / 2 - 20, mid - 28,
+                                     self.W / 2 + vw2 / 2 + 20, mid + 30],
+                                    radius=28, fill=C_BG_TOP)
+                d.text((self.W / 2 - vw2 / 2, mid - 24), "VS", font=vf,
+                       fill=_blend(_mix(C_TEXT, C_DIM, 0.3), C_BG_TOP, 1 - max(a_l, a_r)))
+                return
+            self._column(d, img, left, lx, top, col_w, a_l, C_ACCENT)
+            self._column(d, img, right, rx, top, col_w, a_r, C_ACCENT2)
+            # 中间分隔竖线 + 「VS」
+            mid = self.W // 2
+            h1, h2 = int(self.H * 0.26), int(self.H * 0.62)
+            d.rectangle([mid - 1, h1, mid + 1, h2],
+                        fill=_mix(C_BG_TOP, (52, 70, 96), max(a_l, a_r)))
+            vf = _font(38, True)
+            vw = d.textlength("VS", font=vf)
+            d.rounded_rectangle([mid - (vw / 2 + 18), self.H * 0.475 - 4,
+                                 mid + (vw / 2 + 18), self.H * 0.475 + 52],
+                                radius=28, fill=C_BG_TOP)
+            d.text((mid - vw / 2, self.H * 0.48 - 4), "VS", font=vf,
+                   fill=_blend(_mix(C_TEXT, C_DIM, 0.3), C_BG_TOP, 1 - max(a_l, a_r)))
+            return
+
+        if kind == "quote":
+            body = str(seg.get("quote") or show or "").strip()
+            by = str(seg.get("by") or seg.get("from") or "").strip()
+            f = self.f_quote
+            lines = wrap_text(d, body, f, int(self.W * 0.70))
+            line_h = int(f.size * 1.55)
+            block = line_h * len(lines)
+            cy = self.H * (0.43 if by else 0.5)
+            y = cy - block / 2
+            qf = _font(int(f.size * 1.8), True)
+            d.text((self.W * 0.11, y - qf.size * 0.52), "\u201c", font=qf,
+                   fill=_blend((40, 74, 104), C_BG_TOP, 1 - appear))
+            for i, ln in enumerate(lines):
+                a = _smooth(appear * 1.5 - i * 0.15)
+                w = d.textlength(ln, font=f)
+                d.text(((self.W - w) / 2, y), ln, font=f, fill=_blend(C_TEXT, C_BG_TOP, 1 - a))
+                y += line_h
+            if by:
+                bf = self.f_body_s
+                tw = d.textlength("—— " + by, font=bf)
+                d.text((self.W * 0.70 - tw, y + int(f.size * 0.4)), "—— " + by,
+                       font=bf, fill=_blend(C_ACCENT, C_BG_TOP, 1 - appear))
+            return
+
         if kind == "end":
             f = self.f_title
             lines = wrap_text(d, show, f, int(self.W * 0.8))
@@ -359,6 +467,71 @@ class Renderer:
         # 默认正文
         self._body_text(d, show, top=self.H * 0.40, appear=appear, dim=False,
                         local=local, seg_dur=seg_dur)
+
+    # ── 图片 / 对比 / 引用 ──
+    def _image(self, src):
+        if src in self.img_cache:
+            return self.img_cache[src]
+        p = _resolve_image(src, self.work)
+        im = None
+        if p:
+            try:
+                im = Image.open(p).convert("RGB")
+            except Exception as e:
+                log(f"  图片打不开 {src}: {e}")
+        self.img_cache[src] = im
+        return im
+
+    def _paste_image(self, img, src, box_w, box_h, cx, cy, appear, zoom=1.0):
+        """把图片等比塞进 box，圆角 + 阴影 + 淡入。返回是否画成功。"""
+        im = self._image(src)
+        if im is None:
+            return False
+        r = min(box_w / max(1, im.width), box_h / max(1, im.height)) * zoom
+        w = max(1, int(im.width * r))
+        h = max(1, int(im.height * r))
+        im = im.resize((w, h), Image.LANCZOS)
+        if appear < 0.999:
+            im = Image.blend(Image.new("RGB", (w, h), C_BG_TOP), im, appear)
+        rad = max(8, int(min(w, h) * 0.05))
+        mask = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(mask).rounded_rectangle([0, 0, w - 1, h - 1], radius=rad, fill=255)
+        x = int(cx - w / 2)
+        y = int(cy - h / 2)
+        # 阴影：一圈模糊的深色圆角块
+        pad = 60
+        sh = Image.new("RGB", (w + pad * 2, h + pad * 2), C_BG_TOP)
+        ImageDraw.Draw(sh).rounded_rectangle(
+            [pad, pad + 10, pad + w, pad + h + 10], radius=rad, fill=(3, 6, 14))
+        sh = sh.filter(ImageFilter.GaussianBlur(18))
+        img.paste(sh, (x - pad, y - pad))
+        img.paste(im, (x, y), mask)
+        return True
+
+    def _column(self, d, img, col, cx, top, box_w, appear, tag_col, img_h=0.42):
+        """对比段的一栏：可选图片 + 可选标题/文字。"""
+        title = str(col.get("title") or "").strip()
+        text = str(col.get("text") or "").strip()
+        src = col.get("src") or col.get("img")
+        y = top
+        if src:
+            box_h = int(self.H * img_h)
+            self._paste_image(img, src, box_w, box_h, cx, y + box_h / 2, appear)
+            y += box_h + int(self.H * 0.03)
+        if title:
+            f = self.f_col
+            w = d.textlength(title, font=f)
+            d.text((cx - w / 2, y), title, font=f,
+                   fill=_blend(tag_col, C_BG_TOP, 1 - appear))
+            y += int(f.size * 1.5)
+        if text:
+            f = self.f_col_s
+            lines = wrap_text(d, text, f, box_w)
+            for ln in lines:
+                w = d.textlength(ln, font=f)
+                d.text((cx - w / 2, y), ln, font=f,
+                       fill=_blend(_mix(C_TEXT, C_DIM, 0.25), C_BG_TOP, 1 - appear))
+                y += int(f.size * 1.45)
 
     def _body_text(self, d, text, top, appear, dim=False, local=0.0, seg_dur=1.0):
         f = self.f_body
@@ -406,6 +579,11 @@ def _mix(a, b, k):
     """k=0 用 a，k=1 用 b。用来在同色系里压暗/提亮。"""
     k = max(0.0, min(1.0, k))
     return tuple(int(a[i] * (1 - k) + b[i] * k) for i in range(3))
+
+
+def _smooth(x):
+    x = max(0.0, min(1.0, x))
+    return x * x * (3 - 2 * x)
 
 
 def _count_up(text, t, span=0.85):
@@ -480,6 +658,38 @@ def build_audio(job, ffmpeg, ffprobe, workdir):
     if not audio.exists():
         raise SystemExit("音频拼接失败: " + (r.stderr or "")[-800:])
     return durs, audio
+
+
+def _resolve_image(src, workdir):
+    """src 支持本地绝对/相对路径、file:// 和 http(s) URL。返回本地 Path 或 None。
+    URL 会被下载到 workdir 缓存，同一地址只下一次。"""
+    s = str(src or "").strip()
+    if not s:
+        return None
+    if s.startswith("file://"):
+        s = s[7:]
+    p = Path(s)
+    if p.exists():
+        return p
+    if s.startswith("http://") or s.startswith("https://"):
+        import hashlib
+        import urllib.request
+        key = hashlib.md5(s.encode("utf-8")).hexdigest()[:16]
+        ext = os.path.splitext(s.split("?")[0])[1].lower() or ".img"
+        out = Path(workdir) / ("img_" + key + ext)
+        if out.exists() and out.stat().st_size > 512:
+            return out
+        try:
+            req = urllib.request.Request(s, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=25) as r:
+                data = r.read()
+            if data and len(data) > 512:
+                out.write_bytes(data)
+                return out
+        except Exception as e:
+            log(f"  图片下载失败 {s}: {e}")
+        return None
+    return None
 
 
 def build_bgm(ffmpeg, out, seconds):
