@@ -194,7 +194,23 @@ let uiRects = [];    // 渲染进程上报的、需要吃鼠标的 UI 矩形
 let consoleToken = '';
 let bridgeState = null;
 let turboState = null;   // 超活跃模式状态（/api/socialV2/turbo 的快照，9 秒刷一次）
-const TURBO_HOURS = 10;  // 开一次默认跑多久
+const TURBO_HOURS = 10;  // 「一直玩」默认跑多久
+// 让她去玩一会儿：时长由这里给（hours），间隔由活跃度档位决定
+const PLAY_PRESETS = [
+  { label: '20 分钟', hours: 20 / 60 },
+  { label: '1 小时', hours: 1 },
+  { label: '2 小时', hours: 2 },
+  { label: '4 小时', hours: 4 },
+  { label: '整晚（10 小时）', hours: 10 },
+];
+// 活跃度：她多久自己醒一轮（桥侧写进 everyMinutes，超活跃模式也用它）
+const LEVEL_PRESETS = [
+  { id: 'lazy', label: '摸鱼（30 分钟一轮）', minutes: 30 },
+  { id: 'normal', label: '正常（10 分钟一轮）', minutes: 10 },
+  { id: 'busy', label: '勤快（5 分钟一轮）', minutes: 5 },
+  { id: 'hyper', label: '亢奋（2 分钟一轮）', minutes: 2 },
+  { id: 'max', label: '狂暴（1 分钟一轮）', minutes: 1 },
+];
 
 function readPetState() {
   try { return JSON.parse(fs.readFileSync(PET_JSON, 'utf8')); } catch (_) { return {}; }
@@ -800,12 +816,24 @@ function popupMenu() {
         { label: '今天的日记', click: () => openPreview(todayDiary(), '今天的日记', 'diary') },
         { label: '长期记忆', click: () => openPreview(FACTS_JSON, '长期记忆', 'facts') },
         { type: 'separator' },
-        { label: '让她去玩会儿手机', click: () => wakeHer('interval') },
+        {
+          label: '让她去玩会儿 ▸',
+          submenu: PLAY_PRESETS.map((p) => ({ label: p.label, click: () => playFor(p.hours, p.label) })),
+        },
         {
           label: (st.turbo && st.turbo.on)
-            ? `超活跃模式：整晚玩（${clock(st.turbo.until)} 到期，这段已花 ¥${Number(st.turbo.costTurboCny || 0).toFixed(2)}）· 点这里关掉`
-            : `超活跃模式：让她整晚一直玩（${TURBO_HOURS} 小时）`,
+            ? `她正在玩：剩 ${st.turbo.remainMinutes || 0} 分钟 · 每 ${st.turbo.everyMinutes || '?'} 分钟一轮 · 这段 ¥${Number(st.turbo.costTurboCny || 0).toFixed(2)}（${clock(st.turbo.until)} 收）· 点这里喊停`
+            : `一直玩到我说停（${TURBO_HOURS} 小时）`,
           click: () => toggleTurbo(),
+        },
+        {
+          label: `活跃度：${levelNow().label}（每 ${levelNow().minutes || '?'} 分钟醒一轮）`,
+          submenu: LEVEL_PRESETS.map((l) => ({
+            label: l.label,
+            type: 'radio',
+            checked: levelNow().id === l.id,
+            click: () => setLevel(l.id, l.label),
+          })),
         },
         {
           label: (st.turbo && typeof st.turbo.costTodayCny === 'number')
@@ -1020,15 +1048,48 @@ async function togglePause() {
 
 // 超活跃模式：让她整晚一直醒着玩（桥那边把自醒间隔压到 1 分钟、夜里不放慢）。
 // 关掉的方式有三种：点这里、主人发消息（桥自己关）、到点自动到期。
+// 当前活跃度（来自桥的 turbo 状态里的 level）
+function levelNow() {
+  const st = (turboState && turboState.level) ? turboState.level : null;
+  const minutes = st ? Number(st.minutes) || 0 : 0;
+  return { id: st ? String(st.id || '') : '', minutes, label: st ? String(st.label || '未设') : '未设' };
+}
+
+// 让她去玩一会儿：开一段有时长的「活跃期」，到时自动收；间隔取当前活跃度档位
+async function playFor(hours, label) {
+  const lv = levelNow();
+  const intervalMinutes = lv.minutes >= 1 ? lv.minutes : 5;
+  try {
+    const r = await postJson('/api/socialV2/turbo', { on: true, hours, intervalMinutes, by: 'pet' });
+    log('去玩会儿 →', label, safeStr(r));
+    const cost = r && typeof r.costTodayCny === 'number' ? `（今天已花 ¥${r.costTodayCny.toFixed(2)}）` : '';
+    win?.webContents.send('pet:ui', { t: 'bubble', text: `好，我去玩${label}，每 ${intervalMinutes} 分钟醒一轮${cost}` });
+    await pollBridge();
+    return r;
+  } catch (e) { log('去玩会儿失败', e.message); return { ok: false, error: e.message }; }
+}
+
+// 改活跃度档位：桥侧会写进 everyMinutes（她平时多久醒一次）
+async function setLevel(id, label) {
+  try {
+    const r = await postJson('/api/socialV2/level', { level: id });
+    log('活跃度 →', label, safeStr(r));
+    win?.webContents.send('pet:ui', { t: 'bubble', text: `活跃度调到「${label}」` });
+    await pollBridge();
+    return r;
+  } catch (e) { log('活跃度切换失败', e.message); return { ok: false, error: e.message }; }
+}
+
 async function toggleTurbo() {
   const on = !(bridgeState && bridgeState.turbo && bridgeState.turbo.on);
   try {
-    const r = await postJson('/api/socialV2/turbo', { on, hours: TURBO_HOURS, by: 'pet' });
+    const lv = levelNow();
+    const r = await postJson('/api/socialV2/turbo', { on, hours: TURBO_HOURS, intervalMinutes: lv.minutes || 5, by: 'pet' });
     log('超活跃模式 →', on ? '开' : '关', safeStr(r));
     const cost = r && typeof r.costTodayCny === 'number' ? `（今天已花 ¥${r.costTodayCny.toFixed(2)}）` : '';
     win?.webContents.send('pet:ui', {
       t: 'bubble',
-      text: on ? `超活跃模式开了，${TURBO_HOURS} 小时内我一直在${cost}` : '超活跃模式关了',
+      text: on ? `好，我一直玩到你说停（${TURBO_HOURS} 小时，每 ${lv.minutes || 5} 分钟一轮）${cost}` : '停了，我先歇会儿',
     });
     await pollBridge();
   } catch (e) { log('超活跃模式切换失败', e.message); }

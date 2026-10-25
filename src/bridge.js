@@ -3748,7 +3748,7 @@ async function main() {
         // 管理端专用 v2 接口：带 agent token 的请求一律拒绝，防止 MCP 工具越权访问控制台功能
         // /api/socialV2/initial-prompt 也在这里：它是操作者写给 AI 的"环境背景"，
         // 让 AI 自己读/改等于把控制台的管理输入（以及未来可能写入的其它群信息）交给会话主体。
-        const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/wake', '/api/socialV2/initial-prompt'];
+        const adminOnlyV2Paths = ['/api/socialV2/config', '/api/socialV2/activity', '/api/socialV2/reset', '/api/socialV2/states', '/api/socialV2/wake', '/api/socialV2/initial-prompt', '/api/socialV2/level'];
         if (req.headers['x-agent-token'] && (adminOnlyV2Paths.includes(url.pathname) || (url.pathname === '/api/socialV2/feedback' && req.method === 'GET') || (url.pathname === '/api/socialV2/tool-log' && req.method === 'GET'))) {
           sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
           return;
@@ -4985,8 +4985,40 @@ async function main() {
         if (req.method === 'POST' && url.pathname === '/api/socialV2/turbo') {
           const body = await readBody();
           const on = body.on === true;
-          const status = setTurboV2(on, Number(body.hours) || 0, body.by ? String(body.by) : 'console');
+          // hours = 这一段玩多久；intervalMinutes = 多久醒一轮（桌宠的活跃度档位就靠它传下来，不写回 level）
+          const status = setTurboV2(on, Number(body.hours) || 0, body.by ? String(body.by) : 'console', Number(body.intervalMinutes) || 0);
           sendJson({ ok: true, ...status });
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/level') {
+          sendJson({ ok: true, level: socialV2.level ? { ...socialV2.level } : null, levels: ACTIVE_LEVELS });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/level') {
+          const body = await readBody();
+          const wantId = body.level ? String(body.level) : '';
+          const wantMinutes = Number(body.minutes) || 0;
+          const found = ACTIVE_LEVELS.find((l) => l.id === wantId);
+          const minutes = found ? found.minutes : (wantMinutes >= 1 ? Math.min(720, Math.round(wantMinutes)) : 0);
+          if (!(minutes > 0)) {
+            // 0 / 缺省 = 关掉档位，她回到各会话自己的 everyMinutes
+            socialV2.level = null;
+            saveSocialV2State();
+            for (const key of socialV2.conversations.keys()) setupIntervalTimerV2(key);
+            sendJson({ ok: true, level: null });
+            return;
+          }
+          socialV2.level = { id: found ? found.id : 'custom', label: found ? found.label : '自定义', minutes };
+          // 档位要真的生效：写进每个会话的 everyMinutes 并重建定时器
+          for (const [key, st] of socialV2.conversations) {
+            if (!st.wakeConfig) st.wakeConfig = {};
+            st.wakeConfig.everyMinutes = minutes;
+            setupIntervalTimerV2(key);
+          }
+          saveSocialV2State();
+          log('[level] 活跃度 → ' + socialV2.level.label + '（每 ' + minutes + ' 分钟醒一轮）');
+          const status0 = turboStatusV2();
+          sendJson({ ok: true, level: socialV2.level, ...status0 });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/reset') {
@@ -8821,6 +8853,9 @@ async function main() {
     // 超活跃模式（2026-10-25）：主人想让她整晚一直玩手机时打开。
     // { on:true, since:ms, until:ms|0, by:'manual'|'owner-message', costAtStart?:number }
     turbo: null,
+    // 活跃度档位（2026-10-25）：她多久自己醒一次 { id, label, minutes }；null = 各会话自己的 everyMinutes。
+    // 超活跃模式期间的间隔也取这里，不再硬编码 1 分钟。
+    level: null,
   };
 
   // 一代/普通模式的图片/表情元数据存储：key -> Map<messageId/seq, media[]>
@@ -9077,6 +9112,13 @@ async function main() {
       })();
       const raw = readJsonSafe(SOCIAL_V2_FILE, null);
       socialV2.paused = raw?.paused === true;
+      // 活跃度档位从磁盘恢复；minutes 非法就当没设过
+      const rawLevel = raw?.level;
+      if (rawLevel && Number(rawLevel.minutes) >= 1) {
+        socialV2.level = { id: String(rawLevel.id || 'custom'), label: String(rawLevel.label || '自定义'), minutes: Math.min(720, Math.max(1, Number(rawLevel.minutes))) };
+      } else {
+        socialV2.level = null;
+      }
       // 超活跃模式从磁盘恢复（重启桥不丢）；已过期的直接作废
       const rawTurbo = raw?.turbo;
       if (rawTurbo && rawTurbo.on === true) {
@@ -9194,7 +9236,7 @@ async function main() {
 
   function saveSocialV2State() {
     try {
-      const obj = { paused: socialV2.paused, turbo: socialV2.turbo || null, conversations: Object.create(null) };
+      const obj = { paused: socialV2.paused, turbo: socialV2.turbo || null, level: socialV2.level || null, conversations: Object.create(null) };
       for (const [key, st] of socialV2.conversations) {
         obj.conversations[key] = {
           wakeConfig: st.wakeConfig,
@@ -11130,7 +11172,9 @@ async function main() {
     }
     if (reason === 'interval') {
       const turboOn = turboActiveV2();
-      const mins = turboOn ? TURBO_MINUTES : (Number(wc.everyMinutes) || 0);
+      const mins = turboOn
+        ? (Number(socialV2.turbo && socialV2.turbo.everyMinutes) || levelMinutesV2())
+        : (Number(wc.everyMinutes) || 0);
       const turboNote = turboOn
         ? '- **现在是超活跃模式**：主人开了「整晚玩」模式，醒来间隔被压到最短、夜里也不放慢。这一轮**别收尾、别潜水、别把 everyMinutes 调大**（调了也会被覆盖）。做完一件真事就结束，一两分钟后还会再醒，钱在主人在看着。这个模式只有主人私聊里说「停一下 / 别玩了 / 睡吧」这类话，或者主人在桌宠点暂停，才会结束。'
         : '- 夜里（0~7 点）桥会自动把间隔放慢到 60 分钟，那几轮多半该睡就睡。';
@@ -11595,6 +11639,20 @@ ${turboNote}
   // 停止条件三选一：主人发消息 / 桌宠（或控制台）暂停 / 到点自动到期（默认 10 小时）。
   const TURBO_MINUTES = 1;          // 超活跃时的自醒间隔（分钟）；下限受 setupIntervalTimerV2 的 60s 保护
   const TURBO_DEFAULT_HOURS = 10;   // 不指定时长时默认跑到 10 小时后自动收
+  // 活跃度档位（2026-10-25）：她多久自己醒一轮。档位写进 wakeConfig.everyMinutes，
+  // 超活跃模式期间也用它（以前写死 1 分钟）。
+  const ACTIVE_LEVELS = [
+    { id: 'lazy', label: '摸鱼', minutes: 30 },
+    { id: 'normal', label: '正常', minutes: 10 },
+    { id: 'busy', label: '勤快', minutes: 5 },
+    { id: 'hyper', label: '亢奋', minutes: 2 },
+    { id: 'max', label: '狂暴', minutes: 1 },
+  ];
+  function levelMinutesV2() {
+    const m = Number(socialV2.level && socialV2.level.minutes);
+    if (Number.isFinite(m) && m >= 1) return Math.min(720, Math.round(m));
+    return TURBO_MINUTES;
+  }
   // 主人「叫停」的关键词：只有私聊消息里出现这些才关超活跃，其余消息照常聊、模式继续跑。
   // 别只写「停」一个字当关键词 —— 「别停」「停不下来」都会被误判，宁可多列几个明确的说法。
   const TURBO_STOP_RE = /(停一下|停下来|停下|停止|停吧|别玩了|不要玩了|不玩了|别刷了|睡吧|去睡|睡觉吧|睡觉了|晚安了|该睡了|关掉|关了吧|关了|收工|收摊|下班了|够了|结束吧|今晚到这|回来吧|别玩了|歇着|休息吧)/;
@@ -11652,12 +11710,15 @@ ${turboNote}
       since: active ? Number(t.since) || 0 : 0,
       until: active ? Number(t.until) || 0 : 0,
       by: active ? String(t.by || "manual") : "",
+      everyMinutes: active ? (Number(t.everyMinutes) || levelMinutesV2()) : 0,
+      remainMinutes: active ? Math.max(0, Math.round((Number(t.until) - Date.now()) / 60000)) : 0,
+      level: socialV2.level ? { ...socialV2.level } : null,
       costTodayCny: cost ? cost.today : null,
       costTurboCny: cost && active ? cost.delta : null,
     };
   }
 
-  function setTurboV2(on, hours, why) {
+  function setTurboV2(on, hours, why, intervalMinutes) {
     const wantOn = on === true;
     if (!wantOn) {
       if (!socialV2.turbo) return turboStatusV2();
@@ -11675,6 +11736,7 @@ ${turboNote}
       since: Date.now(),
       until: Date.now() + Math.round(h * 3600 * 1000),
       by: String(why || "manual"),
+      everyMinutes: Number(intervalMinutes) >= 1 ? Math.min(720, Math.round(Number(intervalMinutes))) : levelMinutesV2(),
       costAtStart: cost ? cost.today : 0,
     };
     if (socialV2.paused) {
@@ -11686,7 +11748,7 @@ ${turboNote}
     }
     saveSocialV2State();
     for (const key of socialV2.conversations.keys()) setupIntervalTimerV2(key);
-    log("[turbo] 超活跃模式已开启：每 " + TURBO_MINUTES + " 分钟醒一次，夜间不放慢，" + h.toFixed(2) + " 小时后（" + new Date(socialV2.turbo.until).toLocaleString("zh-CN") + "）自动收");
+    log("[turbo] 超活跃模式已开启：每 " + socialV2.turbo.everyMinutes + " 分钟醒一次，夜间不放慢，" + h.toFixed(2) + " 小时后（" + new Date(socialV2.turbo.until).toLocaleString("zh-CN") + "）自动收");
     return turboStatusV2();
   }
 
@@ -11700,7 +11762,8 @@ ${turboNote}
     if (cfg.socialV2?.enabled === false || socialV2.paused) return;
     const turboOn = turboActiveV2();
     let mins = Number(st.wakeConfig?.everyMinutes) || 0;
-    if (turboOn) mins = TURBO_MINUTES; // 超活跃模式：不管她自己设了多少分钟，一律压到最短
+    // 超活跃模式：用开模式时的档位间隔（默认取当前活跃度），不再写死 1 分钟
+    if (turboOn) mins = Number(socialV2.turbo && socialV2.turbo.everyMinutes) > 0 ? Number(socialV2.turbo.everyMinutes) : levelMinutesV2();
     if (!(mins > 0)) return;
     // 凌晨 0~7 点自动放慢到 60 分钟：真人不会半夜每十分钟醒一次。
     // 只影响这一次的定时器，不写回 wakeConfig —— 白天恢复她自己设的间隔。
