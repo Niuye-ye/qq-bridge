@@ -6618,15 +6618,14 @@ async function main() {
           if (!token) { sendJson({ ok: false, error: 'reserved2 模式必须携带 agent token' }, 403); return; }
           const action = String(body.action ?? (body.remove !== undefined ? 'remove' : body.text ? 'add' : 'list')).trim();
           if (action === 'add') {
-            const entry = addFactV2(body.text, { kind: body.kind, tier: body.tier });
+            const entry = addFactV2(body.text, { kind: body.kind, tier: body.tier, expiresAt: body.expiresAt });
             log(`[facts] 记下：${entry.text.slice(0, 40)}（${entry.tier}/${entry.kind}）`);
             sendJson({ ok: true, entry, total: readFactsV2().length });
             return;
           }
           if (action === 'remove') {
-            const removed = removeFactV2(body.remove ?? body.id ?? body.text);
-            log(`[facts] 删掉 ${removed} 条`);
-            sendJson({ ok: true, removed, total: readFactsV2().length });
+            const res = removeFactV2(body.remove ?? body.id ?? body.text);
+            sendJson({ ok: true, ...res, total: readFactsV2().length, forgotten: readForgottenFactsV2().length });
             return;
           }
           sendJson({
@@ -10690,6 +10689,17 @@ async function main() {
   // 衰减扫描的频率闸，别每轮都写盘。
   const FACTS_DECAY_TICK_MS = 20 * 60 * 1000;
   const FACTS_FORGOTTEN_MAX = 300;
+  // 复习（间隔重复）：被想起来一次，就按 FACT_REVIEW_DAYS 排下一次该想起来的间隔。
+  // 每复习一次半衰期乘 FACT_REVIEW_LIFE_MUL（上限 x4）—— 常想起的事忘得更慢，这才像人的记忆。
+  const FACT_REVIEW_DAYS = [1, 2, 4, 7, 15, 30, 60];
+  const FACT_REVIEW_LIFE_MUL = 1.35;
+  const FACT_REVIEW_LIFE_MUL_MAX = 4;
+  // 到期该复习的记忆排序加权，不然老记忆永远被新记忆压着、排不到注入位。
+  const FACT_DUE_BOOST = 1.15;
+  // 同一条至少隔 6 小时才算一次复习：超活跃模式一分钟一轮，不设闸会被刷爆。
+  const FACT_REVIEW_MIN_GAP_MS = 6 * 60 * 60 * 1000;
+  // 约定过期后再给 3 天宽限才归档（她可能还惦记着）。
+  const FACT_EXPIRE_GRACE_MS = 3 * 86400000;
 
   function readFactsV2() {
     try {
@@ -10738,9 +10748,40 @@ async function main() {
   // 半衰期（天）：long 一年，其余看 kind。
   function factHalfLifeDaysV2(f) {
     const hl = Number(f?.halfLifeDays);
-    if (Number.isFinite(hl) && hl > 0) return hl;
-    if (f?.tier === 'long') return FACT_LONG_HALF_LIFE_DAYS;
-    return FACT_HALF_LIFE_DAYS[f?.kind] ?? FACT_HALF_LIFE_DAYS.fact;
+    const mul = Math.min(FACT_REVIEW_LIFE_MUL_MAX, Math.max(1, Number(f?.lifeMul) || 1));
+    let base;
+    if (Number.isFinite(hl) && hl > 0) base = hl;
+    else if (f?.tier === 'long') base = FACT_LONG_HALF_LIFE_DAYS;
+    else base = FACT_HALF_LIFE_DAYS[f?.kind] ?? FACT_HALF_LIFE_DAYS.fact;
+    return base * mul;
+  }
+
+  // 约定到期没有：expiresAt 只对「有时间点」的事有意义（周六一起看电影、下周交作业）。
+  function factExpiredV2(f, now = Date.now()) {
+    const t = Date.parse(f?.expiresAt || '');
+    if (!Number.isFinite(t)) return false;
+    return now > t;
+  }
+
+  // 该复习了？没有 dueAt 的老数据按「创建后一天」算，让它们也能进复习轮转。
+  function factDueV2(f, now = Date.now()) {
+    const t = Date.parse(f?.dueAt || '');
+    if (Number.isFinite(t)) return now >= t;
+    const at = Date.parse(f?.at || '') || 0;
+    return at > 0 && now - at >= 86400000;
+  }
+
+  // 到期时间解析：'2026-11-01' 按当天 23:59:59（本地）算，也接受完整 ISO。
+  function parseFactExpiresV2(v) {
+    const s = String(v ?? '').trim();
+    if (!s) return '';
+    const parts = s.split('-');
+    if (parts.length === 3 && parts[0].length === 4 && parts[1].length === 2 && parts[2].length === 2) {
+      const ms = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]), 23, 59, 59, 999).getTime();
+      if (Number.isFinite(ms)) return new Date(ms).toISOString();
+    }
+    const ms2 = Date.parse(s);
+    return Number.isFinite(ms2) ? new Date(ms2).toISOString() : '';
   }
 
   // 基础强度：老数据没有 str，就按 kind/tier 现算一个（不落盘）。
@@ -10793,6 +10834,17 @@ async function main() {
           f.str = factStrengthV2({ ...f, touched: from }, now);
           f.touched = new Date(now).toISOString();
         }
+        // 约定过期：宽限期一过就归档，不再当约定提（翻回来会降级成见闻）。
+        if (factExpiredV2(f, now)) {
+          const exp = Date.parse(f.expiresAt) || now;
+          if (now - exp > FACT_EXPIRE_GRACE_MS) {
+            f.str = factStrengthV2(f, now);
+            f.forgotAt = new Date(now).toISOString();
+            f.expiredAt = String(f.expiresAt);
+            gone.push(f);
+            continue;
+          }
+        }
         const s = factStrengthV2(f, now);
         if (f.tier !== 'long' && s < FACTS_FORGET_BELOW) {
           f.str = s;
@@ -10820,6 +10872,15 @@ async function main() {
       if (!f || !f.id) return null;
       const back = { ...f, str: 0.25, touched: new Date(now).toISOString(), hits: (Number(f.hits) || 0) + 1 };
       delete back.forgotAt;
+      delete back.deletedAt;
+      delete back.deletedBy;
+      // 翻回来的是「已经过去的约定」：降级成见闻，别再催她去做一件已经过去的事。
+      if (back.expiredAt || factExpiredV2(back, now)) {
+        if (back.kind === 'promise') back.kind = 'event';
+        delete back.expiresAt;
+      }
+      delete back.expiredAt;
+      back.dueAt = new Date(now + 86400000).toISOString();
       const facts = readFactsV2();
       if (!facts.some((x) => x.id === back.id)) facts.push(back);
       writeFactsV2(facts);
@@ -10843,6 +10904,7 @@ async function main() {
     const tier = opts.tier === 'long' ? 'long' : 'normal';
     const nowMs = Date.now();
     const now = new Date(nowMs).toISOString();
+    const expiresAt = parseFactExpiresV2(opts.expiresAt);
     const facts = readFactsV2();
     const dup = facts.find((f) => String(f.text || '').trim() === t);
     if (dup) {
@@ -10850,10 +10912,27 @@ async function main() {
       dup.kind = kind;
       dup.tier = tier;
       dup.at = now;
+      if (expiresAt) dup.expiresAt = expiresAt;
       touchFactV2(dup, 0.4, nowMs);
       writeFactsV2(facts);
       log('[facts] 又记了一遍：' + t.slice(0, 24) + '（强度 ' + Number(dup.str || 0).toFixed(2) + '）');
       return dup;
+    }
+    // 以前忘了/删过同一句：这次又提起来 = 想起来了，直接从遗忘池捞回，别新建一条。
+    const poolHit = readForgottenFactsV2().find((f) => String(f.text || '').trim() === t);
+    if (poolHit) {
+      const revived = restoreFactV2(poolHit, nowMs);
+      if (revived) {
+        revived.kind = kind;
+        revived.tier = tier;
+        if (expiresAt) revived.expiresAt = expiresAt;
+        touchFactV2(revived, 0.3, nowMs);
+        const all = readFactsV2();
+        const i = all.findIndex((x) => x.id === revived.id);
+        if (i >= 0) { all[i] = revived; writeFactsV2(all); }
+        log('[facts] 从遗忘池捞回来了：' + t.slice(0, 24));
+        return revived;
+      }
     }
     const entry = {
       id: 'f' + Date.now().toString(36) + Math.floor(Math.random() * 1000),
@@ -10864,7 +10943,13 @@ async function main() {
       hits: 0,
       str: tier === 'long' ? 1 : (FACT_INIT_STR[kind] ?? FACT_INIT_STR.fact),
       touched: now,
+      // 复习状态：rev 复习次数、lifeMul 半衰期倍率、dueAt 下次该想起来的时间。
+      rev: 0,
+      lifeMul: 1,
+      reviewedAt: now,
+      dueAt: new Date(nowMs + 86400000).toISOString(),
     };
+    if (expiresAt) entry.expiresAt = expiresAt;
     facts.push(entry);
     if (facts.length > FACTS_MAX) {
       const normals = facts.filter((f) => f.tier !== 'long').sort((a, b) => scoreFactV2(a) - scoreFactV2(b));
@@ -10876,22 +10961,43 @@ async function main() {
     return entry;
   }
 
-  // 删是真删：活跃池和遗忘池都清掉（她记错了要能彻底抹掉）。
+  // 删除分两级：第一次是软删（挪进遗忘池，还翻得回来），对池里那条再删才彻底抹掉。
+  // 说「忘了」不等于没痕迹，但刻意要抹掉就该抹掉 —— 两个都要能表达。
   function removeFactV2(ref) {
     const r = String(ref ?? '').trim();
     if (!r) throw new Error('要删哪条？给 id 或原文关键词');
     const hit = (f) => f.id === r || String(f.text || '').trim() === r || String(f.text || '').includes(r);
-    const facts = readFactsV2();
-    const kept = facts.filter((f) => !hit(f));
-    let removed = facts.length - kept.length;
-    if (removed > 0) writeFactsV2(kept);
-    const pool = readForgottenFactsV2();
-    const keptPool = pool.filter((f) => !hit(f));
-    if (keptPool.length !== pool.length) {
-      removed += pool.length - keptPool.length;
-      writeForgottenFactsV2(keptPool);
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    // 顺序要紧：先看「这次之前就已经软删过」的那些（再删一次 = 彻底抹掉），再软删活跃池的。
+    // 反过来的话刚挪进池的条目会立刻被同一次调用抹掉，软删就白做了。
+    const poolBefore = readForgottenFactsV2();
+    const killed = poolBefore.filter((f) => hit(f) && f.deletedAt);
+    let pool = poolBefore;
+    if (killed.length) {
+      pool = poolBefore.filter((f) => !(hit(f) && f.deletedAt && killed.includes(f)));
+      log('[facts] 彻底抹掉 ' + killed.length + ' 条');
     }
-    return removed;
+    const facts = readFactsV2();
+    const soft = facts.filter(hit);
+    const kept = facts.filter((f) => !hit(f));
+    if (soft.length) {
+      for (const f of soft) {
+        f.str = factStrengthV2(f, now);
+        f.forgotAt = nowIso;
+        f.deletedAt = nowIso;
+        f.deletedBy = 'forgot';
+      }
+      writeFactsV2(kept);
+      pool = pool.concat(soft);
+      log('[facts] 忘了（软删，可恢复）' + soft.length + ' 条：' + soft.slice(0, 3).map((f) => String(f.text || '').slice(0, 16)).join(' / '));
+    }
+    if (killed.length || soft.length) writeForgottenFactsV2(pool);
+    return {
+      soft: soft.length,
+      hard: killed.length,
+      texts: soft.concat(killed).slice(0, 5).map((f) => String(f.text || '').slice(0, 30)),
+    };
   }
 
   function searchFactsV2(query = '', limit = 20, includeForgotten = true) {
@@ -10899,23 +11005,30 @@ async function main() {
     archiveFactsV2();
     const q = String(query ?? '').trim().toLowerCase();
     const match = (f) => !q || String(f.text || '').toLowerCase().includes(q);
-    const live = readFactsV2().filter(match).map((f) => ({ f, s: factStrengthV2(f, now), forgotten: false }));
+    const live = readFactsV2().filter(match).map((f) => ({ f, s: factStrengthV2(f, now), forgotten: false, deleted: false }));
     // 只有真的带着关键词去翻，才把遗忘池倒出来 —— 空查询不能把「想不起来的事」全捞上来。
     const dead = (includeForgotten && q)
-      ? readForgottenFactsV2().filter(match).map((f) => ({ f, s: 0.02, forgotten: true }))
+      ? readForgottenFactsV2().filter(match).map((f) => ({ f, s: 0.02, forgotten: true, deleted: Boolean(f.deletedAt) }))
       : [];
     const rows = live.concat(dead)
       .sort((a, b) => b.s - a.s)
       .slice(0, Math.max(1, Math.min(60, Number(limit) || 20)));
     const out = [];
     for (const r of rows) {
+      const base = { id: r.f.id, text: r.f.text, kind: r.f.kind, tier: r.f.tier, at: r.f.at, hits: r.f.hits ?? 0 };
+      if (r.f.expiresAt) base.expiresAt = r.f.expiresAt;
       if (r.forgotten) {
+        // 她自己主动删掉的不自动复活：只告诉她「这条你删过」。
+        if (r.deleted) { out.push({ ...base, strength: 0, forgotten: true, deleted: true }); continue; }
+        if (factExpiredV2(r.f, now)) { out.push({ ...base, strength: 0, forgotten: true, expired: true }); continue; }
         const back = restoreFactV2(r.f, now);
         if (!back) continue;
-        out.push({ id: back.id, text: back.text, kind: back.kind, tier: back.tier, at: back.at, hits: back.hits ?? 0, strength: 0.25, forgotten: true });
+        out.push({ ...base, hits: back.hits ?? 0, strength: 0.25, forgotten: true });
         continue;
       }
-      out.push({ id: r.f.id, text: r.f.text, kind: r.f.kind, tier: r.f.tier, at: r.f.at, hits: r.f.hits ?? 0, strength: Number(r.s.toFixed(3)), forgotten: false });
+      const row = { ...base, strength: Number(r.s.toFixed(3)), forgotten: false };
+      if (factExpiredV2(r.f, now)) row.expired = true;
+      out.push(row);
     }
     return out;
   }
@@ -10932,6 +11045,7 @@ async function main() {
       let touched = 0;
       for (const f of facts) {
         if (touched >= maxTouch) break;
+        if (factExpiredV2(f, now)) continue;
         const t = String(f.text || '').trim();
         if (t.length < 6) continue;
         const probes = [];
@@ -10947,7 +11061,8 @@ async function main() {
     }
   }
 
-  // 每轮注入：long 取最近 4 条，normal 取强度最高 2 条。
+  // 每轮注入：long 取最近 4 条，normal 取强度最高 2 条；到期该复习的加权，别让老记忆永远排不上。
+  // 注入一次就算「想起一次」：排下一次复习、把半衰期拉长（间隔重复），常想起的忘得更慢。
   // 强度低的带「记不太清了」的口气 —— 她说话时自然会含糊，而不是背书。
   function formatFactsLineV2() {
     archiveFactsV2();
@@ -10955,22 +11070,46 @@ async function main() {
     const forgottenCount = readForgottenFactsV2().length;
     if (!facts.length && !forgottenCount) return '';
     const now = Date.now();
-    const tagged = facts.map((f) => ({ f, s: factStrengthV2(f, now) }));
+    const tagged = facts
+      .filter((f) => !factExpiredV2(f, now))
+      .map((f) => {
+        const s = factStrengthV2(f, now);
+        return { f, s, score: s * (factDueV2(f, now) ? FACT_DUE_BOOST : 1) };
+      });
     const longs = tagged
       .filter((x) => x.f.tier === 'long')
       .sort((a, b) => (Date.parse(b.f.at || '') || 0) - (Date.parse(a.f.at || '') || 0))
       .slice(0, FACTS_INJECT_LONG);
     const normals = tagged
       .filter((x) => x.f.tier !== 'long')
-      .sort((a, b) => b.s - a.s)
+      .sort((a, b) => b.score - a.score)
       .slice(0, FACTS_INJECT_NORMAL);
+    const picked = longs.concat(normals);
+    // 复习：到点了、且距上次复习够久，才把间隔往后排并加固（不然一分钟一轮会刷爆）。
+    let reviewed = 0;
+    for (const x of picked) {
+      const f = x.f;
+      if (!factDueV2(f, now)) continue;
+      const last = Date.parse(f.reviewedAt || '') || 0;
+      if (now - last < FACT_REVIEW_MIN_GAP_MS) continue;
+      const rev = (Number(f.rev) || 0) + 1;
+      f.rev = rev;
+      f.reviewedAt = new Date(now).toISOString();
+      const days = FACT_REVIEW_DAYS[Math.min(rev, FACT_REVIEW_DAYS.length - 1)];
+      f.dueAt = new Date(now + days * 86400000).toISOString();
+      f.lifeMul = Math.min(FACT_REVIEW_LIFE_MUL_MAX, Math.round((Number(f.lifeMul) || 1) * FACT_REVIEW_LIFE_MUL * 100) / 100);
+      touchFactV2(f, 0.06, now);
+      reviewed += 1;
+    }
+    if (reviewed) writeFactsV2(facts);
     const tag = { pref: '喜好', promise: '约定', event: '见闻', fact: '事实' };
     const fmt = (x) => {
       const f = x.f;
       const days = Math.floor((now - (Date.parse(f.at || '') || now)) / 86400000);
       const when = days <= 0 ? '今天' : (days === 1 ? '昨天' : (days + ' 天前'));
       const blur = x.s >= 0.65 ? '' : (x.s >= 0.35 ? '，记不太清了' : '，只记得个大概');
-      return '- ' + f.text + '（' + (tag[f.kind] || '事实') + '，' + when + blur + '）';
+      const exp = f.expiresAt ? ('，说的是 ' + String(f.expiresAt).slice(0, 10)) : '';
+      return '- ' + f.text + '（' + (tag[f.kind] || '事实') + '，' + when + blur + exp + '）';
     };
     const parts = [];
     if (longs.length) parts.push('长期记得的：\n' + longs.map(fmt).join('\n'));
