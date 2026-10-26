@@ -30,7 +30,7 @@ import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
 import { addGoalV2, appendLifeV2, closeGoalV2, formatGoalsLineV2, formatLifeLineV2, readGoalsV2, readLifeV2 } from './goals-life.js';
 // Minecraft 陪伴：轮询 Numen 模组内置 MCP 服务端的游戏内消息（纯 I/O + 队列，不碰会话状态机）
-import { startMcWatcher, takeMcMessages } from './mc-companion.js';
+import { dropMcMessages, peekMcMessages, startMcWatcher } from './mc-companion.js';
 import {
   loadSlang,
   saveSlang,
@@ -11260,13 +11260,14 @@ ${turboNote}
 玩手机、看东西、发呆都算正常生活，不用为了「做点什么」而硬凑动作。`;
     }
     if (reason === 'mc') {
-      const msgs = takeMcMessages();
+      const msgs = peekMcMessages();
       const said = msgs.length ? msgs.map((m) => `- ${m.text}`).join('\n') : '（消息没取到，自己去 get_events 看看）';
       return `${base}【游戏里】${key}\n原因：主人在 Minecraft 里跟你说话，不是 QQ 消息 —— 他看不见 QQ，别在 QQ 里回一句就完事。\n他说：\n${said}\n\n这一轮真的要进游戏里干活：
 1. 本轮第一次先 skill(name="minecraft-numen") 读一遍要点（不熟就每次都读，很短）；
 2. mcp__numen__lua 看他在哪、你俩离多远（status.owner() / status.self()），需要就走过去（move.go / route.plan）；
 3. mcp__numen__say 把话说出来 —— 这是唯一他能听见的方式，text 短一点、像面对面说话；
 4. 说完再 get_events 看一眼他有没有接话；他继续说你就在这一轮接着回。
+5. **这一轮别做 5 分钟的沉睡前观察**：主人在游戏里等着，回完就用 qq_set_wake_config 安排下次唤醒收尾（一句话就够），别调 qq_wait_for_messages 空等。
 别忘了你就是他自己的同伴：走过去的路上可以说一句「我过来了」。想不到说什么就用 lua 看看他在干嘛（背包、血、在哪）再挑话说。`;
     }
     if (reason === 'desk') {
@@ -11305,11 +11306,20 @@ ${turboNote}
   // ── 打断（2026-10-23，参考 Cortico 的 interrupt）────────────────────────────────
   // 它自己玩手机（interval）或发呆（proactiveCheck）时，真人的消息不应该排队等它玩完。
   // 只打断「自己在过时间」的轮次；普通对话轮次照旧走暂存队列，免得把正在组织语言的回合切了。
-  function shouldInterruptV2(st, reason) {
+  function shouldInterruptV2(st, reason, key) {
     if (!st) return false;
     const playingAlone = st.lastWakeReason === 'interval' || st.lastWakeReason === 'proactiveCheck';
     const userCares = reason !== 'interval' && reason !== 'proactiveCheck';
-    return playingAlone && userCares;
+    if (playingAlone && userCares) return true;
+    // 游戏里有人跟她说话（reason=mc）：她很可能正卡在收尾的 qq_wait_for_messages（最长 5 分钟），
+    // 那段时间里桥认为"忙"，新消息只能排队 —— 主人在游戏里喊一句要等五分钟，等于没有。
+    // 所以只在"这一轮已经跑了 20 秒以上"时抢一次（正常对话回合大多在这之内结束，不会被打断）。
+    if (reason === 'mc') {
+      const sid = state.sessions[key];
+      const startedAt = sid ? Number(v2TurnStartAt.get(sid)) || 0 : 0;
+      if (startedAt > 0 && Date.now() - startedAt > 20000) return true;
+    }
+    return false;
   }
 
   async function interruptRoundV2(key, st, reason) {
@@ -11336,7 +11346,7 @@ ${turboNote}
 
   // sendWakePromptV2（async）用：打断成功就继续往下投递
   async function tryInterruptV2(key, st, reason) {
-    if (!shouldInterruptV2(st, reason)) return false;
+    if (!shouldInterruptV2(st, reason, key)) return false;
     return await interruptRoundV2(key, st, reason);
   }
 
@@ -11585,7 +11595,7 @@ ${turboNote}
       return;
     }
     if (isConversationBusyV2(key, st)) {
-      if (shouldInterruptV2(st, reason)) {
+      if (shouldInterruptV2(st, reason, key)) {
         // scheduleWakeV2 是同步函数：打断丢后台，完了用同一个 reason 重新调度自己。
         kickInterruptV2(key, st, reason);
         return;
@@ -13043,6 +13053,9 @@ ${turboNote}
               return;
             }
             await sendWakePromptV2(mcKey, 'mc');
+            // 交付成功才清队列：拼提示词用的是 peek，万一上面因为繁忙没投出去，
+            // 消息还在队列里，轮询器过一会儿会再叫一次（否则主人在游戏里说一句就永远没人应）。
+            dropMcMessages();
           },
         });
       } catch (error) {

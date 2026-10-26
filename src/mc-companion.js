@@ -20,6 +20,17 @@ export function takeMcMessages() {
   return QUEUE.splice(0, QUEUE.length);
 }
 
+/** 只看，不清空（拼提示词时用；真交付成功后再 drop）。 */
+export function peekMcMessages() {
+  return QUEUE.slice();
+}
+
+/** 交付成功后清掉已带过去的那几条。 */
+export function dropMcMessages(n) {
+  const count = Number(n) > 0 ? Math.min(Number(n), QUEUE.length) : QUEUE.length;
+  return QUEUE.splice(0, count);
+}
+
 /** 队列里还有多少条没交出去。 */
 export function mcQueueSize() {
   return QUEUE.length;
@@ -162,6 +173,13 @@ async function loop(ctx) {
       continue;
     }
     if (ctx.stopped) break;
+    // 队列里还压着话（她当时在忙 → 桥没接）：过一会儿再敲一次门。
+    // 不能只靠"下一条消息来了才叫"，主人在游戏里说一句就等回话，不会一直说。
+    if (QUEUE.length > 0 && Date.now() - ctx.lastWakeAt > ctx.cooldownMs) {
+      ctx.lastWakeAt = Date.now();
+      ctx.log(`[mc] 队列还有 ${QUEUE.length} 条没送出去，再叫一次`);
+      try { await ctx.onQuery(); } catch (e) { ctx.log(`[mc] 补叫失败：${e?.message ?? e}`); }
+    }
     await sleep(400);
   }
 }
