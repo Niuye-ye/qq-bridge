@@ -1390,12 +1390,12 @@ if (cfg.socialV2?.tools?.goals !== false) {
 if (cfg.socialV2?.tools?.remember !== false) {
   server.tool(
     'qq_remember',
-    '记一件事到长期记忆。每轮会自动带出几条，不用主动查。tier=long 永不淡忘（画像/喜好/约定），tier=normal 会变淡（事件/见闻，半衰期 30 天）。',
+    '记一件事到长期记忆。每轮会自动带出几条，不用主动查。像人一样会淡忘：normal 随时间变淡（见闻约 12 天、事实 45 天、喜好 90 天、约定 120 天半衰期），淡到一定程度就想不起来了（qq_recall 还能翻回来）。tier=long 是画像/约定，半衰期一年、永不彻底遗忘——别什么都标 long，一次性的见闻和事件一律 normal。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       text: z.string().describe('记什么，一句话，比如「YG 讨厌被叫主人」「说好了明天聊那个游戏」'),
       kind: z.enum(['fact', 'pref', 'event', 'promise']).optional().describe('fact=事实 pref=喜好 event=见闻 promise=约定'),
-      tier: z.enum(['long', 'normal']).optional().describe('long=永不淡忘 normal=会变淡（默认 normal）')
+      tier: z.enum(['long', 'normal']).optional().describe('long=画像/约定（半衰期一年、永不彻底遗忘） normal=会变淡（默认，见闻/事件都用这个）')
     },
     async ({ key, token, text, kind, tier }) => {
       try {
@@ -1416,7 +1416,7 @@ if (cfg.socialV2?.tools?.remember !== false) {
 if (cfg.socialV2?.tools?.recall !== false) {
   server.tool(
     'qq_recall',
-    '翻长期记忆。不传 query 就是按重要度列出来；传了就在记忆文本里搜。',
+    '翻长期记忆。不传 query 就是按记性强弱列出来；传了就在记忆文本里搜——连已经淡忘、快想不起来的事也会一起翻，翻到就算想起来了，会重新记住（强度拉回 0.25）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       query: z.string().optional().describe('搜索词，比如「游戏」「吃饭」'),
@@ -1441,7 +1441,7 @@ if (cfg.socialV2?.tools?.recall !== false) {
 if (cfg.socialV2?.tools?.forget !== false) {
   server.tool(
     'qq_forget',
-    '删掉记错/过期的记忆。给 id 或原文里的关键词都行。',
+    '删掉记错/过期的记忆（活跃的和已淡忘的都删）。给 id 或原文里的关键词都行。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       remove: z.string().describe('要删的记忆 id，或原文里的关键词')
