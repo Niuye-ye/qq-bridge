@@ -212,15 +212,34 @@ const LEVEL_PRESETS = [
   { id: 'max', label: '狂暴（1 分钟一轮）', minutes: 1 },
 ];
 
+// 2026-10-26：pet.json 原来每次拖窗（mousemove → pet:pos 每帧一次）都要
+// 「读一遍文件 + 写一遍文件 + mkdirSync 两次」，一次拖动几十次同步 IO，主进程会卡顿。
+// 现在：状态常驻内存（只启动时读一次），写盘去抖 350ms，内容没变就不写；退出前 flush。
+let PET_STATE_CACHE = null;
+let PET_LAST_TEXT = '';
+let PET_FLUSH_TIMER = null;
 function readPetState() {
-  try { return JSON.parse(fs.readFileSync(PET_JSON, 'utf8')); } catch (_) { return {}; }
+  if (!PET_STATE_CACHE) {
+    try { PET_STATE_CACHE = JSON.parse(fs.readFileSync(PET_JSON, 'utf8')); } catch (_) { PET_STATE_CACHE = {}; }
+  }
+  return { ...PET_STATE_CACHE };
+}
+function flushPetState() {
+  if (PET_FLUSH_TIMER) { clearTimeout(PET_FLUSH_TIMER); PET_FLUSH_TIMER = null; }
+  try {
+    const text = JSON.stringify(PET_STATE_CACHE || {}, null, 2);
+    if (text === PET_LAST_TEXT) return;
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.mkdirSync(path.dirname(APP_LOG), { recursive: true });
+    fs.writeFileSync(PET_JSON, text, 'utf8');
+    PET_LAST_TEXT = text;
+  } catch (e) { log('写 pet.json 失败', e.message); }
 }
 function writePetState(patch) {
   try {
-    const cur = readPetState();
-    fs.mkdirSync(STATE_DIR, { recursive: true });
-fs.mkdirSync(path.dirname(APP_LOG), { recursive: true });
-    fs.writeFileSync(PET_JSON, JSON.stringify({ ...cur, ...patch }, null, 2), 'utf8');
+    const cur = PET_STATE_CACHE || readPetState();
+    PET_STATE_CACHE = { ...cur, ...patch };
+    if (!PET_FLUSH_TIMER) PET_FLUSH_TIMER = setTimeout(flushPetState, 350);
   } catch (e) { log('写 pet.json 失败', e.message); }
 }
 
@@ -1426,5 +1445,6 @@ if (!app.requestSingleInstanceLock()) {
       const [x, y] = win.getPosition();
       writePetState({ left: x, top: y });
     }
+    flushPetState();   // 去抖后可能还有没落盘的位置，退出前补一次
   });
 }

@@ -10096,6 +10096,13 @@ async function main() {
 
   function startSocialLoop() {
     if (social.loopTimer) clearInterval(social.loopTimer);
+    social.loopTimer = null;
+    // 2026-10-26：reserved2（二代仿真）下 socialLoopTick 首行就 return，这条 5 秒定时器
+    // 等于永久空转（每小时 720 次唤醒，纯耗电/干扰 CPU 降频）。只有一代仿真才需要它。
+    if (!isSocialEnabled()) {
+      log('社交模式：当前不是一代仿真（reserved），不启动 5 秒轮询');
+      return;
+    }
     social.loopTimer = setInterval(socialLoopTick, 5000);
     social.loopTimer.unref?.();
   }
