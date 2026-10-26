@@ -29,6 +29,8 @@ import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardR
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
 import { addGoalV2, appendLifeV2, closeGoalV2, formatGoalsLineV2, formatLifeLineV2, readGoalsV2, readLifeV2 } from './goals-life.js';
+// Minecraft 陪伴：轮询 Numen 模组内置 MCP 服务端的游戏内消息（纯 I/O + 队列，不碰会话状态机）
+import { startMcWatcher, takeMcMessages } from './mc-companion.js';
 import {
   loadSlang,
   saveSlang,
@@ -11257,6 +11259,16 @@ async function main() {
 ${turboNote}
 玩手机、看东西、发呆都算正常生活，不用为了「做点什么」而硬凑动作。`;
     }
+    if (reason === 'mc') {
+      const msgs = takeMcMessages();
+      const said = msgs.length ? msgs.map((m) => `- ${m.text}`).join('\n') : '（消息没取到，自己去 get_events 看看）';
+      return `${base}【游戏里】${key}\n原因：主人在 Minecraft 里跟你说话，不是 QQ 消息 —— 他看不见 QQ，别在 QQ 里回一句就完事。\n他说：\n${said}\n\n这一轮真的要进游戏里干活：
+1. 本轮第一次先 skill(name="minecraft-numen") 读一遍要点（不熟就每次都读，很短）；
+2. mcp__numen__lua 看他在哪、你俩离多远（status.owner() / status.self()），需要就走过去（move.go / route.plan）；
+3. mcp__numen__say 把话说出来 —— 这是唯一他能听见的方式，text 短一点、像面对面说话；
+4. 说完再 get_events 看一眼他有没有接话；他继续说你就在这一轮接着回。
+别忘了你就是他自己的同伴：走过去的路上可以说一句「我过来了」。想不到说什么就用 lua 看看他在干嘛（背包、血、在哪）再挑话说。`;
+    }
     if (reason === 'desk') {
       const dm = Array.isArray(st.deskMessages) ? st.deskMessages.slice(-5) : [];
       const dmText = dm.length ? dm.map((m) => `- ${m.text}`).join('\n') : '（没留下记录）';
@@ -13003,6 +13015,41 @@ ${turboNote}
     // 日志里的「token 自愈失败」与 config.json 的 snowluma.homeDir。
     log(`SnowLuma 首次连接未成功（将在后台自动重连并尝试自愈 WS token）: ${error?.message ?? error}`);
   });
+  // ── Minecraft 陪伴：轮询游戏内消息，主人一喊就唤醒她的会话 ──────────────
+  // 为什么挂在桥而不是让她自己轮询：她的会话是按需唤醒的，没人叫醒就不会跑；
+  // 桥 7×24 在跑，正好当那个"耳朵"。配置见 config.json → socialV2.mc。
+  {
+    const mc = cfg.socialV2?.mc ?? {};
+    const mcKey = `private:${String(cfg.ownerQQ ?? '')}`;
+    if (mc.enabled !== true) {
+      log('[mc] 未启用（config.json 的 socialV2.mc.enabled）');
+    } else if (!cfg.ownerQQ) {
+      log('[mc] 没配 ownerQQ，跳过游戏内轮询');
+    } else {
+      try {
+        startMcWatcher({
+          url: mc.url,
+          token: mc.token,
+          companion: mc.companion,
+          log,
+          onQuery: async () => {
+            const st = socialV2.conversations.get(mcKey);
+            if (!st) {
+              log('[mc] 主人会话还没建起来，消息先攒着');
+              return;
+            }
+            if (isConversationBusyV2(mcKey, st)) {
+              log('[mc] 她正在忙，消息先攒着');
+              return;
+            }
+            await sendWakePromptV2(mcKey, 'mc');
+          },
+        });
+      } catch (error) {
+        log('[mc] 轮询启动失败:', error?.message ?? error);
+      }
+    }
+  }
   log('桥接已启动。按 Ctrl+C 退出。');
   // 预热表情库：启动时同步一次 QQ 收藏表情，失败不阻塞（AI 首次调用工具时还会再试）。
   if (cfg.socialV2?.sticker?.enabled !== false) {
