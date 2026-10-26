@@ -49,7 +49,7 @@ function sanitizeQuery(query) {
     .slice(0, 120);
 }
 
-const server = new McpServer({ name: 'web-search-safe', version: '0.2.0-r4' });
+export function registerTools(server) {
 
 server.tool(
   'web_search',
@@ -89,4 +89,13 @@ server.tool(
   }
 );
 
-await server.connect(new StdioServerTransport());
+}
+
+// 单独运行（node mcp-web-search-safe.js）时自己起 stdio 服务；被 mcp-all.js import 时只导出
+// registerTools，由合并进程统一注册（2026-10-26 三 MCP 合并成一个进程省内存）。
+const isEntryFile = path.basename(process.argv[1] || '').toLowerCase() === 'mcp-web-search-safe.js';
+if (isEntryFile) {
+  const server = new McpServer({ name: 'web-search-safe', version: '0.2.0-r4' });
+  registerTools(server);
+  await server.connect(new StdioServerTransport());
+}

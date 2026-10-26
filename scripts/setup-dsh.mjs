@@ -6,7 +6,8 @@
 //      （DSH 0.1.7 机制：作为 qq-agent-presets bundle 的 patch 层插入
 //        @deepseek-ai/dsh-agent-preset 行；~/.dsh/.agent-presets/ 目录已不再被读取）
 //   2. 在 DSH profile 的 cordis.patch.yml 中挂载三个 MCP server：
-//      mcp-snowluma / mcp-snowluma-host / mcp-web-search-safe
+//      mcp-snowluma / mcp-web-search-safe（后者的脚本已合并为 src/mcp-all.js，
+//      同时提供 web_search / web_fetch / snowluma_status；mcp-snowluma-host 只保留在 MANAGED_MCP_IDS 里以便清理旧条目）
 //   3. 在 profile package.json 中注册两个 bundle：qq-mode-console、qq-agent-presets
 //
 // 用法：
@@ -20,31 +21,25 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { BUNDLE_DIR, PRESETS, buildPatches, patchFileFor } from './build-agent-preset-patches.mjs';
-
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
 const PROFILE = process.argv[2] || 'web';
-
 // A profile is a directory name, never a path (same boundary as DSH itself).
 if (PROFILE === '.' || PROFILE === '..' || PROFILE === 'node_modules'
     || /[\\/\x00-\x1f<>:"|?*]/.test(PROFILE) || /[. ]$/.test(PROFILE)) {
   fatal(`invalid profile name: ${JSON.stringify(PROFILE)}`);
 }
-
 function log(msg) {
   console.log(`[setup-dsh] ${msg}`);
 }
-
 function fatal(msg) {
   console.error(`[setup-dsh] ERROR: ${msg}`);
   process.exit(1);
 }
-
 function ensureDir(p) {
   fs.mkdirSync(p, { recursive: true });
 }
-
 /**
  * 备份一个即将被覆盖的文件。
  *
@@ -73,7 +68,6 @@ function backupBeforeOverwrite(file, keep = 5) {
   } catch {}
   return dest;
 }
-
 // ── agent preset：DSH 0.1.7 机制 ─────────────────────────────────────────────
 //
 // 0.1.5：preset 是 ~/.dsh/.agent-presets/<preset>/ 下的目录，DSH 启动时扫目录装载。
@@ -84,7 +78,6 @@ function backupBeforeOverwrite(file, keep = 5) {
 //          ② 从仓库权威源（dsh/agent-presets/<preset>/）重新生成 patch 文件。
 //        旧目录不再写入、也不删除（见 reportLegacyPresetDir）。
 const BUNDLE_NAMES = ['qq-mode-console', 'qq-agent-presets'];
-
 /** 从仓库源重新生成 bundle 里的 patch 文件（人格正文/工具面改了就必须重跑）。 */
 function regeneratePresetPatches() {
   const results = buildPatches({ log: () => {} });
@@ -96,7 +89,6 @@ function regeneratePresetPatches() {
     if (!fs.existsSync(file)) fatal(`preset patch 未生成：${file}`);
   }
 }
-
 /**
  * 旧机制的安装目录：0.1.7 起 DSH 完全不再读它。
  *
@@ -117,20 +109,19 @@ function reportLegacyPresetDir() {
       : `  ⚠️ ${name}：旧目录副本与仓库源**不一致**——那份手改内容不会再生效，请人工合并到 dsh/agent-presets/${name}/agent.cordis.yml`);
   }
 }
-
 function yamlSingleQuote(s) {
   return `'${String(s).replace(/'/g, "''")}'`;
 }
-
-// 由桥接托管的 MCP 条目 id：脚本对这三个 id 拥有所有权，可安全地按 id 增删。
+// 由桥接托管的 MCP 条目 id：脚本对这些 id 拥有所有权，可安全地按 id 增删。
+// mcp-snowluma-host 已并入 mcp-web-search-safe（2026-10-26 合并进程省内存），
+// 但仍留在这里 —— 它的作用是「把历史配置里那条旧条目删掉」，别再往 servers 里加回去。
 const MANAGED_MCP_IDS = ['mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe'];
-
 function mcpEntries() {
   const node = process.execPath;
   const servers = {
     'mcp-snowluma': { serverName: 'snowluma', script: path.join(REPO_ROOT, 'src', 'mcp-snowluma-safe.js'), toolCallTimeoutMs: 725000 },
-    'mcp-snowluma-host': { serverName: 'snowluma-host', script: path.join(REPO_ROOT, 'src', 'mcp-host-server.js') },
-    'mcp-web-search-safe': { serverName: 'web-search-safe', script: path.join(REPO_ROOT, 'src', 'mcp-web-search-safe.js') },
+    // 合并进程：web_search / web_fetch（原 web-search-safe）+ snowluma_status（原 snmowuna-host）
+    'mcp-web-search-safe': { serverName: 'web-search-safe', script: path.join(REPO_ROOT, 'src', 'mcp-all.js') },
   };
   let out = '# === qq-bridge MCP BEGIN ===\n';
   out += '# 由 scripts/setup-dsh.mjs 维护；这段区块会被整体替换，请勿手工编辑内部条目。\n';
@@ -150,7 +141,6 @@ function mcpEntries() {
   out += '# === qq-bridge MCP END ===\n';
   return out;
 }
-
 function prepareCordisPatch() {
   const profileDir = path.join(DSH_HOME, 'profiles', PROFILE);
   const patchFile = path.join(profileDir, 'cordis.patch.yml');
@@ -186,7 +176,6 @@ function prepareCordisPatch() {
   const text = (kept.length ? `${yaml.dump(kept, { lineWidth: -1, noRefs: true })}\n` : '') + mcpEntries();
   return { patchFile, original, text, removed };
 }
-
 function patchCordis({ patchFile, original, text, removed }) {
   ensureDir(path.dirname(patchFile));
   // Parsing/serialization normalizes formatting; keep the original text (including comments).
@@ -202,7 +191,6 @@ function patchCordis({ patchFile, original, text, removed }) {
   }
   log(`cordis.patch.yml: MCP 条目已同步（清理旧条目 ${removed} 条，写入 ${MANAGED_MCP_IDS.length} 条）`);
 }
-
 /**
  * 建一个指向本仓库的目录链接（Windows 用 junction，免管理员权限）。
  *
@@ -212,14 +200,12 @@ function patchCordis({ patchFile, original, text, removed }) {
 function ensureDirLink(linkPath, targetDir, label) {
   if (!fs.existsSync(targetDir)) fatal(`${label} 源目录不存在: ${targetDir}`);
   ensureDir(path.dirname(linkPath));
-
   let existing = null;
   try {
     existing = fs.lstatSync(linkPath);
   } catch (error) {
     if (error?.code !== 'ENOENT') fatal(`failed to inspect ${label}: ${error?.message ?? error}`);
   }
-
   if (existing) {
     if (!existing.isSymbolicLink()) {
       fatal(`${label} 已存在且不是符号链接/junction: ${linkPath}。请先手工移走或删除，然后重跑。`);
@@ -239,7 +225,6 @@ function ensureDirLink(linkPath, targetDir, label) {
     log(`${label} 存在但指向别处/失效，重建: ${linkPath}`);
     fs.rmSync(linkPath, { recursive: true, force: true });
   }
-
   try {
     if (process.platform === 'win32') {
       fs.symlinkSync(targetDir, linkPath, 'junction');
@@ -252,7 +237,6 @@ function ensureDirLink(linkPath, targetDir, label) {
   }
   return linkPath;
 }
-
 /**
  * 把仓库里的 bundle 包接进 profile。
  *
@@ -268,7 +252,6 @@ function ensureBundle(name) {
   ensureDirLink(path.join(DSH_HOME, 'profiles', PROFILE, 'node_modules', name), linkDir, `bundle ${name} node_modules link`);
   return linkDir;
 }
-
 function patchProfilePackage(links) {
   const profileDir = path.join(DSH_HOME, 'profiles', PROFILE);
   const pkgFile = path.join(profileDir, 'package.json');
@@ -301,7 +284,6 @@ function patchProfilePackage(links) {
   fs.writeFileSync(pkgFile, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
   log(`profile package.json ensured: ${pkgFile}`);
 }
-
 function ensureLocalModeFile() {
   const stateDir = path.join(REPO_ROOT, 'state');
   const modeFile = path.join(stateDir, 'mode.json');
@@ -315,7 +297,6 @@ function ensureLocalModeFile() {
   fs.writeFileSync(modeFile, `${JSON.stringify({ mode: 'reserved2', closedAgentPreset: '' }, null, 2)}\n`, 'utf8');
   log(`state/mode.json created with mode=reserved2 (fallback if DSH settings are not available)`);
 }
-
 // qq-mode-console / qq-agent-presets 以 link: 依赖注册进 profile package.json 后，DSH 首次启动
 // 需要先安装一次才能解析这些 bundle（否则 cold start 报 "cannot resolve profile bundle"）。
 // dsh CLI 可用时自动执行。
@@ -350,7 +331,6 @@ function autoInstallProfileBundles() {
     log(`dsh plugin --profile ${PROFILE} install 返回退出码 ${r.status}（若 DSH 启动报 bundle 解析失败，请手动重跑该命令）`);
   }
 }
-
 // Validate the existing YAML before changing any presets or configuration.
 const cordisPatch = prepareCordisPatch();
 regeneratePresetPatches();
