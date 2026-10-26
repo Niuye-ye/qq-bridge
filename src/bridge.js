@@ -2185,7 +2185,39 @@ async function main() {
 
   // 现拍一张 MuMu 的屏幕（adb exec-out screencap -p），给"发张截图给我"这种请求用。
   // 第一次用缓存串号；失败就清缓存重解析（含 adb connect 重连）再试一次。
+  // 2026-10-26：MuMu 改成按需（mumu-butler :8790）。任何要碰设备的操作前，先请管家把模拟器拉起来。
+  // 配置 socialV2.image.wakeUrl（默认 http://127.0.0.1:8790/ensure，空串=禁用）。
+  // 必须同步等（截图链路是 execFileSync 的同步函数），所以走 curl.exe（Win10+ 自带）。
+  // 管家不在（没起/超时/报错）一律静默放行，后面的 adb 探测照旧失败照旧报，行为与以前一致。
+  let WAKE_LAST_OK_AT = 0;
+  function wakeMuMuV2(reason) {
+    const ic = cfg.socialV2?.image ?? {};
+    if (ic.wake === false) return;
+    const url = String(ic.wakeUrl ?? 'http://127.0.0.1:8790/ensure').trim();
+    if (!url) return;
+    // 45 秒内刚确认过在线就不必再等一次（高频截图不重复打管家）
+    if (Date.now() - WAKE_LAST_OK_AT < 45000) return;
+    const t0 = Date.now();
+    const timeoutSec = Number(ic.wakeTimeoutMs) > 0 ? Math.ceil(Number(ic.wakeTimeoutMs) / 1000) : 90;
+    try {
+      const out = execFileSync('curl.exe', ['-sS', '-m', String(timeoutSec), '-X', 'POST', url,
+        '-H', 'content-type: application/json', '-d', JSON.stringify({ reason })],
+      { timeout: (timeoutSec + 5) * 1000, encoding: 'utf8', windowsHide: true }).trim();
+      let parsed = null;
+      try { parsed = JSON.parse(out); } catch { /* 非 JSON 视为失败 */ }
+      if (parsed?.ok) {
+        WAKE_LAST_OK_AT = Date.now();
+        log(`[wake] MuMu 就绪 ${parsed.serial || ''}（${reason}，${Math.round((Date.now() - t0) / 1000)}s${parsed.launched ? '，本次新启动' : ''}）`);
+      } else {
+        log(`[wake] 管家回了不可用（${reason}）：${String(out).slice(0, 160)}`);
+      }
+    } catch (error) {
+      log(`[wake] 唤醒失败（${reason}）：${String(error?.stderr || error?.message || error).slice(0, 200)} —— 继续按原逻辑探测 adb`);
+    }
+  }
+
   function captureDeviceScreenshotV2() {
+    wakeMuMuV2('screenshot');
     const adbPath = adbPathV2();
     let lastError = '';
     let lastSerial = '';

@@ -1890,6 +1890,31 @@ function videoConfig() {
   return v && typeof v === 'object' ? v : {};
 }
 
+/**
+ * 请 mumu-butler（:8790）把 MuMu 拉起来（2026-10-26 起 MuMu 按需，闲置自动关机）。
+ * 地址走 config.socialV2.image.wakeUrl（默认 http://127.0.0.1:8790/ensure，空串=禁用）。
+ * 管家不在 / 超时 / 报错 一律静默放行 —— 后面的 adb 探测照旧，失败信息照旧。
+ */
+async function wakeMuMu(reason) {
+  const ic = readBridgeConfig()?.socialV2?.image ?? {};
+  if (ic.wake === false) return { ok: false, skipped: true };
+  const url = String(ic.wakeUrl ?? 'http://127.0.0.1:8790/ensure').trim();
+  if (!url) return { ok: false, skipped: true };
+  const timeoutMs = Number(ic.wakeTimeoutMs) > 0 ? Number(ic.wakeTimeoutMs) : 90000;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reason }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const data = await res.json().catch(() => null);
+    return data && typeof data === 'object' ? data : { ok: false };
+  } catch (error) {
+    return { ok: false, error: String(error?.message || error) };
+  }
+}
+
 function resolveLocal(p) {
   if (!p) return null;
   const abs = path.isAbsolute(p) ? p : path.resolve(ROOT, p);
@@ -2159,10 +2184,12 @@ server.tool(
         return { content: [{ type: 'text', text: '找不到这个视频文件：' + localPath }], isError: true };
       }
       const sizeMb = (fs.statSync(localPath).size / 1048576).toFixed(1);
+      const wake = await wakeMuMu('push-video');
       const adb = adbBin();
       const serial = pickSerial(adb);
       if (!serial) {
-        return { content: [{ type: 'text', text: '模拟器没连上（adb devices 是空的）。先确认 MuMu 开着，或者让主人跑一次一键启动。' }], isError: true };
+        const hint = wake?.ok ? '' : `（按需唤醒未成功：${wake?.error || wake?.skipped ? '管家没应答' : '状态不明'}）`;
+        return { content: [{ type: 'text', text: `模拟器没连上（adb devices 是空的）${hint}。再试一次，或者让主人跑一次一键启动。` }], isError: true };
       }
 
       const remoteDir = '/sdcard/Movies/qq/';
