@@ -166,6 +166,9 @@ const SAFE_PREFIXES = [
   'mcp__web-search-safe__',
   // 本地补：让 QQ 里的 agent 能操作 MuMu 那台安卓（截图/点击/滑动/启停 App）。
   'mcp__android__',
+  // 2026-10-26：Minecraft Numen 具身智能体（本机 8766，游戏没开时它的工具不存在）。
+  // 她要在 MC 里跟主人一起玩：这 9 个工具都是游戏内动作，不碰电脑文件/进程。
+  'mcp__numen__',
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，
