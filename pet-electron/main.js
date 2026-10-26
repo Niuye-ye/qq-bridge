@@ -1305,9 +1305,56 @@ ipcMain.on('pet:ui-rects', (_e, rects) => {
     .slice(0, 8);
 });
 
-// 2026-10-26：'pet:read-text' 已删（preload 里也一起删了）。它零调用方，却能从渲染层读
-// 任意本机文本文件（≤2MB，无路径夹取）；桌宠窗口一旦被注入就是一条本地文件读取通道。
-// 真要预览日记，按 resolveFsPath 那套「只放行 diary/ memory/」的写法重加。
+// 2026-10-26 晚：「今天的日记 / 长期记忆」预览用的读取通道。
+// 白天那次安全清理把 'pet:read-text' 整条删了（当时判定「零调用方」—— 错，调用方在
+// assets\pet\preview.html 里，不在 pet-electron\ 目录内，grep -r 这个目录是搜不到的），
+// 于是右键「今天的日记」「长期记忆」双双报 window.pet.readText is not a function。
+// 现在按白名单重加：只放行 diary\、memory\ 两个目录 + state\facts.json 这一个文件，
+// 大小 ≤2MB，路径先 realpath 再比，符号链接绕不过去。
+const PREVIEW_ROOT_DIRS = () => [DIARY_DIR, path.join(REPO_ROOT, 'memory')];
+const PREVIEW_EXACT_FILES = () => [FACTS_JSON];
+
+function resolvePreviewPath(p) {
+  const raw = String(p || '').trim();
+  if (!raw) return null;
+  if (raw.includes('\0')) return null;
+  let abs;
+  try { abs = fs.realpathSync(raw); } catch (_) { return null; }
+  let ok = PREVIEW_EXACT_FILES().some((x) => {
+    try { return fs.realpathSync(x) === abs; } catch (_) { return false; }
+  });
+  if (!ok) {
+    ok = PREVIEW_ROOT_DIRS().some((root) => {
+      let r;
+      try { r = fs.realpathSync(root); } catch (_) { r = path.resolve(root); }
+      const rel = path.relative(r, abs);
+      return !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+    });
+  }
+  return ok ? abs : null;
+}
+
+ipcMain.handle('pet:read-preview', async (_e, p) => {
+  const abs = resolvePreviewPath(p);
+  if (!abs) {
+    log('预览被拒（只放行 diary/ memory/ facts.json）', String(p));
+    return { ok: false, error: '只让看日记和记忆' };
+  }
+  try {
+    const st = await fs.promises.stat(abs);
+    if (!st.isFile()) return { ok: false, error: '不是文件' };
+    if (st.size > 2 * 1024 * 1024) return { ok: false, error: '文件太大（>2MB）' };
+    const text = await fs.promises.readFile(abs, 'utf8');
+    if (text.includes('\uFFFD') && /\.(json)$/i.test(abs)) {
+      // facts.json 永远是 UTF-8，出现替换字符只当提示，不拦
+      log('预览内容有乱码', path.basename(abs));
+    }
+    return { ok: true, name: path.basename(abs), bytes: Buffer.byteLength(text, 'utf8'), text };
+  } catch (e) {
+    log('预览读取失败', abs, e.message);
+    return { ok: false, error: e.message };
+  }
+});
 
 ipcMain.handle('pet:config', () => ({
   ...CONFIG,

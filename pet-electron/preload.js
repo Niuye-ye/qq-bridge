@@ -45,9 +45,9 @@ contextBridge.exposeInMainWorld('pet', {
   /** 启动时拿一次配置（尺寸、key、token 是否存在、位置） */
   config: () => ipcRenderer.invoke('pet:config'),
 
-  // 2026-10-26：readText 删掉了。它没有任何渲染层调用方，却把「读任意本机文本文件（≤2MB）」
-  // 暴露给窗口内容；一旦哪天渲染层被 XSS 或调试端口利用，就是一条静默的本地文件读取通道。
-  // 真需要预览时再按「只读 diary/、memory/」的夹取方式加回来。
+  /** 预览页（assets\pet\preview.html）读日记/长期记忆用。主进程侧白名单夹取：
+   *  只放行 diary\、memory\ 和 state\facts.json，≤2MB；越界直接回 {ok:false}。 */
+  readPreview: (p) => ipcRenderer.invoke('pet:read-preview', String(p ?? '')),
 
   /** 记住窗口位置 */
   savePos: (x, y) => ipcRenderer.invoke('pet:pos', { x, y }),

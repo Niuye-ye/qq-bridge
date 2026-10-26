@@ -106,7 +106,7 @@ async function load() {
   bodyEl.innerHTML = '<p class="tip">读着呢…</p>';
   if (!FILE) { bodyEl.innerHTML = '<p class="err">没给文件路径。</p>'; return; }
   let r;
-  try { r = await window.pet.readText(FILE); } catch (e) { r = { ok: false, error: e.message }; }
+  try { r = await window.pet.readPreview(FILE); } catch (e) { r = { ok: false, error: e.message }; }
   if (!r || !r.ok) {
     bodyEl.innerHTML = `<p class="err">打不开：${esc((r && r.error) || '未知错误')}</p>`;
     nameEl.textContent = FILE.split(/[\\/]/).pop();
