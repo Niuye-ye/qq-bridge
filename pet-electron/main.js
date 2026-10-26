@@ -1286,17 +1286,9 @@ ipcMain.on('pet:ui-rects', (_e, rects) => {
     .slice(0, 8);
 });
 
-ipcMain.handle('pet:read-text', (_e, p) => {
-  try {
-    const abs = path.resolve(String(p || ''));
-    const st = fs.statSync(abs);
-    if (!st.isFile()) return { ok: false, error: '不是一个文件' };
-    if (st.size > 2 * 1024 * 1024) return { ok: false, error: '文件太大 ' + (st.size / 1048576).toFixed(1) + 'MB' };
-    return { ok: true, path: abs, name: path.basename(abs), bytes: st.size, text: fs.readFileSync(abs, 'utf8') };
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-});
+// 2026-10-26：'pet:read-text' 已删（preload 里也一起删了）。它零调用方，却能从渲染层读
+// 任意本机文本文件（≤2MB，无路径夹取）；桌宠窗口一旦被注入就是一条本地文件读取通道。
+// 真要预览日记，按 resolveFsPath 那套「只放行 diary/ memory/」的写法重加。
 
 ipcMain.handle('pet:config', () => ({
   ...CONFIG,

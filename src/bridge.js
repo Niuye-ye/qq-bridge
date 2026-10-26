@@ -10,7 +10,7 @@ import os from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
 import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
@@ -2187,8 +2187,27 @@ async function main() {
   // 第一次用缓存串号；失败就清缓存重解析（含 adb connect 重连）再试一次。
   // 2026-10-26：MuMu 改成按需（mumu-butler :8790）。任何要碰设备的操作前，先请管家把模拟器拉起来。
   // 配置 socialV2.image.wakeUrl（默认 http://127.0.0.1:8790/ensure，空串=禁用）。
-  // 必须同步等（截图链路是 execFileSync 的同步函数），所以走 curl.exe（Win10+ 自带）。
-  // 管家不在（没起/超时/报错）一律静默放行，后面的 adb 探测照旧失败照旧报，行为与以前一致。
+  //
+  // 2026-10-26 二次修：原先用 execFileSync('curl.exe', ...)，两处硬伤 ——
+  //   ① curl.exe 是 Windows 10+ 专有，别人在 Linux/macOS 部署必然 ENOENT，被 catch 成一行日志，
+  //      等于「按需唤醒」这个功能在他们的机器上静默失效；
+  //   ② -m 默认 90 秒，而这是同步调用：最坏把整个事件循环按住 95 秒（所有会话、定时器、
+  //      事件流一起停），一轮 QQ 消息全卡住。
+  // 现在改成 spawnSync 一个最小 node 进程（node 一定存在，因为我们就跑在 node 里）发 HTTP，
+  // 默认 45 秒上限；冷启实测 12 秒，45 秒足够，真卡住也只按住 45 秒。
+  const WAKE_HELPER_SRC = [
+    "const http=require('http');",
+    "const raw=process.env.WAKE_URL||'';const body=process.env.WAKE_BODY||'{}';",
+    "const ms=Number(process.env.WAKE_MS||45000);",
+    "if(!raw){process.exit(3)}",
+    "const u=new URL(raw);",
+    "const req=http.request({hostname:u.hostname,port:u.port||80,path:u.pathname+(u.search||''),method:'POST',",
+    "  headers:{'content-type':'application/json','content-length':Buffer.byteLength(body)}},",
+    "  (res)=>{let d='';res.setEncoding('utf8');res.on('data',(c)=>{d+=c});res.on('end',()=>{process.stdout.write(d);process.exit(0)})});",
+    "req.on('error',(e)=>{process.stderr.write(String((e&&e.message)||e));process.exit(2)});",
+    "req.setTimeout(ms,()=>{req.destroy(new Error('wake timeout '+ms+'ms'))});",
+    "req.write(body);req.end();",
+  ].join('');
   let WAKE_LAST_OK_AT = 0;
   function wakeMuMuV2(reason) {
     const ic = cfg.socialV2?.image ?? {};
@@ -2198,11 +2217,19 @@ async function main() {
     // 45 秒内刚确认过在线就不必再等一次（高频截图不重复打管家）
     if (Date.now() - WAKE_LAST_OK_AT < 45000) return;
     const t0 = Date.now();
-    const timeoutSec = Number(ic.wakeTimeoutMs) > 0 ? Math.ceil(Number(ic.wakeTimeoutMs) / 1000) : 90;
+    const wakeMs = Number(ic.wakeTimeoutMs) > 0 ? Math.min(Number(ic.wakeTimeoutMs), 120000) : 45000;
+    let out = '';
     try {
-      const out = execFileSync('curl.exe', ['-sS', '-m', String(timeoutSec), '-X', 'POST', url,
-        '-H', 'content-type: application/json', '-d', JSON.stringify({ reason })],
-      { timeout: (timeoutSec + 5) * 1000, encoding: 'utf8', windowsHide: true }).trim();
+      const r = spawnSync(process.execPath, ['-e', WAKE_HELPER_SRC], {
+        timeout: wakeMs + 5000,
+        encoding: 'utf8',
+        windowsHide: true,
+        env: { ...process.env, WAKE_URL: url, WAKE_BODY: JSON.stringify({ reason }), WAKE_MS: String(wakeMs) },
+      });
+      out = String(r.stdout || '').trim();
+      if (r.status !== 0 && !out) {
+        throw new Error(String(r.stderr || '').trim() || ('wake helper exit ' + r.status));
+      }
       let parsed = null;
       try { parsed = JSON.parse(out); } catch { /* 非 JSON 视为失败 */ }
       if (parsed?.ok) {
@@ -9266,6 +9293,11 @@ async function main() {
     }
   }
 
+  // 2026-10-26 瘦身：状态文件有 51 处调用 saveSocialV2State()，绝大多数是「顺手存一下」，
+  // 内容其实一个字没变（定时器、轮询、读接口都会触发）。原来每次都 JSON.stringify(69KB) +
+  // 写临时文件 + rename，一天下来是几十万次无意义写盘。
+  // 现在记一份「上次写进去的文本」，一模一样就直接返回；只有真变了才落盘。
+  let SOCIAL_LAST_SAVED_TEXT = '';
   function saveSocialV2State() {
     try {
       const obj = { paused: socialV2.paused, turbo: socialV2.turbo || null, level: socialV2.level || null, conversations: Object.create(null) };
@@ -9295,7 +9327,10 @@ async function main() {
           deskMessages: Array.isArray(st.deskMessages) ? st.deskMessages.slice(-20) : []
         };
       }
+      const text = JSON.stringify(obj, null, 2) + '\n';
+      if (text === SOCIAL_LAST_SAVED_TEXT) return; // 内容没变，省掉一次 69KB 写盘
       atomicWriteJson(SOCIAL_V2_FILE, obj);
+      SOCIAL_LAST_SAVED_TEXT = text;
     } catch (error) {
       log('保存 socialV2 状态失败:', error?.message ?? error);
     }
@@ -11704,10 +11739,23 @@ ${turboNote}
     } catch { /* ignore */ }
     return ids;
   }
+  // 2026-10-26 瘦身：这个函数被 /api/socialV2/turbo 与桌宠状态轮询调用（约 9 秒一次），
+  // 每次都把整份 cost-meter ledger（几十 MB 级别，只增不减）读进来 JSON.parse 一遍 ——
+  // 一天就是八千多次全量解析，白白吃 CPU。改成「文件 mtime + 大小没变就用上次解析结果」。
+  let COST_LEDGER_CACHE = { mtimeMs: -1, size: -1, data: null };
+  function readCostLedgerCached(ledgerPath) {
+    const st = fs.statSync(ledgerPath);
+    if (st.mtimeMs === COST_LEDGER_CACHE.mtimeMs && st.size === COST_LEDGER_CACHE.size && COST_LEDGER_CACHE.data) {
+      return COST_LEDGER_CACHE.data;
+    }
+    const data = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+    COST_LEDGER_CACHE = { mtimeMs: st.mtimeMs, size: st.size, data };
+    return data;
+  }
   function readQqCostCnyV2() {
     try {
       const ledgerPath = path.join(os.homedir(), ".dsh", "storages", "cost-meter", "ledger.json");
-      const ledger = JSON.parse(fs.readFileSync(ledgerPath, "utf8"));
+      const ledger = readCostLedgerCached(ledgerPath);
       const days = ledger && ledger.days ? ledger.days : {};
       const nowD = new Date();
       const today = nowD.getFullYear() + "-" + String(nowD.getMonth() + 1).padStart(2, "0") + "-" + String(nowD.getDate()).padStart(2, "0");
@@ -11801,7 +11849,7 @@ ${turboNote}
     // 只影响这一次的定时器，不写回 wakeConfig —— 白天恢复她自己设的间隔。
     // 超活跃模式不放慢：主人就是要她整夜一直在。
     const hourNow = new Date().getHours();
-    if (!turboOn && hourNow >= 0 && hourNow < 7) mins = Math.max(mins, 60);
+    if (!turboOn && hourNow < 7) mins = Math.max(mins, 60);
     if (!isSessionAllowedInCurrentMode(key)) return;
     const delay = Math.max(60 * 1000, Math.min(24 * 60, mins) * 60 * 1000);
     st.intervalTimer = setTimeout(() => {
@@ -11887,6 +11935,16 @@ ${turboNote}
     if (st.rateLimitRetryTimer) {
       clearTimeout(st.rateLimitRetryTimer);
       st.rateLimitRetryTimer = null;
+    }
+    // 2026-10-26：原先漏清这两个 —— 孤儿定时器会把已删会话重建、发新 agentToken、
+    // 照常唤醒（唯一「不改就一直烧钱」的那个 bug）。
+    if (st.intervalTimer) {
+      clearTimeout(st.intervalTimer);
+      st.intervalTimer = null;
+    }
+    if (st.roundWatchdogTimer) {
+      clearTimeout(st.roundWatchdogTimer);
+      st.roundWatchdogTimer = null;
     }
     if (Array.isArray(st.pendingWakeReasons)) st.pendingWakeReasons.length = 0;
   }

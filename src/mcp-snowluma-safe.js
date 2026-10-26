@@ -320,9 +320,24 @@ function resolveAgentToken(key) {
   }
 }
 const registerTool = server.tool.bind(server);
+// 2026-10-26 修：原先只按 args.key 取令牌，而 qq_send_group_message / qq_reply /
+// qq_send_private_message / qq_send_burst 这四个工具的 schema 里根本没有 key（用 groupId /
+// userId 寻址）。于是 resolveAgentToken(undefined) = ''，token 恒为空 → 桥接把这几个请求
+// 当成「没带会话令牌的裸调用」一律 403。日志里一直安静的 0 次，是因为模型改用 qq_send_message
+// 绕开了它们（那条走 key）。这里统一把寻址参数折成会话 key。
+function sessionKeyOfArgs(args) {
+  if (!args || typeof args !== 'object') return '';
+  const direct = String(args.key ?? '').trim();
+  if (direct) return direct;
+  const group = args.groupId ?? args.group_id ?? args.group;
+  if (group !== undefined && group !== null && String(group).trim() !== '') return 'group:' + String(group).trim();
+  const priv = args.userId ?? args.user_id ?? args.qq;
+  if (priv !== undefined && priv !== null && String(priv).trim() !== '') return 'private:' + String(priv).trim();
+  return '';
+}
 server.tool = (name, description, shape, handler) => {
   if (shape && typeof shape === 'object') delete shape.token;
-  const wrapped = (args, extra) => handler({ ...args, token: resolveAgentToken(args?.key) }, extra);
+  const wrapped = (args, extra) => handler({ ...args, token: resolveAgentToken(sessionKeyOfArgs(args)) }, extra);
   return registerTool(name, description, shape, wrapped);
 };
 
@@ -2168,7 +2183,9 @@ server.tool(
     try {
       let localPath = null;
       if (givenPath) {
-        localPath = path.isAbsolute(givenPath) ? givenPath : path.resolve(ROOT, givenPath);
+        const resolved = resolvePushPath(givenPath);
+        if (resolved.error) return { content: [{ type: 'text', text: resolved.error }], isError: true };
+        localPath = resolved.path;
       } else if (id) {
         localPath = path.join(VIDEO_DIR, String(id).trim() + '.mp4');
       } else if (fs.existsSync(VIDEO_DIR)) {
@@ -2285,6 +2302,38 @@ function safeRelName(name) {
   const parts = s.split('/').filter(Boolean);
   if (!parts.length) return null;
   return parts.join('/');
+}
+
+/**
+ * qq_push_video 的路径夹取（2026-10-26）。
+ * 以前 `path` 零校验：任意本机文本/密钥文件（config.json 的 token、state\console-token、
+ * .credentials.yaml）都能被 push 进模拟器 /sdcard/Movies/qq/，再由相册或文件管理器读出来 ——
+ * 等于把 MCP 变成一条任意文件外带通道。只放行我们自己产出的那三个目录。
+ */
+function pushRoots() {
+  return [VIDEO_DIR, path.join(ROOT, 'state', 'code-jobs'), path.join(ROOT, 'state', 'draw')];
+}
+function resolvePushPath(rawPath) {
+  const raw = String(rawPath || '').trim();
+  if (!raw) return { error: '路径是空的' };
+  const abs = path.resolve(path.isAbsolute(raw) ? raw : path.join(ROOT, raw));
+  let real;
+  try {
+    real = fs.realpathSync(abs);
+  } catch {
+    return { error: '文件不存在：' + abs };
+  }
+  const ok = pushRoots().some((root) => {
+    let r = root;
+    try { r = fs.realpathSync(root); } catch { /* 目录还没建也算它的前缀 */ }
+    const withSep = r.endsWith(path.sep) ? r : r + path.sep;
+    return real === r || real.startsWith(withSep);
+  });
+  if (!ok) return { error: '只允许推 videos、state\\code-jobs、state\\draw 下的文件：' + real };
+  if (!/\.(mp4|mov|m4v|mkv|webm|png|jpg|jpeg|gif)$/i.test(real)) {
+    return { error: '只允许视频/图片文件：' + path.basename(real) };
+  }
+  return { path: real };
 }
 
 server.tool(
@@ -2816,193 +2865,24 @@ server.tool(
   }
 );
 
-// ---------- 图生视频（Wan2.2 TI2V-5B，2026-10-25） ----------
-// 她画了图想让它动起来：一张起始图 + 一句提示词 -> mp4（2 秒左右）。
-// ComfyUI 那套 12 个节点她看不见也没法调，这里全包掉。产出落 state/animate/<id>/。
-const ANIM_ROOT = path.join(ROOT, 'state', 'animate');
-const ANIM_TIMEOUT_DEFAULT = 900;
-const ANIM_TIMEOUT_MAX = 1800;
-const ANIM_UNET = 'wan2.2_ti2v_5B_fp16.safetensors';
-const ANIM_CLIP = 'umt5_xxl_fp8_e4m3fn_scaled.safetensors';
-const ANIM_VAE = 'wan2.2_vae.safetensors';
-const ANIM_NEG_DEFAULT = 'blurry, low quality, distorted, watermark, text, jitter, flicker, static, frozen frame';
-// 2026-10-25：Wan2.2 视频模型已被主人删掉腾空间，只留 Z-Image 生图。
-// 缺失时下面 handler 直接给可操作的回执，别让她撞一堵 ComfyUI 的英文报错。
-function animMissingModels() {
-  const dir = String(readBridgeConfig()?.comfyui?.dir || process.env.PET_COMFYUI_DIR || '').trim();
-  if (!dir) return [];
-  const root = path.join(dir, 'ComfyUI', 'models');
-  const need = [['diffusion_models', ANIM_UNET], ['text_encoders', ANIM_CLIP], ['vae', ANIM_VAE]];
-  return need.filter(([sub, f]) => !fs.existsSync(path.join(root, sub, f))).map(([sub, f]) => sub + '/' + f);
-}
-
-function roundTo16(n, fb, lo, hi) {
-  const v = Number(n);
-  if (!Number.isFinite(v) || v <= 0) return fb;
-  return Math.min(hi, Math.max(lo, Math.round(v / 16) * 16));
-}
-
-// WanImageToVideo 要求 length = 4n + 1
-function roundFrames(n, fb) {
-  const v = Number(n);
-  const base = Number.isFinite(v) && v > 0 ? v : fb;
-  const r = Math.round((base - 1) / 4) * 4 + 1;
-  return Math.min(121, Math.max(17, r));
-}
-
-function buildWanI2VWorkflow(o) {
-  return {
-    '1': { class_type: 'UNETLoader', inputs: { unet_name: ANIM_UNET, weight_dtype: 'default' } },
-    '2': { class_type: 'ModelSamplingSD3', inputs: { model: ['1', 0], shift: 8 } },
-    '3': { class_type: 'CLIPLoader', inputs: { clip_name: ANIM_CLIP, type: 'wan' } },
-    '4': { class_type: 'CLIPTextEncode', inputs: { clip: ['3', 0], text: o.prompt } },
-    '5': { class_type: 'CLIPTextEncode', inputs: { clip: ['3', 0], text: o.negative } },
-    '6': { class_type: 'VAELoader', inputs: { vae_name: ANIM_VAE } },
-    '7': { class_type: 'LoadImage', inputs: { image: o.imageName } },
-    '8': {
-      class_type: 'WanImageToVideo',
-      inputs: {
-        positive: ['4', 0], negative: ['5', 0], vae: ['6', 0],
-        width: o.width, height: o.height, length: o.length, batch_size: 1, start_image: ['7', 0],
-      },
-    },
-    '9': {
-      class_type: 'KSampler',
-      inputs: {
-        model: ['2', 0], seed: o.seed, steps: o.steps, cfg: o.cfg,
-        sampler_name: 'euler', scheduler: 'simple',
-        positive: ['8', 0], negative: ['8', 1], latent_image: ['8', 2], denoise: 1,
-      },
-    },
-    '10': {
-      class_type: 'VAEDecodeTiled',
-      inputs: { samples: ['9', 0], vae: ['6', 0], tile_size: 256, overlap: 64, temporal_size: 16, temporal_overlap: 4 },
-    },
-    '11': { class_type: 'CreateVideo', inputs: { images: ['10', 0], fps: o.fps } },
-    '12': { class_type: 'SaveVideo', inputs: { video: ['11', 0], filename_prefix: o.prefix, format: 'mp4' } },
-  };
-}
-
-// 起始图要先塞进 ComfyUI 的 input 目录，走官方 /upload/image 传（不依赖它装在哪）
-async function comfyUploadImage(absPath) {
-  const bytes = fs.readFileSync(absPath);
-  const ext = (path.extname(absPath) || '.png').toLowerCase();
-  const name = 'anim_in_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5) + ext;
-  const fd = new FormData();
-  fd.append('image', new Blob([bytes]), name);
-  fd.append('overwrite', 'true');
-  fd.append('type', 'input');
-  const { res, buf } = await comfyFetch(comfyBase() + '/upload/image', { method: 'POST', body: fd });
-  const txt = buf.toString('utf8');
-  if (!res.ok) throw new Error('传起始图失败 HTTP ' + res.status + '：' + txt.slice(0, 200));
-  let j = null;
-  try { j = JSON.parse(txt); } catch { /* ignore */ }
-  const saved = j?.name || name;
-  const sub = j?.subfolder ? j.subfolder + '/' : '';
-  return sub + saved;
-}
-
-function animCollectFiles(entry) {
-  const files = [];
-  for (const nodeOut of Object.values(entry.outputs || {})) {
-    for (const key of ['images', 'videos', 'gifs']) {
-      for (const it of (nodeOut?.[key] || [])) {
-        if (!it?.filename) continue;
-        files.push({ filename: it.filename, subfolder: it.subfolder || '', type: it.type || 'output' });
-      }
-    }
-  }
-  return files;
-}
-
+// ---------- 图生视频（2026-10-26 瘦身：模型已卸载，只留一个回执桩） ----------
+// 2026-10-25 主人删掉 Wan2.2 三件套腾空间，只留 Z-Image 生图。原来这里的 170 行
+// （workflow 组装 / 上传起始图 / 轮询 / 下载）永远不会被执行，但那段超长 schema 每轮都会
+// 随工具清单发给模型 —— 白烧 token。这里只留工具名（她的提示词里还写着它）+ 一句可操作的回执。
 server.tool(
   'qq_animate_image',
-  '让一张图动起来：给一张起始图和一句描述，用 Wan2.2 生成 2 秒左右的小视频（mp4）。做片头/转场/让插画动一下时用它，产出落在 state/animate/<id>/ 并返回绝对路径。速度：704x480、49 帧、20 步约 7 分钟；竖屏 480x704 差不多；帧数减到 33 或步数降到 15 能快三分之一。提示词务必把起始图的场景一起描述（主体+环境+动作），只写动作会让模型自己换场景。别一次做很多条。',
+  '（当前不可用）本机已卸载图生视频模型；调用只会收到替代方案：用 qq_make_video 的 image 段做动态画面。',
   {
-    image: z.string().describe('起始图的绝对路径（qq_draw_image 给的路径、或主人发来的图都行），png/jpg/webp'),
-    prompt: z.string().describe('画面怎么动。必须写全三样：①起始图里那个主体（是什么材质/什么东西）②它在什么环境背景里 ③动作。示例：a blue whale plush toy on a wooden shelf slowly raises its head and blinks, its fin lifting gently, warm afternoon light, gentle camera push in。⚠️ 实测教训：把“它在哪”省掉，模型会把玩偶直接扔进真实大海、连场景都换掉——环境描半句都不能少'),
-    negative: z.string().optional().describe('不想要的效果，默认排掉糊/水印/文字/抖动/闪烁/定格'),
-    width: z.number().optional().describe('宽，默认 704（竖屏图给 480），按 16 对齐'),
-    height: z.number().optional().describe('高，默认 480（竖屏图给 704）'),
-    length: z.number().optional().describe('帧数，默认 49（约 2 秒 @24fps），会按 4n+1 取整，上限 121'),
-    steps: z.number().optional().describe('步数，默认 20；15 快 25%，24 更顺但慢'),
-    cfg: z.number().optional().describe('提示词强度，默认 5'),
-    fps: z.number().optional().describe('帧率，默认 24'),
-    seed: z.number().optional().describe('种子；不填随机。想重做同一条就用上次的 seed'),
-    timeoutSec: z.number().optional().describe('最多等多少秒，默认 900，上限 1800'),
+    image: z.string().optional().describe('起始图绝对路径（本机没装模型，此参数现在不起作用）'),
+    prompt: z.string().optional().describe('动作描述（本机没装模型，此参数现在不起作用）'),
   },
-  async ({ image, prompt, negative, width, height, length, steps, cfg, fps, seed, timeoutSec }) => {
-    const miss = animMissingModels();
-    if (miss.length) {
-      return {
-        content: [{ type: 'text', text: '本机没装图生视频模型，跑不了这条（缺 ' + miss.join('、') + '）。Wan2.2 那三个文件 2026-10-25 已经被主人删掉腾空间了，现在只留 Z-Image 生图。要做动态画面可以：① 用 qq_make_video 的 { kind:"image", src:"<绝对路径>" } 段，静态图会自动缓慢推近 + 淡入，做成片比微动视频干净；② 用 qq_draw_image 多画几张同风格图，再用 image 段串起来。' }],
-        isError: true,
-      };
-    }
-    const guard = await startMemGuard(memMinGB('animate', 2.5), '图生视频');
-    try {
-      const imgPath = String(image ?? '').trim().replace(/^"+|"+$/g, '');
-      if (!imgPath) return { content: [{ type: 'text', text: '得给一张起始图的绝对路径。' }], isError: true };
-      const abs = path.resolve(imgPath);
-      if (!fs.existsSync(abs)) return { content: [{ type: 'text', text: '找不到这张图：' + abs }], isError: true };
-      const ext = path.extname(abs).toLowerCase();
-      if (!['.png', '.jpg', '.jpeg', '.webp'].includes(ext)) {
-        return { content: [{ type: 'text', text: '起始图得是 png/jpg/webp，这个是 ' + (ext || '无扩展名') + '。' }], isError: true };
-      }
-      const text = String(prompt ?? '').trim();
-      if (!text) return { content: [{ type: 'text', text: '得说它怎么动，不然只能一动不动。' }], isError: true };
-
-      const t0 = Date.now();
-      const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-      const dir = path.join(ANIM_ROOT, id);
-      fs.mkdirSync(dir, { recursive: true });
-      const wait = Math.min(ANIM_TIMEOUT_MAX, Math.max(60, Number(timeoutSec) || ANIM_TIMEOUT_DEFAULT));
-      const o = {
-        prompt: text,
-        negative: String(negative ?? '').trim() || ANIM_NEG_DEFAULT,
-        width: roundTo16(width, 704, 256, 1280),
-        height: roundTo16(height, 480, 256, 1280),
-        length: roundFrames(length, 49),
-        steps: Math.min(40, Math.max(6, Math.round(Number(steps) || 20))),
-        cfg: Math.min(12, Math.max(1, Number(cfg) || 5)),
-        fps: Math.min(30, Math.max(8, Math.round(Number(fps) || 24))),
-        seed: Number.isFinite(Number(seed)) && Number(seed) > 0 ? Math.floor(Number(seed)) : Math.floor(Math.random() * 1e9),
-        prefix: 'anim_' + id,
-      };
-      o.imageName = await comfyUploadImage(abs);
-      const promptId = await comfySubmit(buildWanI2VWorkflow(o));
-      const entry = await comfyWaitDone(promptId, wait);
-      const files = animCollectFiles(entry);
-      const vids = files.filter((f) => /\.(mp4|webm|gif)$/i.test(f.filename));
-      if (!vids.length) throw new Error('跑完了但没拿到视频文件（SaveVideo 没输出？）');
-      const saved = [];
-      for (const f of vids) {
-        const buf = await comfyDownload(f);
-        const name = path.basename(f.filename) || (id + '.mp4');
-        const outAbs = path.join(dir, name);
-        fs.writeFileSync(outAbs, buf);
-        saved.push({ abs: outAbs, bytes: buf.length });
-      }
-      const secs = Math.round((Date.now() - t0) / 1000);
-      const dur = (o.length / o.fps).toFixed(1);
-      const lines = [
-        '动起来了：' + saved.length + ' 条，' + o.width + 'x' + o.height + '，' + o.length + ' 帧 / ' + dur + ' 秒 / ' + o.fps + 'fps，' + o.steps + ' 步，用了 ' + secs + ' 秒。',
-        'seed ' + o.seed + '（想重做同一条就带上它，再改 prompt）。',
-        '目录 ' + dir,
-        ...saved.map((s) => '  ' + s.abs),
-        '',
-        '怎么用：',
-        '- 推去手机：qq_push_video path=<上面那个绝对路径>',
-        '- 想先自己看：目录里的 mp4 直接播',
-        '- 动作太小就加具体动作词（抬头/眨眼/尾巴摆/镜头推进），或把 steps 提到 24',
-      ];
-      return { content: [{ type: 'text', text: lines.join('\n') }] };
-    } catch (error) {
-      return { content: [{ type: 'text', text: '动不起来：' + (error?.message ?? error) }], isError: true };
-    } finally {
-      guard.finish();
-    }
-  }
+  async () => ({
+    content: [{
+      type: 'text',
+      text: '本机没装图生视频模型（Wan2.2 三件套 2026-10-25 已删，只留 Z-Image 生图），这条跑不了。要做动态画面：① 用 qq_make_video 的 { kind:"image", src:"<绝对路径>" } 段，静态图会自动缓慢推近 + 淡入，做成片比微动视频干净；② 用 qq_draw_image 多画几张同风格图，再用 image 段串起来。',
+    }],
+    isError: true,
+  })
 );
 
 await server.connect(new StdioServerTransport());
