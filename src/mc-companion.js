@@ -155,6 +155,23 @@ async function callTool(ctx, name, args, timeoutMs) {
 }
 
 /**
+ * 她的身体现在能不能跑新程序？
+ * lua 在同一只同伴上是串行的：上一条程序没结束时，新的会直接被拒
+ * （"a program is already running for this companion"）。这里用一个空程序探一下，
+ * 免得叫醒她、花掉一轮 token，最后只换来这句报错。
+ * 探不动（网络抖/服务刚重启）时按「不忙」处理 —— 宁可试一次，也不要把她的消息无限攒着。
+ */
+async function bodyBusy(ctx) {
+  try {
+    await callTool(ctx, 'lua', { companion: ctx.companion, code: 'return 1' }, 8000);
+    return false;
+  } catch (e) {
+    const m = String(e?.message ?? e);
+    return /already running|already in progress|built-in brain/i.test(m);
+  }
+}
+
+/**
  * 世界里没有她时自己召唤一个。
  * 为什么需要：Numen 的同伴是**按世界存档**存在世界里的实体，主人换地图 / 开新世界后
  * 她就消失了（面板里也看不到），必须重新 create_companion 才会出现。
@@ -247,10 +264,23 @@ async function loop(ctx) {
           ctx.log(`[mc] 游戏里收到 ${added} 条消息（队列 ${QUEUE.length}）`);
           const now = Date.now();
           if (now - ctx.lastWakeAt > ctx.cooldownMs) {
-            ctx.lastWakeAt = now;
-            try { await ctx.onQuery(); } catch (e) { ctx.log(`[mc] 唤醒失败：${e?.message ?? e}`); }
+            // 先探一下她的身体是不是空着：previous 的 lua 没结束的话，叫醒她也是白花一轮钱
+            // （2026-10-27 实测：身体被占时每次唤醒都只换来一句 already running）
+            if (await bodyBusy(ctx)) {
+              ctx.log('[mc] 她身上还有个程序没结束（游戏内需要点一下「停止」），这几句先攒着');
+            } else {
+              ctx.lastWakeAt = now;
+              try { await ctx.onQuery(); } catch (e) { ctx.log(`[mc] 唤醒失败：${e?.message ?? e}`); }
+            }
           } else {
             ctx.log('[mc] 冷却中，攒着下一轮再叫');
+          }
+        } else if (QUEUE.length > 0 && Date.now() - ctx.lastWakeAt > ctx.cooldownMs) {
+          // 攒着的话没人喊她：身体一空出来就把积压的投出去（她去干活时不看新消息，也不会自己醒）
+          if (!(await bodyBusy(ctx))) {   // 还占着就下一轮再看，不 return（别把这一轮的清理/退避逻辑一起跳掉）
+            ctx.lastWakeAt = Date.now();
+            ctx.log(`[mc] 身体空了，把攒着的 ${QUEUE.length} 句话交给她`);
+            try { await ctx.onQuery(); } catch (e) { ctx.log(`[mc] 补投失败：${e?.message ?? e}`); }
           }
         }
       }

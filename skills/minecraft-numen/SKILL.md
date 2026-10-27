@@ -92,6 +92,22 @@ dragon_combat end_game_overview blaze_rods world_atlas`
 
 另外：单个同伴**同时只能跑一个 lua 程序**；一次调用最长 300 秒（`call_timeout_seconds`），别写死循环。
 
+### 4.1 别开「长任务」，否则你就永远站那儿不动了（2026-10-27 实测）
+
+这一晚她卡了两次，都是同一个原因：起了**跑不完的程序**，之后每次 `lua` 都被拒
+（`a program is already running for this companion`）——人看着就是「她站在那儿一动不动」，话也不回。
+`numen.move.follow(...)`、长距离 `route.plan`、`numen.time.wait(很久)` 都属于这一类。
+
+**硬规矩**
+
+- 走路用**一次一段**的 `numen.move.to(...)`（或短 `route.plan` + `move.go`），每段 ≤ 5 秒能走完的距离；
+  一段没走到就再发一段，**不要**用 `follow` 常驻跟随。
+- 一次 `lua` 里的动作 ≤ 3 个，别在程序里写 `while true` / 递归等待。
+- 每隔几步就返回一次状态（`return {dist=..., pos=...}`），让宿主能看到你在动。
+- 万一还是卡住了：主人可以在游戏内的 MCP 提示条上点**「停止」**（`numen.task.stop`），
+  或者你让主人删掉同伴重召一次 —— 后者会清空背包。
+
+
 ## 5. 记住这个世界的几件事
 
 ```
