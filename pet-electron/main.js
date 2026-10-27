@@ -5,8 +5,8 @@ const {
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const net = require('net');
 const { spawn, execFile } = require('child_process');
+const { createBridgeClient } = require('./lib/bridge-client');
 
 // ────────────────────────────── 省内存开关 ──────────────────────────────
 // 桌宠是常驻程序：四个进程（main / gpu / utility / renderer）合计 455MB 太胖。
@@ -191,7 +191,7 @@ let dragging = false;
 let chatOpen = false;   // 桌面聊天框开着时不要主动插嘴
 let quitRequested = false;
 let uiRects = [];    // 渲染进程上报的、需要吃鼠标的 UI 矩形
-let consoleToken = '';
+// consoleToken 已收进 lib/bridge-client.js（readToken 有状态，读 token 走 bridge.token）
 let bridgeState = null;
 let turboState = null;   // 超活跃模式状态（/api/socialV2/turbo 的快照，9 秒刷一次）
 // 2026-10-27：玩游戏模式（玩 MC 时只听游戏里的），同样 9 秒刷一次
@@ -725,50 +725,18 @@ function todayDiary() {
 }
 
 // ────────────────────────────── 桥 ──────────────────────────────
-function readToken() {
-  try { consoleToken = fs.readFileSync(TOKEN_FILE, 'utf8').trim(); } catch (_) {}
-  if (!consoleToken) {
-    try { consoleToken = String(JSON.parse(fs.readFileSync(BRIDGE_CFG, 'utf8')).consoleToken || '').trim(); } catch (_) {}
-  }
-  log('token', consoleToken ? '已读到(' + consoleToken.slice(0, 6) + '…)' : '没读到');
-}
-
-async function getJson(p, opt) {
-  const r = await fetch(BRIDGE + p, {
-    ...(opt || {}),
-    signal: AbortSignal.timeout(3500),
-    headers: { 'x-console-token': consoleToken, ...((opt && opt.headers) || {}) },
-  });
-  return r.json();
-}
-async function postJson(p, body) {
-  return getJson(p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-}
-
-function probePort(port, timeout = 400) {
-  return new Promise((resolve) => {
-    const s = net.connect({ host: '127.0.0.1', port });
-    let done = false;
-    const fin = (v) => { if (done) return; done = true; try { s.destroy(); } catch (_) {} resolve(v); };
-    s.setTimeout(timeout, () => fin(false));
-    s.on('connect', () => fin(true));
-    s.on('error', () => fin(false));
-  });
-}
-
-const p2 = (n) => String(n).padStart(2, '0');
-function clock(ms) {
-  if (!ms) return '';
-  const d = new Date(ms);
-  return `${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
-}
-
-function markQuit() {
-  try { fs.writeFileSync(QUIT_MARK, String(Date.now())); } catch (_) {}
-}
-function clearQuit() {
-  try { fs.unlinkSync(QUIT_MARK); } catch (_) {}
-}
+// 2026-10-27 整块搬到 lib/bridge-client.js（交接文档第 4 项第一块）：readToken / getJson /
+// postJson / probePort / clock / markQuit / clearQuit 都是纯 fs+net+fetch，不碰 electron。
+// 名字原地解构出来，下面 30 多个调用点一个没改；token 用 client.token 读（readToken 有状态，
+// 别在外面缓存旧值）。
+const bridge = createBridgeClient({
+  bridgeUrl: BRIDGE,
+  tokenFile: TOKEN_FILE,
+  bridgeCfg: BRIDGE_CFG,
+  quitMark: QUIT_MARK,
+  log,
+});
+const { readToken, getJson, postJson, probePort, clock, markQuit, clearQuit } = bridge;
 
 let pollRound = 0;
 let pollBusy = false;
@@ -956,7 +924,7 @@ function popupMenu() {
       submenu: [
         { label: '看链路状态', click: showLinkStatus },
         ...(ONECLICK ? [{ label: oneClickBusy ? '一键修复 · 启动（运行中…）' : '一键修复 · 启动', click: runOneClick }] : []),
-        { label: '打开桥控制台', click: () => openPath(`${BRIDGE}/?token=${encodeURIComponent(consoleToken)}`) },
+        { label: '打开桥控制台', click: () => openPath(`${BRIDGE}/?token=${encodeURIComponent(bridge.token)}`) },
         { type: 'separator' },
         { label: '打开桌宠日志', click: () => openPath(APP_LOG) },
       ],
