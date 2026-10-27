@@ -147,6 +147,10 @@ async function loop(ctx) {
         method: 'tools/call',
         params: { name: 'get_events', arguments: { companion: ctx.companion, wait_seconds: ctx.waitSeconds } },
       }, ctx.waitSeconds * 1000 + 20000);
+      if (ctx.fails > 0) {
+        ctx.log(`[mc] 连上了（之前失败 ${ctx.fails} 次），继续轮询`);
+        ctx.fails = 0;
+      }
       const text = extractText(res);
       if (text) {
         // 只认 <query>…</query>：那是主人在游戏里说的话。
@@ -167,9 +171,15 @@ async function loop(ctx) {
       }
     } catch (e) {
       ctx.ready = false;
-      ctx.log(`[mc] 轮询出错：${e?.message ?? e}（${ctx.backoffMs}ms 后重试）`);
+      ctx.fails = (ctx.fails || 0) + 1;
+      // 游戏没开时这条路每 5 秒就 ECONNREFUSED 一次，一天两万行日志没意义。
+      // 失败越多等越久（5s→10s→…→60s），只在第 1 次和每 20 次打一行。
+      const wait = Math.min(60000, ctx.backoffMs * ctx.fails);
+      if (ctx.fails === 1 || ctx.fails % 20 === 0) {
+        ctx.log(`[mc] 轮询出错：${e?.message ?? e}（之后每 ${wait}ms 试一次，连上会自动恢复）`);
+      }
       if (ctx.stopped) break;
-      await sleep(ctx.backoffMs);
+      await sleep(wait);
       continue;
     }
     if (ctx.stopped) break;
@@ -210,6 +220,7 @@ export function startMcWatcher(opts) {
     cooldownMs: Math.max(0, Number(opts.cooldownMs) || 15000),
     backoffMs: Math.max(1000, Number(opts.backoffMs) || 5000),
     lastWakeAt: 0,
+    fails: 0,
   };
   if (!ctx.companion) {
     ctx.log('[mc] 没配置同伴名（socialV2.mc.companion），轮询不启动');
