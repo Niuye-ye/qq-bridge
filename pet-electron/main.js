@@ -194,6 +194,8 @@ let uiRects = [];    // 渲染进程上报的、需要吃鼠标的 UI 矩形
 let consoleToken = '';
 let bridgeState = null;
 let turboState = null;   // 超活跃模式状态（/api/socialV2/turbo 的快照，9 秒刷一次）
+// 2026-10-27：玩游戏模式（玩 MC 时只听游戏里的），同样 9 秒刷一次
+let mcModeState = null;
 // 2026-10-27：去掉「一直玩到我说停（10 小时）」后，时长一律由「让她去玩会儿」选，
 // 这里不再需要固定的 10 小时默认值。
 // 让她去玩一会儿：时长由这里给（hours），间隔由活跃度档位决定
@@ -757,6 +759,7 @@ async function pollBridge() {
     doing: '', note: '', plan: '', activityAt: 0,
     lastLine: '', lastLineAt: 0,
     turbo: turboState,
+    mcMode: mcModeState,
     links: (bridgeState && bridgeState.links) || { sluma: null, web: null, bridge: null },
   };
 
@@ -792,10 +795,13 @@ async function pollBridge() {
     try {
       const t = await getJson('/api/socialV2/turbo');
       if (t && t.ok) s.turbo = t;
+      const mc = await getJson('/api/socialV2/mc-mode');
+      if (mc && mc.ok) s.mcMode = mc;
     } catch (_) {}
   }
 
   turboState = s.turbo || null;
+  mcModeState = s.mcMode || null;
   const prev = bridgeState;
   bridgeState = s;
   const changed = !prev || safeStr(prev) !== safeStr(s);
@@ -868,6 +874,12 @@ function popupMenu() {
             ? `她今天花了 ¥${st.turbo.costTodayCny.toFixed(2)}`
             : '她今天花了（统计不到）',
           enabled: false,
+        },
+        {
+          label: (st.mcMode && st.mcMode.on)
+            ? '玩游戏模式：开着（只听游戏里的）· 点这里关'
+            : '玩游戏模式：陪主人玩 MC 时不被别的事打断',
+          click: () => toggleMcMode(),
         },
         { label: st.paused ? '恢复她的自主时间' : '暂停她的自主时间', click: () => togglePause() },
         { label: readPetState().noAnim ? '恢复动画' : '暂停动画', click: () => toggleAnim() },
@@ -1129,6 +1141,20 @@ async function toggleTurbo() {
     win?.webContents.send('pet:ui', { t: 'bubble', text: last ? `停了。${last}` : '停了，我先歇会儿' });
     await pollBridge();
   } catch (e) { log('超活跃模式切换失败', e.message); }
+}
+
+// 玩游戏模式开关（2026-10-27）：开了之后除了 MC 里主人说的话，其它唤醒全跳过。
+async function toggleMcMode() {
+  const on = !!(mcModeState && mcModeState.on);
+  try {
+    const r = await postJson('/api/socialV2/mc-mode', { on: !on });
+    log('玩游戏模式 →', on ? '关' : '开', safeStr(r));
+    win?.webContents.send('pet:ui', {
+      t: 'bubble',
+      text: on ? '好，我回来了' : '玩去了，游戏里说话我就来',
+    });
+    await pollBridge();
+  } catch (e) { log('玩游戏模式切换失败', e.message); }
 }
 
 // 动画开关：只停渲染层的动作（呼吸/走路/待机），不影响她的自主时间

@@ -165,7 +165,8 @@ async function ensureCompanion(ctx) {
   }
   try {
     const live = await callTool(ctx, 'list_companions', {}, 15000);
-    if (!/No companions are live/i.test(live) && live.trim()) return true; // 已经在
+    const here = new RegExp(`(^|[^A-Za-z0-9_])${ctx.companion}([^A-Za-z0-9_]|$)`, 'i').test(live);
+    if (!looksMissingCompanion(live) && here) return true; // 她已经在世界里了
     ctx.log('[mc] 世界里没有她（换地图/新世界），自动召唤');
     await callTool(ctx, 'create_companion', { name: ctx.companion }, 20000);
     await sleep(3000);
@@ -173,14 +174,19 @@ async function ensureCompanion(ctx) {
       // 新召唤出来的身体是默认皮，顺手把女仆装穿回去（失败不影响陪伴）
       try {
         const code = `local ok, err = pcall(ysm.model.switch, ${JSON.stringify(ctx.model)}); if not ok then print(err.kind, err.message) end`;
-        await callTool(ctx, 'lua', { companion: ctx.companion, code }, 30000);
+        // ysm 换模型要把 .ysm 解包加载，第一次可能十几秒；给足 120 秒（原来 30 秒会 timeout）
+        await callTool(ctx, 'lua', { companion: ctx.companion, code }, 120000);
         ctx.log(`[mc] 已把外观换成 ${ctx.model}`);
       } catch (e) {
-        ctx.log(`[mc] 换外观失败：${e?.message ?? e}`);
+        const m = String(e?.message ?? e);
+        // 她的身体正被别的程序占用（比如上一次换装还没跑完）—— 不是故障，别刷日志
+        ctx.log(/already running|already in progress/i.test(m)
+          ? '[mc] 换外观跳过：她的身体正忙着跑别的程序'
+          : `[mc] 换外观失败：${m}`);
       }
     }
     const after = await callTool(ctx, 'list_companions', {}, 15000);
-    if (/No companions are live/i.test(after)) {
+    if (looksMissingCompanion(after) || !new RegExp(`(^|[^A-Za-z0-9_])${ctx.companion}([^A-Za-z0-9_]|$)`, 'i').test(after)) {
       ctx.log('[mc] 召唤后仍然没有她（检查同伴名与模组版本）');
       return false;
     }
@@ -190,6 +196,17 @@ async function ensureCompanion(ctx) {
     ctx.log(`[mc] 自动召唤失败：${e?.message ?? e}`);
     return false;
   }
+}
+
+/** 服务端说「这个世界里没有她」的各种说法：
+ *  - 新世界/换地图：No companions are live in the world right now…
+ *  - 名字不存在：get_events needs a 'companion' argument (a name or id from list_companions)  ← 实测就是这个
+ * 两种都必须触发自动召唤，否则轮询会安静地空转（踩过：换地图后一句话都不打，也不召唤）。
+ */
+const MISSING_COMPANION_RE = /No companions are live|needs a ['"]?companion['"]? argument|no such companion|unknown companion|companion.*not found/i;
+
+function looksMissingCompanion(text) {
+  return MISSING_COMPANION_RE.test(String(text ?? ''));
 }
 
 async function loop(ctx) {
@@ -207,8 +224,8 @@ async function loop(ctx) {
         ctx.fails = 0;
       }
       const text = extractText(res);
-      if (/No companions are live/i.test(text)) {
-        // 有些版本不报错，而是把这句话当正文返回
+      if (looksMissingCompanion(text)) {
+        // 不报错、而是把「没有这个同伴」当正文返回（0.1.4.1 就是这样）
         await ensureCompanion(ctx);
         continue;
       }
@@ -234,7 +251,7 @@ async function loop(ctx) {
       ctx.fails = (ctx.fails || 0) + 1;
       const msg = String(e?.message ?? e);
       // 换地图 / 开新世界 → 她要重新落地。这不算故障，别走退避、别刷日志。
-      if (/No companions are live|no such companion|companion.*not found/i.test(msg)) {
+      if (looksMissingCompanion(msg)) {
         if (await ensureCompanion(ctx)) { ctx.ready = false; continue; }
       }
       // 游戏没开时这条路每 5 秒就 ECONNREFUSED 一次，一天两万行日志没意义。

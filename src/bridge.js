@@ -5021,6 +5021,39 @@ async function main() {
           sendJson({ ok: true, ...status });
           return;
         }
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/mc-mode') {
+          sendJson({ ok: true, on: mcModeActiveV2(), mcMode: socialV2.mcMode ? { ...socialV2.mcMode } : null,
+            queue: (typeof mcQueueSize === 'function' ? mcQueueSize() : 0) });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/mc-mode') {
+          const body = await readBody();
+          const on = body.on === true;
+          const minutes = Number(body.minutes) || 0;      // 0 = 一直开着，直到手动关
+          if (on) {
+            socialV2.mcMode = { on: true, since: Date.now(), until: minutes > 0 ? Date.now() + minutes * 60000 : 0 };
+            log('[mc] 玩游戏模式：开' + (minutes > 0 ? `（${minutes} 分钟后自动结束）` : '（手动关）'));
+          } else {
+            socialV2.mcMode = null;
+            log('[mc] 玩游戏模式：关');
+          }
+          saveSocialV2State();
+          // 开关都要重排定时器：开的时候停掉，关的时候恢复
+          for (const key of socialV2.conversations.keys()) {
+            cancelProactiveCheckV2(key);
+            setupIntervalTimerV2(key);
+            if (!on) scheduleProactiveCheckV2(key);
+          }
+          if (!on) {
+            // 关掉后如果积了未读，立刻回一轮，别让主人等下一个自醒点
+            for (const [key, st] of socialV2.conversations) {
+              const unread = Array.isArray(st.unread) ? st.unread.length : 0;
+              if (unread > 0) void sendWakePromptV2(key, 'private').catch(() => {});
+            }
+          }
+          sendJson({ ok: true, on: mcModeActiveV2(), mcMode: socialV2.mcMode ? { ...socialV2.mcMode } : null });
+          return;
+        }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/level') {
           sendJson({ ok: true, level: socialV2.level ? { ...socialV2.level } : null, levels: ACTIVE_LEVELS });
           return;
@@ -8893,6 +8926,9 @@ async function main() {
     // 活跃度档位（2026-10-25）：她多久自己醒一次 { id, label, minutes }；null = 各会话自己的 everyMinutes。
     // 超活跃模式期间的间隔也取这里，不再硬编码 1 分钟。
     level: null,
+    // 玩游戏模式（2026-10-27）：玩 MC 时不被打断，只认游戏里的消息 { on, since, until }。
+    // 除了 reason==='mc' 的唤醒，其它（私聊/主动/定时/超时）全部跳过；QQ 消息照收不丢。
+    mcMode: null,
   };
 
   // 一代/普通模式的图片/表情元数据存储：key -> Map<messageId/seq, media[]>
@@ -11463,6 +11499,12 @@ ${turboNote}
       log(`[reserved2] 跳过唤醒 ${key}（${reason}）：会话已不在当前模式允许范围内`);
       return;
     }
+    // 玩游戏模式（2026-10-27）：玩 MC 的时候除了游戏里的消息，谁都别叫她。
+    // 消息本身照收（unread 会累加），退出模式后一轮就能一起回，不丢。
+    if (mcModeActiveV2() && reason !== 'mc') {
+      log(`[reserved2] 玩游戏模式中，跳过唤醒 ${key}（${reason}）`);
+      return;
+    }
     const st = getSocialV2State(key);
     // 防重入：如果该会话已经有一个 DSH turn 在进行中（AI 正在思考/调用工具），
     // 或已有排队/在途 prompt，则不再投递新的候选唤醒，避免“思维链进行中又塞入一个 question 唤醒”。
@@ -11847,6 +11889,18 @@ ${turboNote}
     return true;
   }
 
+  // 玩游戏模式是否开着（到期自动失效，不用人记着关）
+  function mcModeActiveV2() {
+    const m = socialV2.mcMode;
+    if (!m || m.on !== true) return false;
+    if (Number(m.until) > 0 && Date.now() >= Number(m.until)) {
+      socialV2.mcMode = null;               // 到期就安静收掉
+      try { saveSocialV2State(); } catch { /* ignore */ }
+      return false;
+    }
+    return true;
+  }
+
   // 她今天花了多少钱（cost-meter ledger 里 QQ 会话的累计 costCny）
   function qqSessionIdsV2() {
     const ids = new Set();
@@ -11991,6 +12045,7 @@ ${turboNote}
       st.intervalTimer = null;
     }
     if (cfg.socialV2?.enabled === false || socialV2.paused) return;
+    if (mcModeActiveV2()) return;   // 玩游戏模式：不定时自醒（退出模式时统一重排）
     const turboOn = turboActiveV2();
     let mins = Number(st.wakeConfig?.everyMinutes) || 0;
     // 超活跃模式：用开模式时的档位间隔（默认取当前活跃度），不再写死 1 分钟
@@ -12032,6 +12087,7 @@ ${turboNote}
   function scheduleProactiveCheckV2(key) {
     if (cfg.socialV2?.proactive?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
+    if (mcModeActiveV2()) return;   // 玩游戏模式：不主动开口
     if (!isSessionAllowedInCurrentMode(key)) return;
     const st = getSocialV2State(key);
     if (st.proactiveTimer) return;
