@@ -8887,6 +8887,9 @@ async function main() {
     // 超活跃模式（2026-10-25）：主人想让她整晚一直玩手机时打开。
     // { on:true, since:ms, until:ms|0, by:'manual'|'owner-message', costAtStart?:number }
     turbo: null,
+    // 上一次「去玩会儿」的结算（2026-10-27）：{ since, until, hours, everyMinutes, costCny, endedAt, endedBy }
+    // 桌宠关掉模式后还能显示「上次玩了多久、花了多少」。
+    turboLast: null,
     // 活跃度档位（2026-10-25）：她多久自己醒一次 { id, label, minutes }；null = 各会话自己的 everyMinutes。
     // 超活跃模式期间的间隔也取这里，不再硬编码 1 分钟。
     level: null,
@@ -9162,6 +9165,19 @@ async function main() {
           : { on: true, since: Number(rawTurbo.since) || Date.now(), until, by: String(rawTurbo.by || 'manual'), costAtStart: Number(rawTurbo.costAtStart) || 0 };
       } else {
         socialV2.turbo = null;
+      }
+      // 上一次「去玩会儿」的结算（桌宠关掉后还要显示花了多少）
+      const rawLast = raw?.turboLast;
+      if (rawLast && typeof rawLast === 'object') {
+        socialV2.turboLast = {
+          since: Number(rawLast.since) || 0,
+          until: Number(rawLast.until) || 0,
+          hours: Number(rawLast.hours) || 0,
+          everyMinutes: Number(rawLast.everyMinutes) || 0,
+          costCny: Number.isFinite(Number(rawLast.costCny)) ? Number(rawLast.costCny) : null,
+          endedAt: Number(rawLast.endedAt) || 0,
+          endedBy: String(rawLast.endedBy || ''),
+        };
       }
       if (raw && typeof raw.conversations === 'object') {
         const seenTokens = new Set();
@@ -10899,6 +10915,71 @@ async function main() {
     return factStrengthV2(f, now);
   }
 
+  // —— 同一件事换个说法（2026-10-27）——
+  // 以前只认「一字不差」，于是「她喜欢在晚上写代码」和「她喜欢晚上写代码」要各记一条，
+  // 「说好了周六」和「说好周六」也各算一条，80 条上限很快被同一件事的几种写法挤满。
+  // 这里只认**很保守**的一种重复：去掉标点后，两句话只差「虚词 / 程度副词」——
+  //   · 长度相同：允许 ≤2 个位置不同，且每个不同的字都落在虚词集里（很↔好、在↔∅ 这种）；
+  //   · 长度不同：短的必须能在长的上「删掉 ≤2 个虚词」得到。
+  // 为什么不用相似度（试过大 bigram Jaccard）：中文实测
+  //   「她喜欢在晚上写代码 / 她喜欢晚上写代码」只有 0.67，
+  //   「主人今天心情不好 / 主人今天心情不错」却有 0.75 —— 一个阈值分不开「同义」和「反义」，
+  //   真按相似度合并会把「心情不好」改写成「心情不错」。宁可漏合并，也不能记反。
+  // 另外三条硬约束：只跟同 kind 比（"明天吃饭"vs"今天吃饭"不是一件事）；event（见闻）永不合并；
+  // 差的是实词（饭/面、好/错）一律不合并。
+  // 虚词集：只放「删掉/替换不改变意思」的字。注意 不/没/别 故意不在里面 ——
+  // 「他很好」和「他不好」只差一个字，但意思正好相反，绝不能当重复合并掉。
+  const FACT_FILLER = new Set(Array.from('的了着过是在和与我啊吧呢吗嘛呀就都也还挺很太更好又才要将会把被给对从向跟同及或而但地得们一'));
+  function factNormTextV2(s) {
+    return String(s || '').toLowerCase().replace(/[\s，。！？、,.!?~～"'“”‘’（）()【】\[\]…—\-]+/g, '');
+  }
+  const factRemoveAtV2 = (s, i) => s.slice(0, i) + s.slice(i + 1);
+  // 两句话是否只差虚词
+  function isSameByFillersV2(a, b) {
+    const A = factNormTextV2(a);
+    const B = factNormTextV2(b);
+    if (!A || !B) return false;
+    if (A === B) return true;
+    if (Math.abs(A.length - B.length) > 2) return false;
+    if (A.length === B.length) {
+      let diff = 0;
+      for (let i = 0; i < A.length; i += 1) {
+        if (A[i] === B[i]) continue;
+        diff += 1;
+        if (diff > 2) return false;
+        if (!FACT_FILLER.has(A[i]) || !FACT_FILLER.has(B[i])) return false;
+      }
+      return true;
+    }
+    const shorter = A.length < B.length ? A : B;
+    const longer = A.length < B.length ? B : A;
+    const drop = longer.length - shorter.length;
+    const pool = [];
+    for (let i = 0; i < longer.length && pool.length <= 8; i += 1) if (FACT_FILLER.has(longer[i])) pool.push(i);
+    if (pool.length < drop) return false;
+    if (drop === 1) return pool.some((i) => factRemoveAtV2(longer, i) === shorter);
+    if (drop === 2) {
+      for (let i = 0; i < pool.length; i += 1) {
+        for (let j = i + 1; j < pool.length; j += 1) {
+          // 先删靠后的下标，再删靠前的，避免下标错位
+          const once = factRemoveAtV2(longer, pool[j]);
+          if (factRemoveAtV2(once, pool[i]) === shorter) return true;
+        }
+      }
+    }
+    return false;
+  }
+  function findSameFactV2(facts, text, kind) {
+    if (!text || kind === 'event') return null;
+    for (const f of facts) {
+      const other = String(f.text || '');
+      if (!other || other === text) continue;
+      if (String(f.kind || '') !== kind) continue;
+      if (isSameByFillersV2(other, text)) return f;
+    }
+    return null;
+  }
+
   function addFactV2(text, opts = {}) {
     const t = String(text ?? '').trim();
     if (!t) throw new Error('text 不能为空');
@@ -10935,6 +11016,21 @@ async function main() {
         log('[facts] 从遗忘池捞回来了：' + t.slice(0, 24));
         return revived;
       }
+    }
+    // 同一件事换个说法（"她喜欢在晚上写代码" vs "她喜欢晚上写代码"）：只算复习，不新增一条。
+    const same = findSameFactV2(facts, t, kind);
+    if (same) {
+      const oldText = String(same.text || '');
+      // 保留信息量更大（更长）的那条作为正文
+      if (t.length > oldText.length) same.text = t.slice(0, 300);
+      same.kind = kind;
+      same.tier = tier;
+      same.at = now;
+      if (expiresAt) same.expiresAt = expiresAt;
+      touchFactV2(same, 0.35, nowMs);
+      writeFactsV2(facts);
+      log('[facts] 同一件事换个说法，只算复习：' + String(same.text || '').slice(0, 24) + '（强度 ' + Number(same.str || 0).toFixed(2) + '）');
+      return same;
     }
     const entry = {
       id: 'f' + Date.now().toString(36) + Math.floor(Math.random() * 1000),
@@ -11801,7 +11897,39 @@ ${turboNote}
     }
   }
 
+  // 结算一段「去玩会儿」：记下时长与这段花了多少，桌宠关掉后还能显示。
+  function rememberTurboEndV2(was, why) {
+    if (!was) return;
+    const cost = readQqCostCnyV2();
+    const snap = Number(was.costAtStart) || 0;
+    const since = Number(was.since) || 0;
+    const until = Number(was.until) || 0;
+    socialV2.turboLast = {
+      since,
+      until,
+      hours: Number(was.hours) > 0 ? Number(was.hours) : (since > 0 && until > since ? (until - since) / 3600000 : 0),
+      everyMinutes: Number(was.everyMinutes) || 0,
+      costCny: cost ? Math.max(0, cost.today - snap) : null,
+      endedAt: Date.now(),
+      endedBy: String(why || 'manual'),
+    };
+    log("[turbo] 结算：" + (socialV2.turboLast.hours || 0).toFixed(2) + " 小时，这段 ¥" + (socialV2.turboLast.costCny === null ? "?" : socialV2.turboLast.costCny.toFixed(2)) + "（" + String(why || 'manual') + "）");
+  }
+
+  // 到点自动收 —— 以前只靠 turboActiveV2() 返回 false 当"没在玩"，但那一支不会结算，
+  // 于是「上次花了多少」永远没有。这里在状态查询入口做一次幂等的收尾。
+  function expireTurboV2() {
+    const t = socialV2.turbo;
+    if (!t || t.on !== true) return;
+    if (!(Number(t.until) > 0 && Date.now() >= Number(t.until))) return;
+    rememberTurboEndV2(t, 'expired');
+    socialV2.turbo = null;
+    saveSocialV2State();
+    for (const key of socialV2.conversations.keys()) setupIntervalTimerV2(key);
+  }
+
   function turboStatusV2() {
+    expireTurboV2();
     const active = turboActiveV2();
     const t = socialV2.turbo;
     const cost = readQqCostCnyV2();
@@ -11815,6 +11943,7 @@ ${turboNote}
       level: socialV2.level ? { ...socialV2.level } : null,
       costTodayCny: cost ? cost.today : null,
       costTurboCny: cost && active ? cost.delta : null,
+      last: socialV2.turboLast ? { ...socialV2.turboLast } : null,
     };
   }
 
@@ -11823,6 +11952,7 @@ ${turboNote}
     if (!wantOn) {
       if (!socialV2.turbo) return turboStatusV2();
       const was = socialV2.turbo;
+      rememberTurboEndV2(was, why);
       socialV2.turbo = null;
       saveSocialV2State();
       for (const key of socialV2.conversations.keys()) setupIntervalTimerV2(key);
@@ -11836,6 +11966,7 @@ ${turboNote}
       since: Date.now(),
       until: Date.now() + Math.round(h * 3600 * 1000),
       by: String(why || "manual"),
+      hours: h,
       everyMinutes: Number(intervalMinutes) >= 1 ? Math.min(720, Math.round(Number(intervalMinutes))) : levelMinutesV2(),
       costAtStart: cost ? cost.today : 0,
     };

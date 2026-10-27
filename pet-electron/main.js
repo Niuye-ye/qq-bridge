@@ -194,7 +194,8 @@ let uiRects = [];    // 渲染进程上报的、需要吃鼠标的 UI 矩形
 let consoleToken = '';
 let bridgeState = null;
 let turboState = null;   // 超活跃模式状态（/api/socialV2/turbo 的快照，9 秒刷一次）
-const TURBO_HOURS = 10;  // 「一直玩」默认跑多久
+// 2026-10-27：去掉「一直玩到我说停（10 小时）」后，时长一律由「让她去玩会儿」选，
+// 这里不再需要固定的 10 小时默认值。
 // 让她去玩一会儿：时长由这里给（hours），间隔由活跃度档位决定
 const PLAY_PRESETS = [
   { label: '20 分钟', hours: 20 / 60 },
@@ -837,14 +838,22 @@ function popupMenu() {
         { type: 'separator' },
         {
           label: '让她去玩会儿 ▸',
-          submenu: PLAY_PRESETS.map((p) => ({ label: p.label, click: () => playFor(p.hours, p.label) })),
+          submenu: PLAY_PRESETS.map((p) => ({
+            label: (st.turbo && st.turbo.on) ? `${p.label}（换成这个时长）` : p.label,
+            click: () => playFor(p.hours, p.label),
+          })),
         },
-        {
-          label: (st.turbo && st.turbo.on)
-            ? `她正在玩：剩 ${st.turbo.remainMinutes || 0} 分钟 · 每 ${st.turbo.everyMinutes || '?'} 分钟一轮 · 这段 ¥${Number(st.turbo.costTurboCny || 0).toFixed(2)}（${clock(st.turbo.until)} 收）· 点这里喊停`
-            : `一直玩到我说停（${TURBO_HOURS} 小时）`,
+        // 只在"正在玩"时出现，点它就是喊停。以前那条「一直玩到我说停（10 小时）」
+        // 已按主人要求去掉：时长统一从上面的「让她去玩会儿」选。
+        ...((st.turbo && st.turbo.on) ? [{
+          label: `她正在玩：剩 ${st.turbo.remainMinutes || 0} 分钟 · 每 ${st.turbo.everyMinutes || '?'} 分钟一轮 · 这段 ¥${Number(st.turbo.costTurboCny || 0).toFixed(2)}（${clock(st.turbo.until)} 收）· 点这里喊停`,
           click: () => toggleTurbo(),
-        },
+        }] : []),
+        // 玩完之后还留着一条结算：这段多久、花了多少钱。
+        ...((!(st.turbo && st.turbo.on) && st.turbo && st.turbo.last) ? [{
+          label: lastPlayLine(st.turbo.last),
+          enabled: false,
+        }] : []),
         {
           label: `活跃度：${levelNow().label}（每 ${levelNow().minutes || '?'} 分钟醒一轮）`,
           submenu: LEVEL_PRESETS.map((l) => ({
@@ -1074,6 +1083,16 @@ function levelNow() {
   return { id: st ? String(st.id || '') : '', minutes, label: st ? String(st.label || '未设') : '未设' };
 }
 
+// 「这段花了多少」的结算行：上次玩了多久、花了多少钱、几点收的。
+function lastPlayLine(last) {
+  const h = Number(last && last.hours) || 0;
+  const dur = h >= 1 ? `${Number(h.toFixed(1))} 小时` : `${Math.max(1, Math.round(h * 60))} 分钟`;
+  const money = (last && typeof last.costCny === 'number') ? `¥${last.costCny.toFixed(2)}` : '花费统计不到';
+  const when = last && last.endedAt ? clock(last.endedAt) : '';
+  const why = last && last.endedBy === 'expired' ? '到点收' : '手动收';
+  return `上次玩了 ${dur} · 花了 ${money}（${when} ${why}）`;
+}
+
 // 让她去玩一会儿：开一段有时长的「活跃期」，到时自动收；间隔取当前活跃度档位
 async function playFor(hours, label) {
   const lv = levelNow();
@@ -1099,17 +1118,15 @@ async function setLevel(id, label) {
   } catch (e) { log('活跃度切换失败', e.message); return { ok: false, error: e.message }; }
 }
 
+// 只用来「喊停」：菜单里那条「她正在玩…点这里喊停」。开启一律走 playFor（时长由主人选）。
 async function toggleTurbo() {
-  const on = !(bridgeState && bridgeState.turbo && bridgeState.turbo.on);
+  const playing = !!(bridgeState && bridgeState.turbo && bridgeState.turbo.on);
+  if (!playing) { log('喊停：当前没在玩，忽略'); return; }
   try {
-    const lv = levelNow();
-    const r = await postJson('/api/socialV2/turbo', { on, hours: TURBO_HOURS, intervalMinutes: lv.minutes || 5, by: 'pet' });
-    log('超活跃模式 →', on ? '开' : '关', safeStr(r));
-    const cost = r && typeof r.costTodayCny === 'number' ? `（今天已花 ¥${r.costTodayCny.toFixed(2)}）` : '';
-    win?.webContents.send('pet:ui', {
-      t: 'bubble',
-      text: on ? `好，我一直玩到你说停（${TURBO_HOURS} 小时，每 ${lv.minutes || 5} 分钟一轮）${cost}` : '停了，我先歇会儿',
-    });
+    const r = await postJson('/api/socialV2/turbo', { on: false, by: 'pet' });
+    const last = r && r.last ? lastPlayLine(r.last) : '';
+    log('超活跃模式 → 关', safeStr(r));
+    win?.webContents.send('pet:ui', { t: 'bubble', text: last ? `停了。${last}` : '停了，我先歇会儿' });
     await pollBridge();
   } catch (e) { log('超活跃模式切换失败', e.message); }
 }
