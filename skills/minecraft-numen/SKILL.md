@@ -154,3 +154,179 @@ print(r.sleeping, r.bed)
 
 跟熔炉同一套：`numen.use.block(pos)` 拿到 Window → `put / take / move / quick / close`。
 潜行放东西：`numen.use.block(pos, {item = "minecraft:oak_planks", sneak = true})`（Shift+右键，不会打开界面）。
+
+## 3.6 吃东西 / 喝药水
+
+```lua
+numen.inv.eat("minecraft:cooked_beef")        -- 吃东西（真的嚼完才回血）
+numen.inv.eat("minecraft:potion")             -- 喝药水（身上带着的那瓶）
+```
+
+它是**身体动作**：程序会等到吃完才返回。背包里没有 / 不是食物 / 已经饱了都会直接拒绝并说明。
+
+## 3.7 手持与穿戴
+
+```lua
+numen.gear.hold("minecraft:iron_pickaxe")                 -- 拿到主手（不会用掉、不会倒出来）
+numen.gear.hold("minecraft:torch", {hand = "off"})        -- 副手
+numen.gear.wear("minecraft:iron_helmet")                  -- 穿装备（槽位自动选）
+numen.gear.wear("minecraft:elytra", {slot = "chest"})     -- 指定槽位
+numen.gear.remove("minecraft:diamond_boots")              -- 脱下来放回背包
+```
+
+`gear.hold` 只换手，不触发使用 —— 水桶拿在手上还是满的。要**真用**：`numen.use.item({item = "..."})`。
+
+## 3.8 合成（工作台 / 配方书）
+
+**最省事的是一条 `inv.make`**：它自己挑配方、自己找/放工作台、做完把台子收回去。
+
+```lua
+numen.inv.make("minecraft:wooden_pickaxe")          -- 做 1 个（材料不够会报 no_material 并说你缺什么）
+numen.inv.make("minecraft:torch", 16)               -- 做 16 个
+for _, s in ipairs(numen.inv.items()) do print(s.item, s.count) end   -- 背包里有什么
+```
+
+要精细控制才手动来：
+
+```lua
+for _, r in ipairs(numen.inv.craftable()) do print(r.id, r.item, r.grid) end   -- 现在能做什么
+numen.inv.craft("minecraft:stick", {count = 8})            -- 在自己身上那个 2x2 里做
+```
+
+- **3x3 配方**：`numen.move.to(台子, {arrive="use"})` → `numen.use.block(台子.pos)` → 再 `inv.craft` → `w:close()`。
+- 熔炉类（smelting/blasting/smoking/campfire）不是 `craft`，是往炉子里塞料烧（见 3.5）。
+- 丢东西：`numen.inv.drop("minecraft:cobblestone", {count = 32})`（会先问主人；丢在地上 5 分钟就没了）。
+
+## 3.9 挖、敲、打
+
+```lua
+local ores = numen.scan.blocks({"iron_ore", "deepslate_iron_ore"}, {radius = 32})
+numen.work.dig(ores[1])                       -- 走过去挖掉（自己换最好的工具）
+numen.use.hit({x = 120, y = 64, z = -35})     -- 只敲一下（开箱子敲一下没用，用 use.block）
+local foe = numen.scan.entities("hostile", {radius = 16})[1]
+if foe then numen.fight.attack(foe) end       -- 打到死/跑掉/够不着为止
+```
+
+## 3.10 上船 / 上马 / 下车
+
+`scan.entities` 的第一个参数**只认五个**：`hostile` / `passive` / `player` / `item` / `all`
+（写 `"boat"`、`"sheep"`、`"villager"` 会直接 `bad_argument`）。挑具体种类要按 `e.type` 过滤：
+
+```lua
+local function find(kind, radius)
+  for _, e in ipairs(numen.scan.entities("all", {radius = radius or 24})) do
+    if e.type == kind then return e end
+  end
+end
+local boat = find("minecraft:oak_boat") or find("minecraft:boat")
+if boat then
+  numen.move.to(boat, {arrive = "use"})
+  numen.use.entity(boat)                      -- 右键上去
+end
+numen.move.dismount()                         -- 下来
+```
+
+实体字段只有这些：`id / type（满名，如 minecraft:sheep）/ name / category（player|passive|hostile…）/ pos / hp / max_hp / distance`。
+
+船在水里走、马要鞍；骑着的时候 `move.go` 照样能用。
+
+## 3.11 钓鱼
+
+```lua
+numen.work.fish()                             -- 抛一次、等鱼咬、收杆，返回钓到的东西
+for i = 1, 5 do numen.work.fish() end         -- 连着钓五杆
+```
+
+要求：手里有鱼竿、站在岸上、面前有开阔水面。它**不会走路**，先自己站好。
+
+## 3.12 剪羊毛 / 挤奶 / 喂动物 / 拴绳
+
+这些都是「拿着东西右键实体」：
+
+```lua
+local function find(kind, radius)
+  for _, e in ipairs(numen.scan.entities("all", {radius = radius or 24})) do
+    if e.type == kind then return e end
+  end
+end
+local sheep = find("minecraft:sheep")
+if sheep then
+  numen.move.to(sheep, {arrive = "use"})
+  numen.use.entity(sheep, {item = "minecraft:shears"})      -- 剪羊毛
+  numen.use.entity(sheep, {item = "minecraft:lead"})        -- 拴上
+end
+local cow = find("minecraft:cow")
+if cow then
+  numen.use.entity(cow, {item = "minecraft:bucket"})        -- 挤奶
+  numen.use.entity(cow, {item = "minecraft:wheat"})         -- 喂（繁殖/催熟）
+end
+```
+
+## 3.13 按钮 / 拉杆 / 门 / 活板门 / 唱片机
+
+全部是 `numen.use.block(pos)`（右键那一格），空气格也行：
+
+```lua
+numen.use.block({x = 120, y = 64, z = -35})                  -- 按按钮 / 拉杆 / 开门 / 翻活板门
+numen.use.block({x = 120, y = 63, z = -35}, {item = "minecraft:flint_and_steel"})  -- 点火
+numen.use.block(pos, {item = "minecraft:oak_planks", sneak = true})  -- Shift+右键：放东西到箱子上而不是打开它
+```
+
+## 3.14 村民交易
+
+```lua
+local function find(kind, radius)
+  for _, e in ipairs(numen.scan.entities("all", {radius = radius or 24})) do
+    if e.type == kind then return e end
+  end
+end
+local v = find("minecraft:villager")
+if v then
+  numen.move.to(v, {arrive = "use"})
+  local w = numen.use.entity(v)               -- 打开交易界面
+  for _, s in ipairs(w.slots) do if s.item then print(s.index, s.item, s.count) end end
+  w:close()
+end
+```
+
+交易窗口和容器是同一套 `slots / put / take / move / quick / close`；先看清楚哪个 index 是什么再动，
+**别乱花主人的绿宝石**。
+
+## 3.15 附魔台 / 铁砧 / 砂轮 / 织布机 / 切石机 / 锻造台 / 讲台 / 信标
+
+同一个套路：走过去 → `use.block` 打开 → 看 `w.slots` 决定往哪格放（`w:move(from, to)` 或 `w:put`）→ `w:close()`。
+
+```lua
+numen.move.to(station, {arrive = "use"})
+local w = numen.use.block(station.pos)
+for _, s in ipairs(w.slots) do
+  if s.item then print(s.index, s.side, s.item, s.count) end
+end
+-- 例：附魔台把剑放进 0 号格、青金石放 1 号格，再点附魔按钮（需要等级，看 w.data）
+```
+
+界面里 `side` 只有四种：`container`（机器那边）/ `you`（自己背包）/ `grid`（合成格）/ `result`（只能取的成品）。
+
+## 3.16 种地 / 骨粉
+
+```lua
+numen.use.block(soil_pos, {item = "minecraft:iron_hoe"})       -- 锄地
+numen.use.block(soil_pos, {item = "minecraft:wheat_seeds"})    -- 播种
+numen.use.block(crop_pos, {item = "minecraft:bone_meal"})      -- 催熟
+```
+
+## 3.17 等时间 / 定提醒（别原地空转）
+
+```lua
+numen.time.wait(30)                                            -- 等 30 秒世界时间
+numen.task.timer("去把熔炉里的铁取出来", {after = 300})          -- 5 分钟后提醒自己（主人也看得到）
+```
+
+`task.timer` 立刻返回、不占身体，比 `time.wait` 长时间硬等好 —— 一轮里要等就排个提醒然后先干别的。
+
+## 3.18 通用四条（所有交互都适用）
+
+1. **先站好再动手**：所有 `use.*` / `work.*` / `fight.*` 都不走路，够不着会直接报错并告诉你该调哪个 `move.to` —— 复制它给的那句就行。
+2. **右键看结果**：返回里的 `Clicked` 会说清点到的是什么；点歪了（前面有高草、树叶、别的方块）它会点名，照着换一格。
+3. **别连点**：同一位置点两次没反应 = 方法不对（该用 `work.dig` 而不是 `use.hit`，该先开门再走），换法子，别原地磨。
+4. **主人的东西别乱动**：动他的箱子、宠物、命名生物、村民会先问他；被拒绝就换事做。
