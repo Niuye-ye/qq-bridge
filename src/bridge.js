@@ -7213,7 +7213,9 @@ async function main() {
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getMyRecent')) { sendJson({ ok: false, error: '工具未启用：qq_get_my_recent_messages' }, 403); return; }
           const st = getSocialV2State(key);
           const mine = st.recentMessages.filter((m) => m.isSelf).slice(-limit);
-          sendJson({ ok: true, key, messages: mine, readThroughSeq: readThroughSeqV2(st) });
+          // 2026-10-27 修：桌宠一直在等这个字段（pet-electron/main.js:801），但这里从来没返回过 →
+          // s.paused 恒 null → 菜单永远显示「暂停」、点了只能暂停不能恢复。补上。
+          sendJson({ ok: true, key, paused: !!st.paused, messages: mine, readThroughSeq: readThroughSeqV2(st) });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/record-sent') {

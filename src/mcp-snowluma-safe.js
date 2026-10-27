@@ -24,6 +24,24 @@ import { serializeModelData } from './qq-model-view.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 
+// 2026-10-27 加：以前这个进程是"裸奔"的 —— 4 处 spawn 都没有 'error' 监听，
+// pickPython() 找不到解释器时兜底返回裸 'python'，spawn 的 ENOENT 会变成未处理事件，
+// 整个 MCP 进程直接退出，DSH 侧所有 QQ 工具同时消失（而日志里一个字都没有）。
+// 现在：spawnSafe 统一兜底 + 进程级兜底，只记日志、不退出。
+const MC_LOG = path.join(ROOT, 'state', 'mcp.log');
+function mcLog(line) {
+  try {
+    fs.appendFileSync(MC_LOG, `${new Date().toISOString()} ${line}\n`);
+  } catch {}
+}
+function spawnSafe(cmd, args, opts) {
+  const child = spawnSafe(cmd, args, opts);
+  child.on('error', (e) => mcLog(`[spawn] ${cmd} 启动失败：${e?.message ?? e}`));
+  return child;
+}
+process.on('uncaughtException', (e) => mcLog(`[uncaught] ${e?.stack || e}`));
+process.on('unhandledRejection', (e) => mcLog(`[unhandled] ${e?.stack || e}`));
+
 function loadConfig() {
   try {
     let text = fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8');
@@ -1596,7 +1614,10 @@ if (cfg.socialV2?.tools?.getSelfImage !== false) {
       }
     }
   );
+}
 
+// 2026-10-27 修：这个工具原来被误写在 getSelfImage 的 if 块里，关“自画像”会连带关掉“看屏幕”
+if (cfg.socialV2?.tools?.seeScreen !== false) {
 server.tool(
   'qq_see_screen',
   '看一眼模拟器现在的屏幕，返回真正的画面（图片会直接进入你的视觉上下文，你能看见）。刷 feed、看视频、玩游戏、任何需要知道「屏幕现在长什么样」的时候都用它。**看画面一律用它**。mcp__android__screenshot 也能看图，但它是 adb 抓屏，**网页类页面（WebView，比如小黑盒帖子详情、B站部分页）会截成白屏**，而且抓的是独立图层、不保证和你眼睛看到的一致。只有在需要精确像素坐标时才用 android 那个，判断白屏或卡住一律以 qq_see_screen 为准。',
@@ -1772,6 +1793,9 @@ const FS_ROOT_RE = new RegExp(`^(${FS_ROOT_NAMES.join('|')})/`);
 const FS_HINT = `${FS_ROOT_NAMES.join('/')} 之一`;
 const FS_MAX_READ_BYTES = 256 * 1024;
 const FS_MAX_WRITE_BYTES = 512 * 1024;
+// 2026-10-27 修：state/ 是整目录白名单，但里面躺着所有会话的 agentToken（social-v2.json）
+// 和控制台令牌（console-token）。读走一个就能借别人的身份说话 —— 这两个文件一律不给读写。
+const FS_DENY_RE = /^state\/(social-v2|console-token|agent-token|bridge-guard)/i;
 
 // 允许三种写法：
 //   1) diary/2026-10-22.md（推荐，短）
@@ -1799,7 +1823,9 @@ function resolveFsPath(rawPath) {
   const abs = path.resolve(root, ...segs.slice(1));
   const rel = path.relative(root, abs);
   if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) throw new Error(`path 越界：只能读写 ${FS_HINT} 里的文件`);
-  return { abs, label: `${rootName}/${rel.split(path.sep).join('/')}` };
+  const label = `${rootName}/${rel.split(path.sep).join('/')}`;
+  if (FS_DENY_RE.test(label)) throw new Error(`${label} 里存着会话令牌/锁，不给读写`);
+  return { abs, label };
 }
 
 server.tool(
@@ -2035,7 +2061,7 @@ server.tool(
       const ffmpeg = pickFfmpeg();
       const childEnv = { ...process.env, PYTHONIOENCODING: process.env.PYTHONIOENCODING || 'utf-8' };
       if (ffmpeg) childEnv.PET_FFMPEG = ffmpeg;
-      const child = spawn(pickPython(), [VIDEO_SCRIPT, jobPath, '--out', outPath], {
+      const child = spawnSafe(pickPython(), [VIDEO_SCRIPT, jobPath, '--out', outPath], {
         cwd: path.dirname(VIDEO_SCRIPT),
         detached: true,
         stdio: ['ignore', fd, fd],
@@ -2188,7 +2214,11 @@ server.tool(
         if (resolved.error) return { content: [{ type: 'text', text: resolved.error }], isError: true };
         localPath = resolved.path;
       } else if (id) {
-        localPath = path.join(VIDEO_DIR, String(id).trim() + '.mp4');
+        // 2026-10-27 修：id 分支原来直接 path.join，`id: "../../state/xxx"` 能越过 videos 目录；
+        // 现在和 path 分支走同一道校验（resolvePushPath 会 realpath 后比前缀）
+        const byId = resolvePushPath(path.join(VIDEO_DIR, String(id).trim() + '.mp4'));
+        if (byId.error) return { content: [{ type: 'text', text: byId.error }], isError: true };
+        localPath = byId.path;
       } else if (fs.existsSync(VIDEO_DIR)) {
         const files = fs.readdirSync(VIDEO_DIR).filter((f) => f.toLowerCase().endsWith('.mp4'));
         if (!files.length) return { content: [{ type: 'text', text: 'videos 目录里还没有 mp4，先用 qq_make_video 做一个。' }], isError: true };
@@ -2377,7 +2407,7 @@ server.tool(
         childEnv.PET_FFMPEG = ffmpeg;
         childEnv.PATH = path.dirname(ffmpeg) + path.delimiter + (process.env.PATH || '');
       }
-      const child = spawn(pickPython(), ['-u', mainPy], {
+      const child = spawnSafe(pickPython(), ['-u', mainPy], {
         cwd: dir,
         detached: true,
         stdio: ['ignore', fd, fd],
@@ -2527,7 +2557,7 @@ function memRestoreLater() {
   const script = memSaverScript();
   if (!script) return;
   try {
-    const child = spawn(
+    const child = spawnSafe(
       "powershell.exe",
       ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script, "-Action", "restore"],
       // 别加 detached：powershell + detached + stdio ignore 会静默退出（见 AGENTS 17.15 实测）
@@ -2608,7 +2638,7 @@ async function comfyEnsureUp() {
   if (!bat) return false;
   comfyStarting = (async () => {
     try {
-      const child = spawn('cmd.exe', ['/c', bat], {
+      const child = spawnSafe('cmd.exe', ['/c', bat], {
         cwd: path.dirname(bat), detached: true, stdio: 'ignore', windowsHide: true,
       });
       child.unref();

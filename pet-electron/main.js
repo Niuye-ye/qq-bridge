@@ -1,7 +1,7 @@
 // 小鲸鱼桌宠 · Electron 主进程
 // 窗口/协议/穿透见 M1；桥状态轮询、聊天、右键菜单见 M3。
 const {
-  app, BrowserWindow, ipcMain, protocol, Menu, Tray, nativeImage, screen, shell, dialog,
+  app, BrowserWindow, ipcMain, protocol, Menu, Tray, nativeImage, screen, shell, dialog, Notification,
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
