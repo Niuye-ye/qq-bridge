@@ -30,7 +30,7 @@ import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
 import { addGoalV2, appendLifeV2, closeGoalV2, formatGoalsLineV2, formatLifeLineV2, readGoalsV2, readLifeV2 } from './goals-life.js';
 // Minecraft 陪伴：轮询 Numen 模组内置 MCP 服务端的游戏内消息（纯 I/O + 队列，不碰会话状态机）
-import { dropMcMessages, peekMcMessages, startMcWatcher } from './mc-companion.js';
+import { dropMcMessages, mcAlive, mcQueueSize, peekMcMessages, startMcWatcher } from './mc-companion.js';
 import {
   loadSlang,
   saveSlang,
@@ -11402,6 +11402,9 @@ ${turboNote}
 5. **这一轮别做 5 分钟的沉睡前观察**：主人在游戏里等着，回完就用 qq_set_wake_config 安排下次唤醒收尾（一句话就够），别调 qq_wait_for_messages 空等。
 别忘了你就是他自己的同伴：走过去的路上可以说一句「我过来了」。想不到说什么就用 lua 看看他在干嘛（背包、血、在哪）再挑话说。`;
     }
+    if (reason === 'mcSelf') {
+      return `${base}【自己在游戏里过日子】${key}\n原因：**没人跟你说话**。你正在 Minecraft 里陪着主人，他可能在忙自己的事，也可能就在旁边。这一轮是你自己的时间 —— 想干什么干什么，不用请示、不用等指令，别问「要我做什么」。\n\n怎么像一个真玩家：\n1. 先 skill(name="minecraft-numen") 扫一遍要点（不熟就读全文，很短）；\n2. **一次 lua 把情况看完**（别一步一个调用，慢又满屏红字）：status.self() 看自己在哪、血、饥饿、背包；status.owner() 看主人在哪、离多远；scan.sight() / scan.entities() 看身边有什么；time.wait 之外再看下时间。\n3. 自己决定这一轮干什么，从这些里挑一个（别每轮都同一件）：\n   - 跟着主人转（move.follow / move.go 到他附近），边上顺便说句闲话；\n   - 挖点矿、砍点树、攒材料（work.dig）；\n   - 盖个小窝、铺个床（要三块羊毛就去找羊）；\n   - 到处走走看看，发现新鲜东西就 say 一句感叹；\n   - 找箱子、找村庄、翻地图（scan.map）；\n   - 练手打架，但别去硬刚苦力怕、别下深层洞穴。\n4. 用 2~6 个真实动作把它做出来（走、挖、放、砍、看），别只站在原地想；做完用 say 说一句你刚干了什么。\n5. 收尾：qq_set_wake_config 给自己排下一次（everyMinutes 5~10），**别调 qq_wait_for_messages 空等**。\n\n规矩：主人一说话就立刻改成陪他，他的话永远优先；不动他的箱子、房子和东西；不去深层洞穴、岩浆、末地；一轮最多 20 分钟、30 次工具。`;
+    }
     if (reason === 'desk') {
       const dm = Array.isArray(st.deskMessages) ? st.deskMessages.slice(-5) : [];
       const dmText = dm.length ? dm.map((m) => `- ${m.text}`).join('\n') : '（没留下记录）';
@@ -11501,7 +11504,7 @@ ${turboNote}
     }
     // 玩游戏模式（2026-10-27）：玩 MC 的时候除了游戏里的消息，谁都别叫她。
     // 消息本身照收（unread 会累加），退出模式后一轮就能一起回，不丢。
-    if (mcModeActiveV2() && reason !== 'mc') {
+    if (mcModeActiveV2() && reason !== 'mc' && reason !== 'mcSelf') {
       log(`[reserved2] 玩游戏模式中，跳过唤醒 ${key}（${reason}）`);
       return;
     }
@@ -11887,6 +11890,37 @@ ${turboNote}
     if (!t || t.on !== true) return false;
     if (Number(t.until) > 0 && Date.now() >= Number(t.until)) return false;
     return true;
+  }
+
+  // 她自己过日子：玩游戏模式里，没人说话的时候每隔 N 分钟醒一轮自己找事做。
+  // 为什么要桥来打点：她的会话是被唤醒才跑的，游戏本身不会叫她；桥 7×24 醒着，正好当闹钟。
+  let MC_SELF_TIMER = null;
+  let MC_SELF_LAST = 0;
+  function startMcSelfLoop() {
+    if (MC_SELF_TIMER) return;
+    const every = Math.max(2, Math.min(60, Number(cfg.socialV2?.mc?.selfPlayMinutes) || 6)) * 60000;
+    MC_SELF_TIMER = setInterval(async () => {
+      try {
+        const mc = cfg.socialV2?.mc ?? {};
+        if (mc.selfPlay === false) return;
+        // 不要求「玩游戏模式」开着：只要游戏在跑、她在世界里，就当她自己在过日子。
+        // 玩游戏模式管的是另一件事 —— 玩的时候别让 QQ/主动问候打断她。
+        if (socialV2.paused || currentMode !== 'reserved2') return;
+        if (!mcAlive()) return;                        // 游戏没开 / 她不在这个世界里
+        if (mcQueueSize() > 0) return;                 // 主人在游戏里说话 → 那一轮优先，别插队
+        const key = `private:${String(cfg.ownerQQ ?? '')}`;
+        if (!cfg.ownerQQ) return;
+        const st = socialV2.conversations.get(key);
+        if (!st || isConversationBusyV2(key, st)) return;
+        if (Date.now() - MC_SELF_LAST < every) return;
+        MC_SELF_LAST = Date.now();
+        log('[mc] 没人找她，这一轮她自己安排');
+        await sendWakePromptV2(key, 'mcSelf');
+      } catch (e) {
+        log('[mc] 自主行动异常:', e?.message ?? e);
+      }
+    }, 60000);
+    MC_SELF_TIMER.unref?.();
   }
 
   // 玩游戏模式是否开着（到期自动失效，不用人记着关）
@@ -13256,6 +13290,12 @@ ${turboNote}
             dropMcMessages();
           },
         });
+        // ── 她自己过日子（2026-10-27）──────────────────────────────────────
+        // 以前她只会「主人说一句、她动一下」：唤醒来自 QQ / 定时自醒，游戏里没人说话就不动。
+        // 真人玩家不是这样的 —— 没人指挥也会自己挖矿、盖房、闲逛。
+        // 这里给一个低频打点：玩游戏模式开着 + 她正活着 + 没人说话 + 她闲着 → reason='mcSelf'。
+        // 提示词（buildWakePromptV2 的 mcSelf 分支）明确告诉她「这是你自己的时间」。
+        startMcSelfLoop();
       } catch (error) {
         log('[mc] 轮询启动失败:', error?.message ?? error);
       }

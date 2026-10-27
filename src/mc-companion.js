@@ -9,7 +9,13 @@ const QUEUE = [];          // [{ at, text }]
 const MAX_QUEUE = 8;       // 攒太多轮也没意义，主人早就不等了
 let LAST_TEXT = '';        // 去重：同一条事件可能在下一次 get_events 里重复出现
 let LAST_AT = 0;
+let LAST_OK_AT = 0;        // 最近一次轮询成功（她在世界里、服务端答话）
 let WATCHER = null;
+
+/** 她是不是正活在游戏里（桥用它判断「现在能不能叫她自己玩」）。 */
+export function mcAlive(maxAgeMs = 150000) {
+  return LAST_OK_AT > 0 && Date.now() - LAST_OK_AT < maxAgeMs;
+}
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -191,6 +197,7 @@ async function ensureCompanion(ctx) {
       return false;
     }
     ctx.log('[mc] 她回来了，继续轮询');
+    LAST_OK_AT = Date.now();
     return true;
   } catch (e) {
     ctx.log(`[mc] 自动召唤失败：${e?.message ?? e}`);
@@ -229,6 +236,7 @@ async function loop(ctx) {
         await ensureCompanion(ctx);
         continue;
       }
+      LAST_OK_AT = Date.now();   // 轮询成功 = 她活着（出生点、世界都通）
       if (text) {
         // 只认 <query>…</query>：那是主人在游戏里说的话。
         const re = /<query>([\s\S]*?)<\/query>/g;
