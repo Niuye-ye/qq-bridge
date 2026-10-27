@@ -13172,6 +13172,7 @@ ${turboNote}
           url: mc.url,
           token: mc.token,
           companion: mc.companion,
+          model: mc.model,
           log,
           onQuery: async () => {
             const st = socialV2.conversations.get(mcKey);
@@ -13180,8 +13181,18 @@ ${turboNote}
               return;
             }
             if (isConversationBusyV2(mcKey, st)) {
-              log('[mc] 她正在忙，消息先攒着');
-              return;
+              const why = busyReasonV2(mcKey, st);
+              // `pendingWakeKey` 是一个没有回合的幽灵标记（DSH 那边 turn/end 丢了），
+              // 它会挂满 30 分钟的防卡死租约，把游戏里的喊话整段吃掉。
+              // 主人正在游戏里说话，这种标记不该拦人：清掉继续投。
+              if (why === 'pendingWakeKey') {
+                pendingWakeKeys.delete(mcKey);
+                disarmPendingWakeLease(mcKey);
+                log('[mc] 清掉卡住的 pendingWakeKey（没有真实回合），继续投递');
+              } else {
+                log(`[mc] 她正在忙（${why}），消息先攒着`);
+                return;
+              }
             }
             await sendWakePromptV2(mcKey, 'mc');
             // 交付成功才清队列：拼提示词用的是 peek，万一上面因为繁忙没投出去，

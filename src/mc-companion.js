@@ -137,6 +137,61 @@ async function handshake(ctx) {
   ctx.ready = true;
 }
 
+/** 调一个工具，返回拼好的文本（失败抛错）。 */
+async function callTool(ctx, name, args, timeoutMs) {
+  const res = await postJson(ctx, {
+    jsonrpc: '2.0',
+    id: ++ctx.id,
+    method: 'tools/call',
+    params: { name, arguments: args },
+  }, timeoutMs);
+  return extractText(res);
+}
+
+/**
+ * 世界里没有她时自己召唤一个。
+ * 为什么需要：Numen 的同伴是**按世界存档**存在世界里的实体，主人换地图 / 开新世界后
+ * 她就消失了（面板里也看不到），必须重新 create_companion 才会出现。
+ * 注意 create_companion 只认 3~16 位字母、数字、下划线 —— 中文名会被服务端静默忽略
+ * （返回仍是一句 "summoning…"，但永远不出现），所以这里先做一次白名单校验。
+ */
+async function ensureCompanion(ctx) {
+  const now = Date.now();
+  if (now - ctx.lastRejoinAt < 20000) return false;   // 别把服务端敲爆
+  ctx.lastRejoinAt = now;
+  if (!/^[A-Za-z0-9_]{3,16}$/.test(ctx.companion)) {
+    ctx.log(`[mc] 同伴名 "${ctx.companion}" 不合规（只能 3~16 位字母/数字/下划线），无法自动召唤`);
+    return false;
+  }
+  try {
+    const live = await callTool(ctx, 'list_companions', {}, 15000);
+    if (!/No companions are live/i.test(live) && live.trim()) return true; // 已经在
+    ctx.log('[mc] 世界里没有她（换地图/新世界），自动召唤');
+    await callTool(ctx, 'create_companion', { name: ctx.companion }, 20000);
+    await sleep(3000);
+    if (ctx.model) {
+      // 新召唤出来的身体是默认皮，顺手把女仆装穿回去（失败不影响陪伴）
+      try {
+        const code = `local ok, err = pcall(ysm.model.switch, ${JSON.stringify(ctx.model)}); if not ok then print(err.kind, err.message) end`;
+        await callTool(ctx, 'lua', { companion: ctx.companion, code }, 30000);
+        ctx.log(`[mc] 已把外观换成 ${ctx.model}`);
+      } catch (e) {
+        ctx.log(`[mc] 换外观失败：${e?.message ?? e}`);
+      }
+    }
+    const after = await callTool(ctx, 'list_companions', {}, 15000);
+    if (/No companions are live/i.test(after)) {
+      ctx.log('[mc] 召唤后仍然没有她（检查同伴名与模组版本）');
+      return false;
+    }
+    ctx.log('[mc] 她回来了，继续轮询');
+    return true;
+  } catch (e) {
+    ctx.log(`[mc] 自动召唤失败：${e?.message ?? e}`);
+    return false;
+  }
+}
+
 async function loop(ctx) {
   while (!ctx.stopped) {
     try {
@@ -152,6 +207,11 @@ async function loop(ctx) {
         ctx.fails = 0;
       }
       const text = extractText(res);
+      if (/No companions are live/i.test(text)) {
+        // 有些版本不报错，而是把这句话当正文返回
+        await ensureCompanion(ctx);
+        continue;
+      }
       if (text) {
         // 只认 <query>…</query>：那是主人在游戏里说的话。
         const re = /<query>([\s\S]*?)<\/query>/g;
@@ -172,6 +232,11 @@ async function loop(ctx) {
     } catch (e) {
       ctx.ready = false;
       ctx.fails = (ctx.fails || 0) + 1;
+      const msg = String(e?.message ?? e);
+      // 换地图 / 开新世界 → 她要重新落地。这不算故障，别走退避、别刷日志。
+      if (/No companions are live|no such companion|companion.*not found/i.test(msg)) {
+        if (await ensureCompanion(ctx)) { ctx.ready = false; continue; }
+      }
       // 游戏没开时这条路每 5 秒就 ECONNREFUSED 一次，一天两万行日志没意义。
       // 失败越多等越久（5s→10s→…→60s），只在第 1 次和每 20 次打一行。
       const wait = Math.min(60000, ctx.backoffMs * ctx.fails);
@@ -219,6 +284,8 @@ export function startMcWatcher(opts) {
     waitSeconds: Math.max(5, Math.min(55, Number(opts.waitSeconds) || 25)),
     cooldownMs: Math.max(0, Number(opts.cooldownMs) || 15000),
     backoffMs: Math.max(1000, Number(opts.backoffMs) || 5000),
+    model: String(opts.model || ''),        // 召唤后要穿的外观（YSM 模型 id），空 = 不动
+    lastRejoinAt: 0,
     lastWakeAt: 0,
     fails: 0,
   };
