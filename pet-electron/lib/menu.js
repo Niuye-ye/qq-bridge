@@ -11,6 +11,17 @@
 //
 // 依赖一律由调用方注入（deps），这里不 require electron、不读文件、不碰全局。
 
+// deps 里必须存在的符号。selfCheck 会逐个核对 —— 只数菜单项数是查不出漏传的
+// （2026-10-27 实测：applySize 没注入，「更大/更小」点下去才 TypeError，而项数照样 104 项全绿）。
+const REQUIRED_DEPS = [
+  'getWin', 'getState', 'openChat', 'feelMenuItems', 'trimTo', 'showActivity', 'showActivityBox',
+  'todayDiary', 'openPreview', 'FACTS_JSON', 'PLAY_FOCUS', 'PLAY_PRESETS', 'playFor', 'toggleTurbo',
+  'clock', 'lastPlayLine', 'levelNow', 'LEVEL_PRESETS', 'setLevel', 'togglePause', 'readPetState',
+  'toggleAnim', 'SKINS', 'writePetState', 'send', 'log', 'MOTIONS', 'FACES', 'hideForGood',
+  'showLinkStatus', 'ONECLICK', 'oneClick', 'runOneClick', 'openPath', 'BRIDGE', 'bridge', 'APP_LOG',
+  'onQuit', 'SIZE', 'SIZE_STEP', 'applySize',
+];
+
 function createMenu(deps) {
   let win = null;
   let st = {};
@@ -26,7 +37,7 @@ function createMenu(deps) {
       feelMenuItems, trimTo, showActivity, showActivityBox, todayDiary, openPreview, FACTS_JSON,
       PLAY_FOCUS, PLAY_PRESETS, playFor, toggleTurbo, clock, lastPlayLine, levelNow, LEVEL_PRESETS,
       setLevel, togglePause, readPetState, toggleAnim, SKINS, writePetState, send, log,
-      SIZE, SIZE_STEP, applySize, MOTIONS, FACES, hideForGood, showLinkStatus,
+      SIZE, SIZE_STEP, applySize, MOTIONS, FACES, hideForGood, showLinkStatus, // applySize 2026-10-27 补回（曾漏传 → 更大/更小必炸）
       ONECLICK, oneClick, runOneClick, openPath, BRIDGE, bridge, APP_LOG, onQuit,
     } = deps;
     return [
@@ -166,10 +177,17 @@ function createMenu(deps) {
     return n;
   }
 
-  /** 启动时调一次：构建模板（会走到每一个依赖符号）+ 返回项数。漏传直接抛在这里。 */
+  /**
+   * 启动时调一次：核对依赖 + 构建模板 + 返回项数。
+   * 只数项数是查不出漏传的（闭包符号缺失要到点击那一刻才 TypeError），
+   * 所以先把 REQUIRED_DEPS 逐个比对 values —— missing 非空就说明 main.js 的 deps 少了一项。
+   */
   function selfCheck() {
+    const missing = REQUIRED_DEPS.filter((k) => {
+      try { return deps[k] === undefined; } catch { return true; }   // getter 撞 TDZ 也算缺失
+    });
     const tpl = buildTemplate();
-    return { top: tpl.length, total: countItems(tpl) };
+    return { top: tpl.length, total: countItems(tpl), missing };
   }
 
   function popupMenu() {
@@ -182,4 +200,4 @@ function createMenu(deps) {
   return { popupMenu, buildTemplate, selfCheck, countItems };
 }
 
-module.exports = { createMenu };
+module.exports = { createMenu, REQUIRED_DEPS };

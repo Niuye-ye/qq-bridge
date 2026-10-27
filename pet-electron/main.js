@@ -863,6 +863,7 @@ const menu = createMenu({
   bridge,
   APP_LOG,
   onQuit: () => { quitRequested = true; app.quit(); },
+  applySize,                                   // 2026-10-27 补：漏传导致「更大/更小」TypeError
   get SIZE() { return SIZE; },
   get SIZE_STEP() { return SIZE_STEP; },
 });
@@ -1316,7 +1317,11 @@ if (!app.requestSingleInstanceLock()) {
     log('=== 桌宠启动', safeStr({ SIZE, K, FLOOR_Y }));
     log(ONECLICK ? `一键启动脚本: ${ONECLICK}` : '一键启动脚本: 没找到 —— 右键菜单里不会有「一键修复 · 启动」');
   // 菜单模板自检：整个模板树当场建一遍，漏传的依赖立刻在这里报错（别等用户右键）
-  try { const mi = menu.selfCheck(); log('菜单模板', mi.top, '个顶级项 / 共', mi.total, '项'); }
+  try {
+    const mi = menu.selfCheck();
+    log('菜单模板', mi.top, '个顶级项 / 共', mi.total, '项');
+    if (mi.missing && mi.missing.length) log('!!! 菜单依赖漏传：', mi.missing.join(', '));
+  }
   catch (e) { log('!!! 菜单模板自检失败', e.message); }
     registerAppProtocol();
     createWindow();
