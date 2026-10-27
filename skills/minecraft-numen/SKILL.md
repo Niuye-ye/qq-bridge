@@ -107,3 +107,50 @@ mcp__numen__todo    companion=xiaojingyu  items=["走到主人身边", "帮他�
 - 主人喊你，**这一轮必须动**（至少一次 `lua` 或 `say`），不能只看一眼就当回应了。
 - 距离远（>30 格）先 `say` 一句「我过来」，再走；走不动就报实话，别假装到了。
 - 她在游戏里会自己逃跑、自己打怪（reflex），那是模组的内置反应，不用你去纠正。
+
+## 3.5 用手碰方块：熔炉、床、箱子（`numen.use.*` + `numen.gui.*`）
+
+`numen.use.block(cell)` 就是**真人拿准星对准那一格右键**：它会真的打开界面（返回 Window），
+但它**不会走路**——你必须先站在 4.5 格以内，否则报错并提示你先 `numen.move.to(..., {arrive = "use"})`。
+
+### 熔炉（烧矿、烧东西）
+
+```lua
+local f = numen.scan.blocks("minecraft:furnace", {radius = 16})
+if #f == 0 then print("附近没有熔炉，得先做一个") return end
+local pos = f[1].nearest.pos
+numen.move.to(f[1], {arrive = "use"})          -- 站到能点到它的位置
+local w = numen.use.block(pos)                  -- 右键：返回 Window（界面上每个格子）
+w:put("minecraft:raw_iron", 3)                  -- 原料
+w:put("minecraft:coal", 2)                      -- 燃料（没有煤就用 oak_planks / charcoal）
+for _, s in ipairs(w.slots) do
+  if s.item then print(s.index, s.side, s.item, s.count) end
+end
+print("烧制进度", w.data[3], "/", w.data[4])     -- 熔炉的 data = 燃烧时间/总时长/进度/总进度
+w:close()
+```
+
+- 只看不拿：`w:take("minecraft:iron_ingot")` 把成品取回背包。
+- 格子不清楚就先 `numen.gui.view()` 看一遍（`index / side / item / count`）。
+- 界面没打开（`w.slots` 是空的、没有 `block` 字段）＝右键点歪了或被别的东西挡住（高草、树叶），
+  结果里会点名下一格该点哪儿——照着重新点，别原地连点。
+
+### 床（睡觉过夜）
+
+```lua
+local beds = numen.scan.blocks("#minecraft:beds", {radius = 32})   -- 这个 tag 覆盖所有颜色
+if #beds == 0 then print("附近没有床") return end
+numen.move.to(beds[1], {arrive = "use"})
+local r = numen.use.sleep({at = beds[1].nearest.pos})
+print(r.sleeping, r.bed)
+```
+
+- 返回 `sleeping=false` 且理由是 **"Only at night"** → 不是失败，等天黑（`numen.task.timer`），别重试。
+- **"too far away"** → 先 `numen.move.to`。
+- 有床但没放下：先 `numen.inv.count("minecraft:white_bed")`（0 就先 `numen.inv.craft`），
+  再用 `numen.build.place` 铺在自己脚边。
+
+### 箱子 / 工作台 / 别的容器
+
+跟熔炉同一套：`numen.use.block(pos)` 拿到 Window → `put / take / move / quick / close`。
+潜行放东西：`numen.use.block(pos, {item = "minecraft:oak_planks", sneak = true})`（Shift+右键，不会打开界面）。

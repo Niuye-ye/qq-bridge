@@ -196,6 +196,9 @@ let bridgeState = null;
 let turboState = null;   // 超活跃模式状态（/api/socialV2/turbo 的快照，9 秒刷一次）
 // 2026-10-27：玩游戏模式（玩 MC 时只听游戏里的），同样 9 秒刷一次
 let mcModeState = null;
+// 她自己在游戏里多久醒一轮（分钟）；跟 mc-mode 一起取回来，不额外发请求
+const MC_SELF_PRESETS = [3, 5, 6, 8, 10, 15, 20, 30];
+let mcSelfState = null;
 // 2026-10-27：去掉「一直玩到我说停（10 小时）」后，时长一律由「让她去玩会儿」选，
 // 这里不再需要固定的 10 小时默认值。
 // 让她去玩一会儿：时长由这里给（hours），间隔由活跃度档位决定
@@ -796,12 +799,16 @@ async function pollBridge() {
       const t = await getJson('/api/socialV2/turbo');
       if (t && t.ok) s.turbo = t;
       const mc = await getJson('/api/socialV2/mc-mode');
-      if (mc && mc.ok) s.mcMode = mc;
+      if (mc && mc.ok) {
+        s.mcMode = mc;
+        s.mcSelf = { minutes: Number(mc.selfPlayMinutes) || 6, selfPlay: mc.selfPlay !== false };
+      }
     } catch (_) {}
   }
 
   turboState = s.turbo || null;
   mcModeState = s.mcMode || null;
+  mcSelfState = s.mcSelf || null;
   const prev = bridgeState;
   bridgeState = s;
   const changed = !prev || safeStr(prev) !== safeStr(s);
@@ -880,6 +887,25 @@ function popupMenu() {
             ? '玩游戏模式：开着（只听游戏里的）· 点这里关'
             : '玩游戏模式：陪主人玩 MC 时不被别的事打断',
           click: () => toggleMcMode(),
+        },
+        {
+          // 她自己在游戏里多久醒一轮（没人说话时自己找事做）；关掉整个自主行动也能从这里点
+          label: `游戏里她自己过日子：${(st.mcSelf && st.mcSelf.selfPlay === false) ? '关着' : `每 ${(st.mcSelf && st.mcSelf.minutes) || 6} 分钟醒一轮`}`,
+          submenu: [
+            ...MC_SELF_PRESETS.map((m) => ({
+              label: `${m} 分钟一轮`,
+              type: 'radio',
+              checked: !!(st.mcSelf && st.mcSelf.selfPlay !== false && Number(st.mcSelf.minutes) === m),
+              click: () => setMcSelfMinutes(m),
+            })),
+            { type: 'separator' },
+            {
+              label: '关掉（不自己找事做）',
+              type: 'radio',
+              checked: !!(st.mcSelf && st.mcSelf.selfPlay === false),
+              click: () => setMcSelfMinutes(0),
+            },
+          ],
         },
         { label: st.paused ? '恢复她的自主时间' : '暂停她的自主时间', click: () => togglePause() },
         { label: readPetState().noAnim ? '恢复动画' : '暂停动画', click: () => toggleAnim() },
@@ -1157,9 +1183,23 @@ async function toggleMcMode() {
   } catch (e) { log('玩游戏模式切换失败', e.message); }
 }
 
+// 她自己在游戏里多久醒一轮：minutes = 0 表示关掉自主行动，其余 2~60 分钟
+async function setMcSelfMinutes(minutes) {
+  try {
+    const m = Math.max(0, Math.min(60, Math.round(Number(minutes) || 0)));
+    const r = await postJson('/api/socialV2/mc-self', m === 0 ? { selfPlay: false } : { selfPlay: true, minutes: m });
+    log('自主节奏 →', m === 0 ? '关' : `${m} 分钟`, safeStr(r));
+    win?.webContents.send('pet:ui', {
+      t: 'bubble',
+      text: m === 0 ? '好，那我自己不折腾了' : `行，我每 ${m} 分钟自己找点事做`,
+    });
+    await pollBridge();
+    return r;
+  } catch (e) { log('自主节奏切换失败', e.message); return { ok: false, error: e.message }; }
+}
+
 // 动画开关：只停渲染层的动作（呼吸/走路/待机），不影响她的自主时间
-function toggleAnim() {
-  const next = !readPetState().noAnim;
+function toggleAnim() {  const next = !readPetState().noAnim;
   writePetState({ noAnim: next });
   if (win && !win.isDestroyed()) win.webContents.send('pet:ui', { t: 'anim', on: !next });
   log('动画切换 →', next ? '暂停' : '恢复');

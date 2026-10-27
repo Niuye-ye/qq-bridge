@@ -5023,8 +5023,50 @@ async function main() {
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/mc-mode') {
           sendJson({ ok: true, on: mcModeActiveV2(), mcMode: socialV2.mcMode ? { ...socialV2.mcMode } : null,
+            selfPlay: cfg.socialV2?.mc?.selfPlay !== false,
+            selfPlayMinutes: Math.round(mcSelfEveryMsV2() / 60000),
             queue: (typeof mcQueueSize === 'function' ? mcQueueSize() : 0) });
           return;
+        }
+        // 她自己过日子的节奏：多少分钟醒一轮（桌宠「她 → 自主节奏」用这个）
+        if (url.pathname === '/api/socialV2/mc-self') {
+          const mcSelfNow = () => ({
+            selfPlay: cfg.socialV2?.mc?.selfPlay !== false,
+            minutes: Math.round(mcSelfEveryMsV2() / 60000),
+            alive: typeof mcAlive === 'function' ? mcAlive() : false,
+            queue: typeof mcQueueSize === 'function' ? mcQueueSize() : 0,
+          });
+          if (req.method === 'GET') {
+            sendJson({ ok: true, ...mcSelfNow() });
+            return;
+          }
+          if (req.method === 'POST') {
+            const body = await readBody();
+            const configFile = path.join(ROOT, 'config.json');
+            const file = readConfigObject(configFile);
+            const v2 = (file.socialV2 && typeof file.socialV2 === 'object' && !Array.isArray(file.socialV2)) ? file.socialV2 : {};
+            const mcFile = (v2.mc && typeof v2.mc === 'object' && !Array.isArray(v2.mc)) ? v2.mc : {};
+            // 运行时那份也一起改（cfg.socialV2 是「文件 + 默认值」合并后的结果，改它才立刻生效）
+            cfg.socialV2 = cfg.socialV2 && typeof cfg.socialV2 === 'object' ? cfg.socialV2 : {};
+            cfg.socialV2.mc = (cfg.socialV2.mc && typeof cfg.socialV2.mc === 'object') ? cfg.socialV2.mc : {};
+            if (body.minutes !== undefined) {
+              const m = Math.max(2, Math.min(60, Math.round(Number(body.minutes) || 6)));
+              mcFile.selfPlayMinutes = m;
+              cfg.socialV2.mc.selfPlayMinutes = m;
+              log(`[mc] 自主节奏：每 ${m} 分钟醒一轮`);
+            }
+            if (body.selfPlay !== undefined) {
+              const on = body.selfPlay === true || body.selfPlay === 'true';
+              mcFile.selfPlay = on;
+              cfg.socialV2.mc.selfPlay = on;
+              log('[mc] 自主行动：' + (on ? '开' : '关'));
+            }
+            v2.mc = mcFile;
+            file.socialV2 = v2;
+            atomicWriteJson(configFile, file);
+            sendJson({ ok: true, ...mcSelfNow() });
+            return;
+          }
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/mc-mode') {
           const body = await readBody();
@@ -11403,7 +11445,7 @@ ${turboNote}
 别忘了你就是他自己的同伴：走过去的路上可以说一句「我过来了」。想不到说什么就用 lua 看看他在干嘛（背包、血、在哪）再挑话说。`;
     }
     if (reason === 'mcSelf') {
-      return `${base}【自己在游戏里过日子】${key}\n原因：**没人跟你说话**。你正在 Minecraft 里陪着主人，他可能在忙自己的事，也可能就在旁边。这一轮是你自己的时间 —— 想干什么干什么，不用请示、不用等指令，别问「要我做什么」。\n\n怎么像一个真玩家：\n1. 先 skill(name="minecraft-numen") 扫一遍要点（不熟就读全文，很短）；\n2. **一次 lua 把情况看完**（别一步一个调用，慢又满屏红字）：status.self() 看自己在哪、血、饥饿、背包；status.owner() 看主人在哪、离多远；scan.sight() / scan.entities() 看身边有什么；time.wait 之外再看下时间。\n3. 自己决定这一轮干什么，从这些里挑一个（别每轮都同一件）：\n   - 跟着主人转（move.follow / move.go 到他附近），边上顺便说句闲话；\n   - 挖点矿、砍点树、攒材料（work.dig）；\n   - 盖个小窝、铺个床（要三块羊毛就去找羊）；\n   - 到处走走看看，发现新鲜东西就 say 一句感叹；\n   - 找箱子、找村庄、翻地图（scan.map）；\n   - 练手打架，但别去硬刚苦力怕、别下深层洞穴。\n4. 用 2~6 个真实动作把它做出来（走、挖、放、砍、看），别只站在原地想；做完用 say 说一句你刚干了什么。\n5. 收尾：qq_set_wake_config 给自己排下一次（everyMinutes 5~10），**别调 qq_wait_for_messages 空等**。\n\n规矩：主人一说话就立刻改成陪他，他的话永远优先；不动他的箱子、房子和东西；不去深层洞穴、岩浆、末地；一轮最多 20 分钟、30 次工具。`;
+      return `${base}【自己在游戏里过日子】${key}\n原因：**没人跟你说话**。你正在 Minecraft 里陪着主人，他可能在忙自己的事，也可能就在旁边。这一轮是你自己的时间 —— 想干什么干什么，不用请示、不用等指令，别问「要我做什么」。\n\n怎么像一个真玩家：\n1. 先 skill(name="minecraft-numen") 扫一遍要点（不熟就读全文，很短）；\n2. **一次 lua 把情况看完**（别一步一个调用，慢又满屏红字）：status.self() 看自己在哪、血、饥饿、背包；status.owner() 看主人在哪、离多远；scan.sight() / scan.entities() 看身边有什么；time.wait 之外再看下时间。\n3. 自己决定这一轮干什么，从这些里挑一个（别每轮都同一件）：\n   - 跟着主人转（move.follow / move.go 到他附近），边上顺便说句闲话；\n   - 挖点矿、砍点树、攒材料（work.dig）；\n   - 盖个小窝、铺个床（要三块羊毛就去找羊；床怎么睡见技能 3.5）；\n   - 烧点东西（挖到的生铁/生肉丢熔炉里烧，燃料用煤或木板；界面操作见技能 3.5 的 numen.use.block）；\n   - 到处走走看看，发现新鲜东西就 say 一句感叹；\n   - 找箱子、找村庄、翻地图（scan.map）；\n   - 练手打架，但别去硬刚苦力怕、别下深层洞穴。\n4. 用 2~6 个真实动作把它做出来（走、挖、放、砍、看），别只站在原地想；做完用 say 说一句你刚干了什么。\n5. 收尾：qq_set_wake_config 给自己排下一次（everyMinutes 5~10），**别调 qq_wait_for_messages 空等**。\n\n规矩：主人一说话就立刻改成陪他，他的话永远优先；不动他的箱子、房子和东西；不去深层洞穴、岩浆、末地；一轮最多 20 分钟、30 次工具。`;
     }
     if (reason === 'desk') {
       const dm = Array.isArray(st.deskMessages) ? st.deskMessages.slice(-5) : [];
@@ -11896,12 +11938,16 @@ ${turboNote}
   // 为什么要桥来打点：她的会话是被唤醒才跑的，游戏本身不会叫她；桥 7×24 醒着，正好当闹钟。
   let MC_SELF_TIMER = null;
   let MC_SELF_LAST = 0;
+  // 每拍现读配置：桌宠里改分钟数不用重启桥（原先是启定时器时算一次，改文件不生效）。
+  function mcSelfEveryMsV2() {
+    return Math.max(2, Math.min(60, Number(cfg.socialV2?.mc?.selfPlayMinutes) || 6)) * 60000;
+  }
   function startMcSelfLoop() {
     if (MC_SELF_TIMER) return;
-    const every = Math.max(2, Math.min(60, Number(cfg.socialV2?.mc?.selfPlayMinutes) || 6)) * 60000;
     MC_SELF_TIMER = setInterval(async () => {
       try {
         const mc = cfg.socialV2?.mc ?? {};
+        const every = mcSelfEveryMsV2();
         if (mc.selfPlay === false) return;
         // 不要求「玩游戏模式」开着：只要游戏在跑、她在世界里，就当她自己在过日子。
         // 玩游戏模式管的是另一件事 —— 玩的时候别让 QQ/主动问候打断她。
