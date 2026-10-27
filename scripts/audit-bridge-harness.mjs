@@ -30,6 +30,7 @@ import * as stateStore from '../src/state-store.mjs';
 import * as roleCard from '../src/role-card.js';        // 纯解析，无 I/O
 import * as mcCompanion from '../src/mc-companion.js';  // 模块级只有队列，startMcWatcher 不调用就不轮询
 import * as rateLimit from '../src/rate-limit.mjs';      // 纯函数（窗口计数/预占/回滚），无 I/O
+import * as memoryFacts from '../src/memory-facts.mjs';  // 纯数据层，路径由 bridge 传入（harness 里 root=临时目录）
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -180,7 +181,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...stateStore,
-    ...roleCard, ...mcCompanion, ...rateLimit,
+    ...roleCard, ...mcCompanion, ...rateLimit, ...memoryFacts,
     // snowluma-conn 会写 config.json / 磁盘上的 token 文件 —— VM 里绝不能真写，桩掉。
     discoverSnowLumaConnection: async () => null,
     persistSnowLumaEndpoint: async () => ({ ok: true, detail: 'stub' }),
