@@ -69,8 +69,13 @@ function createOneClick(opts) {
     onFinished = () => {},
   } = opts || {};
 
-  let busyAt = 0;      // 运行中 = 开始时间戳；0 = 空闲
-  let timer = null;
+  // 2026-10-27 修（审计 P2）：以前是「busyAt + 一个共享的 timer」——
+  //   ① 超时只把 busyAt 清零、不杀 powershell，于是一次卡死会永久占着端口不放；
+  //   ② timer 是共享变量，上一轮的 finish 会把下一轮的 timer 清掉，新一轮就没有超时保护了。
+  // 现在每次运行一个 run 对象，超时就 kill 掉自己那棵子进程并按失败收尾。
+  let run = null;   // { child, from, startedAt, timer, done }
+
+  const busyMs = () => (run ? Date.now() - run.startedAt : 0);
 
   function logPath() {
     try { return scriptPath ? path.join(path.dirname(scriptPath), 'logs', 'oneclick.log') : ''; } catch (_) { return ''; }
@@ -91,8 +96,8 @@ function createOneClick(opts) {
       return;
     }
     // 已经有一次在跑就别起第二个：两个 powershell 抢同一批端口只会互相打架
-    if (busyAt && Date.now() - busyAt < timeoutMs) {
-      const secs = Math.round((Date.now() - busyAt) / 1000);
+    if (run && !run.done && busyMs() < timeoutMs) {
+      const secs = Math.round(busyMs() / 1000);
       notify('上一次还在跑（' + secs + ' 秒了），等它跑完…', 5000);
       log('一键启动已在运行，忽略重复点击（已跑', secs, '秒）');
       return;
@@ -106,18 +111,18 @@ function createOneClick(opts) {
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', scriptPath, '-Quiet',
       ], opts2);
 
-      busyAt = Date.now();
+      const me = { child, from, startedAt: Date.now(), timer: null, done: false };
+      run = me;
       notify('好，我去把链路修一遍…大概 25 秒', 30000);
       log('已拉起一键启动.ps1 -Quiet → PID', child.pid, '（日志起点', from, '字节）');
 
-      let done = false;
       const finish = (code, why) => {
-        if (done) return;
-        done = true;
-        if (timer) { clearTimeout(timer); timer = null; }
-        const usedMs = Date.now() - busyAt;
-        busyAt = 0;
-        const rows = parseCheckRows(readLogDelta(lp, from));
+        if (me.done) return;
+        me.done = true;
+        if (me.timer) { clearTimeout(me.timer); me.timer = null; }
+        const usedMs = Date.now() - me.startedAt;
+        if (run === me) run = null;
+        const rows = parseCheckRows(readLogDelta(lp, me.from));
         const msg = why || oneClickSummary(rows, code);
         notify(msg, 30000);
         log('一键启动结束 code =', code, '| 耗时', Math.round(usedMs / 1000) + '秒 | 结果行数', rows.length, '|', msg);
@@ -128,13 +133,14 @@ function createOneClick(opts) {
       child.on('exit', (code) => finish(code));
       child.unref();
 
-      timer = setTimeout(() => {
-        if (!busyAt) return;
-        busyAt = 0; timer = null;
-        notify('跑了 3 分钟还没结束，可能卡住了，去看 logs\\oneclick.log', 25000);
-        log('一键启动超时（3 分钟未见退出）');
+      me.timer = setTimeout(() => {
+        if (me.done) return;
+        log('一键启动超时（' + Math.round(timeoutMs / 1000) + ' 秒未见退出），杀掉子进程');
+        // 卡住的 powershell 必须杀：它可能正占着 3000/3080/3100，留着下一轮照样抢端口
+        try { if (me.child && me.child.pid) process.kill(me.child.pid); } catch (e) { log('kill 失败', e.message); }
+        finish(null, '跑了 ' + Math.round(timeoutMs / 60000) + ' 分钟还没结束，已经掐掉，去看 logs\\oneclick.log');
       }, timeoutMs);
-      if (timer.unref) timer.unref();
+      if (me.timer.unref) me.timer.unref();
     } catch (e) { log('一键启动失败', e.message); notify('没拉起来：' + e.message, 15000); }
   }
 
@@ -144,7 +150,7 @@ function createOneClick(opts) {
     readLogDelta,
     parseCheckRows,
     oneClickSummary,
-    get busy() { return busyAt; },
+    get busy() { return run ? run.startedAt : 0; },
   };
 }
 

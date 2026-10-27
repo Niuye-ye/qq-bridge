@@ -5,11 +5,8 @@ contextBridge.exposeInMainWorld('pet', {
   /** body.js 的 host.emit 原样转给主进程（事件：mode/arrived/interrupted/touch/done） */
   emit: (kind, detail) => ipcRenderer.send('pet:event', kind, detail ?? null),
 
-  /** 渲染进程自己算的命中结果（主进程另有光标轮询，这里是补充） */
-  setHit: (inside) => ipcRenderer.send('pet:hit', !!inside),
-
-  /** 抓起/放下：拖拽期间必须强制可点，否则甩出框会丢 pointerup */
-  setDragging: (on) => ipcRenderer.send('pet:drag', !!on),
+  // 2026-10-27 删掉 setHit / setDragging：主进程那两条 IPC 通道已删除，
+  // 穿透只由主进程 30ms 光标轮询决定（AGENTS 17.10「穿透只能有一个来源」）。
 
   /** 主进程每 3s 推一次桥状态 { mood, doing, lastLine, links, paused } */
   onState: (cb) => {

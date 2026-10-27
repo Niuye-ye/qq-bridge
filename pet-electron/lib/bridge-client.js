@@ -37,12 +37,34 @@ function createBridgeClient(opts) {
     return token;
   }
 
+  /** 2026-10-27 修（审计 P2）：token 只在启动时读一次，桥换了 token（或首次读得太早、
+   *  文件后写）之后每个请求都静默 401 —— 界面上只表现为「她一直发呆」，日志里一个字都没有。
+   *  现在 401/403 就重读一次 token 再试一遍，还不行就把这一条记进日志（每种路径每分钟最多一条）。 */
+  const authWarn = new Map();   // path → 上次记日志的时间戳，防刷屏
   async function getJson(p, opt) {
-    const r = await fetch(bridgeUrl + p, {
+    const call = (tok) => fetch(bridgeUrl + p, {
       ...(opt || {}),
       signal: AbortSignal.timeout(timeoutMs),
-      headers: { 'x-console-token': token, ...((opt && opt.headers) || {}) },
+      headers: { 'x-console-token': tok, ...((opt && opt.headers) || {}) },
     });
+    let r = await call(token);
+    if (r.status === 401 || r.status === 403) {
+      let body = '';
+      try { body = await r.text(); } catch (_) {}
+      const old = token;
+      readToken();                       // 桥可能重写过 console-token / config.json
+      if (token && token !== old) {
+        log('桥回 ' + r.status + '，token 变了，重试一次', p);
+        r = await call(token);
+      }
+      if (r.status === 401 || r.status === 403) {
+        const last = authWarn.get(p) || 0;
+        if (Date.now() - last > 60000) {
+          authWarn.set(p, Date.now());
+          log('!!! 桥拒绝访问 ' + r.status + ' ' + p + (body ? ' | ' + body.slice(0, 120) : '') + '（token ' + (token ? '非空' : '为空') + '）');
+        }
+      }
+    }
     return r.json();
   }
 

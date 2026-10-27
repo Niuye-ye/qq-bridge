@@ -189,14 +189,15 @@ process.on('unhandledRejection', (e) => writeLog(`[${STAMP()}] !!! rejection ${(
 // ────────────────────────────── 状态 ──────────────────────────────
 let win = null, tray = null;
 let ignoring = true; // 当前是否穿透
-let dragging = false;
+// 2026-10-27：dragging 已删 —— 渲染进程早就不发 pet:drag 了（preload 里 setDragging 是死通道），
+// 一个永远为 false 的变量只会让「穿透到底谁说了算」更难查。穿透只由光标轮询 + winDrag 决定。
 let chatOpen = false;   // 桌面聊天框开着时不要主动插嘴
 let quitRequested = false;
 let uiRects = [];    // 渲染进程上报的、需要吃鼠标的 UI 矩形
 // consoleToken 已收进 lib/bridge-client.js（readToken 有状态，读 token 走 bridge.token）
 let bridgeState = null;
-let turboState = null;   // 超活跃模式状态（/api/socialV2/turbo 的快照，9 秒刷一次）
-// 2026-10-27：玩游戏模式（玩 MC 时只听游戏里的），同样 9 秒刷一次
+let turboState = null;   // 超活跃模式状态（/api/socialV2/turbo 的快照，每 3 轮轮询 = 6 秒刷一次）
+// 2026-10-27：玩游戏模式（玩 MC 时只听游戏里的），同样 6 秒刷一次（pollRound % 3）
 let mcModeState = null;
 // 2026-10-27：去掉「一直玩到我说停（10 小时）」后，时长一律由「让她去玩会儿」选，
 // 这里不再需要固定的 10 小时默认值。
@@ -207,7 +208,7 @@ const PLAY_FOCUS = [
   { id: 'both', label: '随便玩（手机/游戏都行）' },
 ];
 
-// 心情 / 好感度菜单项（数据来自 /api/socialV2/turbo 的 feel 字段，每 9 秒刷一次）
+// 心情 / 好感度菜单项（数据来自 /api/socialV2/turbo 的 feel 字段，每 6 秒刷一次）
 function feelMenuItems(st) {
   const f = (st && st.turbo && st.turbo.feel) || null;
   if (!f) return [{ label: '心情：她还没记过（state/mood.json）', enabled: false }];
@@ -274,14 +275,16 @@ function restoreBounds() {
   const x = Number(st.left), y = Number(st.top);
   const w = screen.getPrimaryDisplay().workArea;
   if (Number.isFinite(x) && Number.isFinite(y)) {
-    // 只要跟某块屏幕有交集就认，然后夹进工作区；差几像素不算「跑丢了」
-    const visible = screen.getAllDisplays().some((d) => {
+    // 只要跟某块屏幕有交集就认，然后夹进**那块屏**的工作区；差几像素不算「跑丢了」。
+    // 2026-10-27 修：原来一律用主屏 workArea 夹，副屏上的位置会被拽回主屏（副屏左/上为负坐标时尤其明显）。
+    const hit = screen.getAllDisplays().find((d) => {
       const a = d.workArea;
       return x + SIZE > a.x && x < a.x + a.width && y + SIZE > a.y && y < a.y + a.height;
     });
-    if (visible) {
-      const cx = Math.max(w.x - HIT_RECT.x0, Math.min(x, w.x + w.width - HIT_RECT.x1));
-      const cy = Math.max(w.y - HIT_RECT.y0, Math.min(y, w.y + w.height - HIT_RECT.y1));
+    if (hit) {
+      const a = hit.workArea;
+      const cx = Math.max(a.x - HIT_RECT.x0, Math.min(x, a.x + a.width - HIT_RECT.x1));
+      const cy = Math.max(a.y - HIT_RECT.y0, Math.min(y, a.y + a.height - HIT_RECT.y1));
       return { x: Math.round(cx), y: Math.round(cy) };
     }
     log('位置完全在屏幕外，回落默认', x, y);
@@ -398,7 +401,7 @@ function setIgnore(on) {
 let pollTimer = null;
 let dbgTicks = 0;
 let hoverIn = null;   // 光标是否在窗口附近（决定三颗按钮显不显形）
-let winDrag = null;   // 拖整窗时的抓取偏移 {dx,dy}
+let winDrag = null;   // 拖整窗时的抓取偏移 {dx,dy,startedAt}（startedAt 用来兜底超时）
 
 const HOVER_PAD = 26; // 「附近」= 窗口边缘再往外扩这么多像素
 
@@ -411,6 +414,14 @@ function startHitPolling() {
 
     // 抓着立绘拖 = 搬整个窗口，所以拖的时候窗口跟着光标跑
     if (winDrag) {
+      // 兜底（2026-10-27）：渲染进程在拖拽中途崩溃/被 reload 时 win-drag-end 永远不来，
+      // 窗口会一直粘在光标上、连点都点不到。两分钟还没松手就当它结束了。
+      if (Date.now() - (winDrag.startedAt || 0) > 120000) {
+        log('拖窗 2 分钟没收到 win-drag-end，强制结束');
+        winDrag = null;
+        writePetState({ left: b.x, top: b.y });
+        return;
+      }
       const rawX = Math.round(c.x - winDrag.dx);
       const rawY = Math.round(c.y - winDrag.dy);
       // 按「角色矩形」夹住：窗口可以出去一点，但她本人不能出屏
@@ -447,7 +458,6 @@ function startHitPolling() {
       log('悬停 →', near);
     }
 
-    if (dragging) { setIgnore(false); return; }      // body 内部拖拽/甩出期间整窗可点
     setIgnore(!hitTest(lx, ly));
   }, 30);
   log('穿透轮询已启动 hitRect=', safeStr(HIT_RECT));
@@ -546,7 +556,7 @@ function startProactive() {
   setInterval(() => {
     try {
       if (quitRequested || !win || win.isDestroyed() || !win.isVisible()) return;
-      if (winDrag || dragging) return;                    // 正在搬她，别插嘴
+      if (winDrag) return;                                // 正在搬她，别插嘴
       if (chatOpen) return;                               // 正在跟她打字，别插嘴
       if (Date.now() - lastSpeakAt < nextSpeakGap) return;
       const p = pickProactive();
@@ -607,10 +617,35 @@ function createWindow() {
     if (process.env.PET_MEM_REPORT) setTimeout(() => reportMemory('启动后'), 9000);
   });
   win.webContents.on('did-fail-load', (_e, code, desc, url) => log('did-fail-load', code, desc, url));
-  win.webContents.on('render-process-gone', (_e, d) => log('渲染进程没了', safeStr(d)));
+  let renderGoneAt = [];
+  win.webContents.on('render-process-gone', (_e, d) => {
+    log('渲染进程没了', safeStr(d));
+    // 拖拽状态必须清掉：进程都没了，win-drag-end 永远不会来，窗口会一直粘在光标上
+    winDrag = null;
+    // 白屏没人救：pet-guard 只看进程在不在，主进程活着它就认为一切正常 → 自己 reload。
+    // 但不是崩溃循环：5 分钟内最多 3 次，超了只记日志，别把 CPU 烧光。
+    const now = Date.now();
+    renderGoneAt = renderGoneAt.filter((t) => now - t < 5 * 60 * 1000);
+    renderGoneAt.push(now);
+    if (renderGoneAt.length > 3) { log('渲染进程 5 分钟内崩了 ' + renderGoneAt.length + ' 次，不再自动重载'); return; }
+    setTimeout(() => {
+      try {
+        if (win && !win.isDestroyed()) { log('重新载入渲染进程'); win.reload(); }
+      } catch (e) { log('重载失败', e.message); }
+    }, 800);
+  });
   win.webContents.on('console-message', (e) => {
     const msg = e?.message ?? '';
     if (msg && !/Security Warning/.test(msg)) log('[page]', String(msg).slice(0, 400));
+  });
+
+  // 2026-10-27：点关闭（Alt+F4 / 任务栏）不该等于「主人让我退出」——隐藏起来就行，
+  // 托盘和菜单都还在。真退出走菜单/托盘那几条路径（它们会先置 quitRequested）。
+  win.on('close', (e) => {
+    if (quitRequested) return;
+    e.preventDefault();
+    win.hide();
+    log('窗口被关闭 → 隐藏（真退出用菜单/托盘）');
   });
 
   win.on('move', () => {
@@ -777,7 +812,7 @@ async function pollBridge() {
       }
     }
   } catch (_) {}
-  // 端口 9 秒探一次就够
+  // 端口和 turbo/mc 状态 6 秒探一次就够（轮询本身 2 秒一轮）
   if (pollRound++ % 3 === 0) {
     const [sluma, web, br] = await Promise.all([probePort(3000), probePort(3080), probePort(3100)]);
     s.links = { sluma, web, bridge: br };
@@ -1129,28 +1164,22 @@ const runOneClick = oneClick.runOneClick;
 // ────────────────────────────── IPC ──────────────────────────────
 ipcMain.on('pet:log', (_e, msg) => log('[hud]', String(msg).slice(0, 400)));
 ipcMain.on('pet:event', (_e, kind, detail) => {
-  // 穿透只由 pet:hit / pet:drag / 光标轮询决定，这里纯记录，避免两套状态互相打架
+  // 穿透只由光标轮询决定（2026-10-27 起），这里纯记录，避免两套状态互相打架
   if (kind === 'touch' && detail) log('touch', detail.kind ?? '', detail.x ?? '');
   else if (kind === 'chatOpen') { chatOpen = !!detail; return; }
   else if (kind === 'mode') log('mode', detail?.mode ?? '');
 });
 
-ipcMain.on('pet:hit', (_e, inside) => {
-  if (dragging) return; // 拖拽中一直可点
-  setIgnore(!inside);
-});
-
-ipcMain.on('pet:drag', (_e, on) => {
-  dragging = !!on;
-  if (dragging) setIgnore(false); // 松手后由命中判定决定，不在这里强行穿透
-});
+// 2026-10-27 删掉 pet:hit / pet:drag 两条死通道：渲染进程（assets/pet/electron.html）
+// 早就不发它们了，只有 preload 还导着 setHit / setDragging。留着就能从渲染端改穿透，
+// 和 30ms 光标轮询抢同一件事（AGENTS 17.10「穿透只能有一个来源」）。
 
 // 拖整窗：渲染进程按下立绘 → 这里记下「光标相对窗口左上角」的偏移，轮询里每 30ms 跟一次
 ipcMain.on('pet:win-drag-start', () => {
   if (!win || win.isDestroyed()) return;
   const c = screen.getCursorScreenPoint();
   const b = win.getBounds();
-  winDrag = { dx: c.x - b.x, dy: c.y - b.y };
+  winDrag = { dx: c.x - b.x, dy: c.y - b.y, startedAt: Date.now() };
   setIgnore(false);
   log('拖窗开始 offset=', safeStr(winDrag));
 });
@@ -1366,7 +1395,12 @@ if (!app.requestSingleInstanceLock()) {
     }
   });
 
-  app.on('window-all-closed', () => { quitRequested = true; app.quit(); });
+  // 2026-10-27 修：以前 window-all-closed 里无条件把 quitRequested 置真 → Alt+F4 被算成「主人主动退出」，
+  // 写进 pet-quit 之后 pet-guard 当天不再拉起她。现在只有真退出路径（菜单/托盘/ tray quit）才写标记。
+  app.on('window-all-closed', () => {
+    log('所有窗口都关了，退出进程（未写 pet-quit，guard 会拉起）');
+    app.quit();
+  });
   app.on('before-quit', () => {
     markQuit();
     quitRequested = true;
