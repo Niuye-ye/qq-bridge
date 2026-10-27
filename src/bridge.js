@@ -31,6 +31,7 @@ import { WAKE_TRIGGER_KEYS, createSocialV2Store, defaultWakeConfigV2 as defaultW
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
 import { addGoalV2, appendLifeV2, closeGoalV2, formatGoalsLineV2, formatLifeLineV2, readGoalsV2, readLifeV2 } from './goals-life.js';
+import { checkQuota, countQuota, reserveQuota, rollbackQuota } from './rate-limit.mjs';
 // Minecraft 陪伴：轮询 Numen 模组内置 MCP 服务端的游戏内消息（纯 I/O + 队列，不碰会话状态机）
 import { dropMcMessages, mcAlive, mcBusyMs, mcQueueSize, mcStatus, peekMcMessages, startMcWatcher } from './mc-companion.js';
 import {
@@ -2674,13 +2675,13 @@ async function main() {
   // AI 提交黑话候选的限频：防止单个会话在短时间内刷大量候选。
   function allowSlangSubmit(key) {
     const now = Date.now();
-    const arr = (slangSubmitTimes.get(key) ?? []).filter((t) => now - t < 60 * 60 * 1000);
-    const recentMinute = arr.filter((t) => now - t < 60 * 1000).length;
     const MAX_PER_MINUTE = 2;
     const MAX_PER_HOUR = 10;
-    if (recentMinute >= MAX_PER_MINUTE || arr.length >= MAX_PER_HOUR) return false;
-    arr.push(now);
-    slangSubmitTimes.set(key, arr);
+    // 原来小时侧用的是 `arr.length`（数组上限 500 ⇒ 这条永远不会触发，等于只限了每分钟 2 条）。
+    // 统一走 src/rate-limit.mjs 的窗口计数，预占也用它的（返回新数组）。
+    const times = slangSubmitTimes.get(key) ?? [];
+    if (!checkQuota(times, { now, need: 1, maxPerMinute: MAX_PER_MINUTE, maxPerHour: MAX_PER_HOUR }).ok) return false;
+    slangSubmitTimes.set(key, reserveQuota(times, 1, now, MAX_PER_HOUR * 2));
     return true;
   }
 
@@ -5738,15 +5739,14 @@ async function main() {
           try {
             const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
             const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
-            const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
-            const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-            if ((maxPerMinute > 0 && recentMinute + messages.length > maxPerMinute) || (maxPerHour > 0 && recentHour + messages.length > maxPerHour)) {
+            // 额度检查/预占/回滚统一在 src/rate-limit.mjs（原来这里手写 9 份，语义已漂）。
+            const quota = checkQuota(st.sendTimes, { now, need: messages.length, maxPerMinute, maxPerHour });
+            if (!quota.ok) {
               sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
               return;
             }
             // 先预占发送额度，避免并发绕过限频
-            for (let i = 0; i < messages.length; i++) st.sendTimes.push(now);
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            st.sendTimes = reserveQuota(st.sendTimes, messages.length, now);
             const delays = computeGapsV2(messages, 'auto', undefined, undefined, sendCfg);
             const sentMessages = await sendMessagesV2(key, messages, delays);
             recordSentMessagesV2(key, sentMessages);
@@ -5769,11 +5769,7 @@ async function main() {
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
             const sentCount = Array.isArray(error?.sent) ? error.sent.length : 0;
             const failedCount = Math.max(0, messages.length - sentCount);
-            for (let i = 0; i < failedCount; i++) {
-              const idx = st.sendTimes.indexOf(now);
-              if (idx >= 0) st.sendTimes.splice(idx, 1);
-            }
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            rollbackQuota(st.sendTimes, failedCount);
             saveSocialV2State();
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
           }
@@ -5869,25 +5865,21 @@ async function main() {
           const now = Date.now();
           const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
           const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
-          const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
-          const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-          if ((maxPerMinute > 0 && recentMinute + messages.length > maxPerMinute) || (maxPerHour > 0 && recentHour + messages.length > maxPerHour)) {
+          // 额度检查/预占/回滚统一在 src/rate-limit.mjs（原来这里手写 9 份，语义已漂）。
+          const quota = checkQuota(st.sendTimes, { now, need: messages.length, maxPerMinute, maxPerHour });
+          if (!quota.ok) {
             sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
             return;
           }
           // 先预占发送额度，避免并发绕过限频
-          for (let i = 0; i < messages.length; i++) st.sendTimes.push(now);
-          if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+          st.sendTimes = reserveQuota(st.sendTimes, messages.length, now);
           let quotedInfo = null;
           let actualReplyToMessageId = replyToMessageId;
           if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
             const resolved = await resolveReplyTargetV2(st, kind, id, String(replyToMessageId).trim());
             if (!resolved) {
-              // 引用解析失败：回滚已预占的发送额度
-              for (let i = 0; i < messages.length; i++) {
-                const idx = st.sendTimes.indexOf(now);
-                if (idx >= 0) st.sendTimes.splice(idx, 1);
-              }
+              // 引用解析失败：回滚已预占的发送额度（删尾巴，不再逐条 indexOf）
+              rollbackQuota(st.sendTimes, messages.length);
               saveSocialV2State();
               sendJson({ ok: false, error: '无法解析被引用消息，请确认 message id 正确且属于当前会话（可用 qq_get_message_detail 查看）' }, 400);
               return;
@@ -5917,11 +5909,7 @@ async function main() {
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
             const sentCount = Array.isArray(error?.sent) ? error.sent.length : 0;
             const failedCount = Math.max(0, messages.length - sentCount);
-            for (let i = 0; i < failedCount; i++) {
-              const idx = st.sendTimes.indexOf(now);
-              if (idx >= 0) st.sendTimes.splice(idx, 1);
-            }
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            rollbackQuota(st.sendTimes, failedCount);
             saveSocialV2State();
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
           }
@@ -5965,14 +5953,13 @@ async function main() {
           const now = Date.now();
           const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
           const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
-          const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
-          const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-          if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
+          // 额度检查/预占/回滚统一在 src/rate-limit.mjs（原来这里手写 9 份，语义已漂）。
+          const quota = checkQuota(st.sendTimes, { now, need: 1, maxPerMinute, maxPerHour });
+          if (!quota.ok) {
             sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
             return;
           }
-          st.sendTimes.push(now);
-          if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+          st.sendTimes = reserveQuota(st.sendTimes, 1, now);
           // 成员校验是异步的（要问 OneBot）；期间操作者可能切模式/改白名单/开静默。
           // 拍一拍此前完全没有发送守卫，这里补上：真正发之前再确认一次。
           const sendGuard = captureSendGuard(key);
@@ -6023,9 +6010,7 @@ async function main() {
             appendActivity(`${key} [reserved2] 工具拍一拍${kind === 'group' ? ' -> ' + targetUserId : ''}`);
             sendJson({ ok: true, key, kind, targetUserId: targetUserId || String(id) });
           } catch (error) {
-            const idx = st.sendTimes.indexOf(now);
-            if (idx >= 0) st.sendTimes.splice(idx, 1);
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            rollbackQuota(st.sendTimes, 1);
             log(`[reserved2] 工具拍一拍失败 ${key}:`, error?.message ?? error);
             sendJson({ ok: false, error: `拍一拍失败：${error?.message ?? error}` }, error?.statusCode ?? 500);
           }
@@ -6411,14 +6396,13 @@ async function main() {
             const st = getSocialV2State(key);
             const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
             const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
-            const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
-            const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-            if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
+            // 额度检查/预占/回滚统一在 src/rate-limit.mjs（原来这里手写 9 份，语义已漂）。
+            const quota = checkQuota(st.sendTimes, { now, need: 1, maxPerMinute, maxPerHour });
+            if (!quota.ok) {
               sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
               return;
             }
-            st.sendTimes.push(now);
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            st.sendTimes = reserveQuota(st.sendTimes, 1, now);
             const sent = await sendImageV2(key, buffer, {
               replyToMessageId: actualReplyToMessageId,
               atUserId
@@ -6453,9 +6437,7 @@ async function main() {
             sendJson({ ok: true, key, source: sourceLabel, bytes: buffer.length, sent: 1, failed: 0, quoted: quotedInfo });
           } catch (error) {
             const st = getSocialV2State(key);
-            const idx = st.sendTimes.indexOf(now);
-            if (idx >= 0) st.sendTimes.splice(idx, 1);
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            rollbackQuota(st.sendTimes, 1);
             saveSocialV2State();
             log(`[image] 工具发送图片失败 ${key}: ${error?.message ?? error}`);
             sendJson({ ok: false, error: `发送图片失败：${error?.message ?? error}` }, 500);
@@ -6525,14 +6507,13 @@ async function main() {
             const st = getSocialV2State(key);
             const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
             const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
-            const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
-            const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-            if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
+            // 额度检查/预占/回滚统一在 src/rate-limit.mjs（原来这里手写 9 份，语义已漂）。
+            const quota = checkQuota(st.sendTimes, { now, need: 1, maxPerMinute, maxPerHour });
+            if (!quota.ok) {
               sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
               return;
             }
-            st.sendTimes.push(now);
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            st.sendTimes = reserveQuota(st.sendTimes, 1, now);
             const sent = await sendStickerV2(key, stickerId, {
               replyToMessageId: actualReplyToMessageId,
               atUserId
@@ -6571,9 +6552,7 @@ async function main() {
             sendJson({ ok: true, key, sticker: sent.entry, sent: 1, failed: 0, quoted: quotedInfo });
           } catch (error) {
             const st = getSocialV2State(key);
-            const idx = st.sendTimes.indexOf(now);
-            if (idx >= 0) st.sendTimes.splice(idx, 1);
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            rollbackQuota(st.sendTimes, 1);
             saveSocialV2State();
             log(`[sticker] 工具发送表情失败 ${key}: ${error?.message ?? error}`);
             sendJson({ ok: false, error: `发送表情失败：${error?.message ?? error}` }, 500);
@@ -6731,16 +6710,14 @@ async function main() {
           const now = Date.now();
           const maxPerMinute = Math.max(0, Number(collectCfg.maxPerMinute) || 0);
           const maxPerHour = Math.max(0, Number(collectCfg.maxPerHour) || 0);
-          const recentMinute = (st.stickerCollectTimes || []).filter((t) => now - t < 60000).length;
-          const recentHour = (st.stickerCollectTimes || []).filter((t) => now - t < 3600000).length;
-          if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
+          // 额度检查/预占/回滚统一在 src/rate-limit.mjs（原来这里手写 9 份，语义已漂）。
+          const quota = checkQuota(st.stickerCollectTimes, { now, need: 1, maxPerMinute, maxPerHour });
+          if (!quota.ok) {
             sendJson({ ok: false, error: '收藏表情太频繁了，请过一会儿再偷图' }, 429);
             return;
           }
           // 先预占收藏次数，避免并发调用绕过限频；失败时回滚。
-          st.stickerCollectTimes = st.stickerCollectTimes || [];
-          st.stickerCollectTimes.push(now);
-          if (st.stickerCollectTimes.length > 500) st.stickerCollectTimes = st.stickerCollectTimes.slice(-500);
+          st.stickerCollectTimes = reserveQuota(st.stickerCollectTimes, 1, now);
           try {
             const result = await collectStickerV2(key, messageRef, remark);
             saveSocialV2State();
@@ -6748,9 +6725,7 @@ async function main() {
             appendActivity(`${key} [sticker] AI 收藏表情：${result.remark || result.emojiId}`);
             sendJson({ ok: true, key, sticker: result.entry, emojiId: result.emojiId, remark: result.remark });
           } catch (error) {
-            const idx = st.stickerCollectTimes.indexOf(now);
-            if (idx >= 0) st.stickerCollectTimes.splice(idx, 1);
-            if (st.stickerCollectTimes.length > 500) st.stickerCollectTimes = st.stickerCollectTimes.slice(-500);
+            rollbackQuota(st.stickerCollectTimes, 1);
             saveSocialV2State();
             log(`[sticker] AI 收藏表情失败 ${key}: ${error?.message ?? error}`);
             sendJson({ ok: false, error: `收藏表情失败：${error?.message ?? error}` }, 500);
@@ -7798,14 +7773,13 @@ async function main() {
           try {
             const maxPerMinute = Number(sendCfg.maxSendPerMinute) || 0;
             const maxPerHour = Number(sendCfg.maxSendPerHour) || 0;
-            const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
-            const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
-            if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
+            // 额度检查/预占/回滚统一在 src/rate-limit.mjs（原来这里手写 9 份，语义已漂）。
+            const quota = checkQuota(st.sendTimes, { now, need: 1, maxPerMinute, maxPerHour });
+            if (!quota.ok) {
               sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
               return;
             }
-            st.sendTimes.push(now);
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            st.sendTimes = reserveQuota(st.sendTimes, 1, now);
             const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
             recordSentMessagesV2(key, sentMessages);
             st.lastAiReplyAt = now;
@@ -7824,11 +7798,7 @@ async function main() {
             // 失败/未发出的消息回滚预占的发送额度，避免假 429。
             const sentCount = Array.isArray(error?.sent) ? error.sent.length : 0;
             const failedCount = Math.max(0, 1 - sentCount);
-            for (let i = 0; i < failedCount; i++) {
-              const idx = st.sendTimes.indexOf(now);
-              if (idx >= 0) st.sendTimes.splice(idx, 1);
-            }
-            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            rollbackQuota(st.sendTimes, failedCount);
             saveSocialV2State();
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
           }
@@ -11537,24 +11507,15 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
     const now = Date.now();
     const maxPerMinute = Number(cfg.socialV2?.wake?.maxWakePerMinute) || 0;
     const maxPerHour = Number(cfg.socialV2?.wake?.maxWakePerHour) || 0;
-    const recentMinute = (st.wakeTimes || []).filter((t) => now - t < 60000).length;
-    const recentHour = (st.wakeTimes || []).filter((t) => now - t < 3600000).length;
     // 主人正在游戏里说话（reason='mc'）**不参与限频**：这是唯一「有人正等着回应」的场景，
     // 被限频压住的表现就是他在游戏里喊半天，她一动不动也不吭声（2026-10-27 实际踩到：
     // 活跃度 1 分钟 + 超活跃模式 + mcSelf 三套定时器把每分钟的名额吃满，mc 全被延后重试）。
     // 防刷屏交给 busy 判重与「同一条消息只投一次」，不靠限频。
-    const rateLimited = reason !== 'mc'
-      && ((maxPerMinute > 0 && recentMinute >= maxPerMinute) || (maxPerHour > 0 && recentHour >= maxPerHour));
+    // 窗口计数与「等多久再试」统一由 src/rate-limit.mjs 算（原来这里自己数两遍、排两遍序）。
+    const wakeQuota = checkQuota(st.wakeTimes, { now, need: 1, maxPerMinute, maxPerHour });
+    const rateLimited = reason !== 'mc' && !wakeQuota.ok;
     if (rateLimited) {
-      let retryAfterMs = 0;
-      if (maxPerMinute > 0 && recentMinute >= maxPerMinute) {
-        const times = (st.wakeTimes || []).filter((t) => now - t < 60000).sort((a, b) => a - b);
-        if (times.length) retryAfterMs = Math.max(retryAfterMs, 60000 - (now - times[0]) + 500);
-      }
-      if (maxPerHour > 0 && recentHour >= maxPerHour) {
-        const times = (st.wakeTimes || []).filter((t) => now - t < 3600000).sort((a, b) => a - b);
-        if (times.length) retryAfterMs = Math.max(retryAfterMs, 3600000 - (now - times[0]) + 500);
-      }
+      const retryAfterMs = wakeQuota.retryAfterMs + 500;
       // 每次只等一小段（最长 60s）：小时级限频不会一次性睡满一小时而错过中途可用的窗口。
       const waitMs = Math.min(60000, Math.max(1000, Math.round(retryAfterMs) || 5000));
       if (!st.rateLimitRetryTimer) {
