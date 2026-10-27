@@ -14,7 +14,14 @@ const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 // 用回环地址：launch token 交换默认**拒绝非回环 baseUrl**（凭据只应交给 127.0.0.1），
 // 所以夹具不能用 dsh.invalid 这类域名，否则测的是新加的那道闸门而不是协议行为。
-const client = (timeoutMs = 1000) => new NodeApiClient('http://127.0.0.1:9', timeoutMs, { token: 'fixture-token' });
+// src/dsh-client.js 里 import 的是 'ws' 的具名类，改 globalThis.WebSocket 根本影响不到它
+// （2026-10-27 审计：三条协议回归因此一直红 —— 夹具以为自己在测 WS，其实 socket 压根没建）。
+// 客户端现在支持注入，这里按当前夹具显式传入。
+let testWs = null;
+const client = (timeoutMs = 1000) => new NodeApiClient('http://127.0.0.1:9', timeoutMs, {
+  token: 'fixture-token',
+  ...(testWs ? { WebSocket: testWs } : {}),
+});
 
 test('session/cancel uses the DSH request wrapper and unwraps the envelope', async () => {
   const api = client();
@@ -160,7 +167,7 @@ const unavailableProjections = async (method, payload) => (
 );
 
 test('session retirement reads the inbox projection through session/projections (no socket)', async () => {
-  globalThis.WebSocket = FakeWebSocket;
+  globalThis.WebSocket = FakeWebSocket; testWs = FakeWebSocket;
   const before = FakeWebSocket.sockets.length;
   const api = client();
   api.cookie = 'fixture=ok';
@@ -186,7 +193,7 @@ test('session retirement reads the inbox projection through session/projections 
 });
 
 test('session retirement falls back to the 0.2.0 control baseline shape and removes only its own items', async () => {
-  globalThis.WebSocket = FakeWebSocket;
+  globalThis.WebSocket = FakeWebSocket; testWs = FakeWebSocket;
   const api = client();
   api.cookie = 'fixture=ok';
   const calls = [];
@@ -211,7 +218,7 @@ test('session retirement falls back to the 0.2.0 control baseline shape and remo
 });
 
 test('session retirement closes its control socket on timeout', async () => {
-  globalThis.WebSocket = FakeWebSocket;
+  globalThis.WebSocket = FakeWebSocket; testWs = FakeWebSocket;
   const api = client();
   api.cookie = 'fixture=ok';
   // 主路径不可用 ⇒ 走 control 流；control 流始终不发 baseline ⇒ 只能被超时中止。
@@ -225,7 +232,7 @@ test('session retirement closes its control socket on timeout', async () => {
 });
 
 test('session retirement reports control failure while still cancelling active work', async () => {
-  globalThis.WebSocket = FakeWebSocket;
+  globalThis.WebSocket = FakeWebSocket; testWs = FakeWebSocket;
   const api = client();
   api.cookie = 'fixture=ok';
   const calls = [];
@@ -243,7 +250,7 @@ test('session retirement reports control failure while still cancelling active w
 });
 
 test('pre-aborted event stream never opens a WebSocket', async () => {
-  globalThis.WebSocket = FakeWebSocket;
+  globalThis.WebSocket = FakeWebSocket; testWs = FakeWebSocket;
   globalThis.fetch = async () => new Response('', { headers: { 'set-cookie': 'fixture=ok' } });
   const api = client();
   const abort = new AbortController();
@@ -254,7 +261,7 @@ test('pre-aborted event stream never opens a WebSocket', async () => {
 });
 
 test('failed follow send can be retried and never stays marked followed', async () => {
-  globalThis.WebSocket = FakeWebSocket;
+  globalThis.WebSocket = FakeWebSocket; testWs = FakeWebSocket;
   const api = client();
   api.cookie = 'fixture=ok';
   const abort = new AbortController();
@@ -277,7 +284,7 @@ test('failed follow send can be retried and never stays marked followed', async 
 
 for (const type of ['end', 'error']) {
   test(`logical $events ${type} ends the transport so the bridge can reconnect`, async () => {
-    globalThis.WebSocket = FakeWebSocket;
+    globalThis.WebSocket = FakeWebSocket; testWs = FakeWebSocket; testWs = FakeWebSocket;
     const api = client();
     api.cookie = 'fixture=ok';
     api.events.follow('session-a');
@@ -302,7 +309,7 @@ for (const type of ['end', 'error']) {
 }
 
 test('transient follow errors preserve subscriptions and close transport for retry', async () => {
-  globalThis.WebSocket = FakeWebSocket;
+  globalThis.WebSocket = FakeWebSocket; testWs = FakeWebSocket;
   const api = client();
   api.cookie = 'fixture=ok';
   api.events.follow('session-a');

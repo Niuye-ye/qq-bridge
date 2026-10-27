@@ -35,7 +35,9 @@ class FakeWebSocket {
 globalThis.WebSocket = FakeWebSocket;
 
 const { NodeApiClient } = await import(pathToFileURL(path.join(ROOT, 'src/dsh-client.js')).href);
-const client = new NodeApiClient('http://127.0.0.1:3080', undefined, {});
+// src/dsh-client.js 里 import 的是 'ws' 的具名类，改 globalThis 影响不到它（2026-10-27 审计），
+// 所以显式注入；否则 sockets[0] 恒 undefined，这条回归永远测不到真东西。
+const client = new NodeApiClient('http://127.0.0.1:3080', undefined, { WebSocket: FakeWebSocket });
 // 不走真实鉴权：本测试只关心 follow 的重放行为。
 client.ensureAuth = async () => { client.cookie = 'test-cookie'; };
 

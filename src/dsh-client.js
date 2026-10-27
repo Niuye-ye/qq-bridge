@@ -320,6 +320,10 @@ export class NodeApiClient extends AbstractApiClient {
     // 期望 follow 的会话集合：**跨重连保留**。DSH 重启或 WS 中断后必须重放，
     // 否则已有会话再也收不到 session 事件（turn/end 丢失 → QQ 上永远没有回复，且无报错）。
     this._desiredFollows = new Set();
+    // WebSocket 实现可注入（默认就是 'ws'）：
+    // 离线回归测试用 FakeWebSocket 顶替，靠 globalThis 是**不管用**的 —— 这里 import 的是
+    // 'ws' 的具名类，跟浏览器全局是两个东西（2026-10-27 审计：三条协议回归因此一直红）。
+    this.WebSocketImpl = this.auth.WebSocket || WsClient;
   }
 
   /** Node 没有 location；把 base 固定为配置的 DSH 地址（回环地址天然通过 /api 信任栅栏）。 */
@@ -513,7 +517,7 @@ export class NodeApiClient extends AbstractApiClient {
     signal?.throwIfAborted();
     const url = new URL('/api/remote.mux', this.baseUrl);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WsClient(url, { headers: { cookie: this.cookie } });
+    const socket = new this.WebSocketImpl(url, { headers: { cookie: this.cookie } });
     const streamId = randomUUID();
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -525,7 +529,7 @@ export class NodeApiClient extends AbstractApiClient {
         socket.removeEventListener('message', message);
         socket.removeEventListener('error', failed);
         socket.removeEventListener('close', failed);
-        if (socket.readyState === WsClient.CONNECTING || socket.readyState === WsClient.OPEN) socket.close();
+        if (socket.readyState === this.WebSocketImpl.CONNECTING || socket.readyState === this.WebSocketImpl.OPEN) socket.close();
         if (error) reject(error); else resolve(items);
       };
       const abort = () => finish(signal.reason);
@@ -690,7 +694,7 @@ export class NodeApiClient extends AbstractApiClient {
     sig.throwIfAborted();
     const url = new URL('/api/remote.mux', this.baseUrl);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-    const socket = new WsClient(url, { headers: { cookie: this.cookie } });
+    const socket = new this.WebSocketImpl(url, { headers: { cookie: this.cookie } });
     const inbox = [];
     let wake;
     let socketOpen = false;
@@ -892,7 +896,7 @@ export class NodeApiClient extends AbstractApiClient {
     const handleError = () => endStream();
     const handleAbort = () => {
       endStream();
-      if (socket.readyState === WsClient.CONNECTING || socket.readyState === WsClient.OPEN) socket.close();
+      if (socket.readyState === this.WebSocketImpl.CONNECTING || socket.readyState === this.WebSocketImpl.OPEN) socket.close();
     };
     socket.addEventListener('open', handleOpen);
     socket.addEventListener('message', handleMessage);
