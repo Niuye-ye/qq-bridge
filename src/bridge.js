@@ -4982,6 +4982,33 @@ async function main() {
           sendJson({ ok: true, config: cfg.socialV2 });
           return;
         }
+        // 「她在干嘛」详情：活动 / 心情好感 / 想干的事 / 今天的时间线 / 正在玩什么，一次取全
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/self') {
+          const selfKey = `private:${String(cfg.ownerQQ ?? '')}`;
+          const selfSt = socialV2.conversations.get(selfKey) || {};
+          let goalsList = [];
+          let lifeList = [];
+          try { goalsList = readGoalsV2() || []; } catch { /* ignore */ }
+          try { lifeList = readLifeV2() || []; } catch { /* ignore */ }
+          let alive = false;
+          try { alive = mcAlive(); } catch { /* ignore */ }
+          const t = turboStatusV2();
+          sendJson({
+            ok: true,
+            activity: readActivityV2(),
+            feel: readFeelV2(),
+            goals: goalsList.slice(-6).map((g) => String(g?.text ?? '').slice(0, 80)).filter(Boolean),
+            life: lifeList.slice(-4).map((l) => String(l?.text ?? l ?? '').slice(0, 80)).filter(Boolean),
+            busy: isConversationBusyV2(selfKey, selfSt),
+            lastAiReplyAt: selfSt.lastAiReplyAt || 0,
+            unread: Array.isArray(selfSt.unread) ? selfSt.unread.length : 0,
+            playing: t.on ? { focus: t.focus, focusLabel: t.focusLabel, remainMinutes: t.remainMinutes, everyMinutes: t.everyMinutes, costCny: t.costTurboCny, level: t.level } : null,
+            mc: { alive, queue: (() => { try { return mcQueueSize(); } catch { return 0; } })(), mode: mcModeActiveV2() },
+            paused: !!socialV2.paused,
+            level: socialV2.level ? { ...socialV2.level } : null,
+          });
+          return;
+        }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/activity') {
           sendJson({ ok: true, paused: socialV2.paused });
           return;
@@ -5017,83 +5044,14 @@ async function main() {
           const body = await readBody();
           const on = body.on === true;
           // hours = 这一段玩多久；intervalMinutes = 多久醒一轮（桌宠的活跃度档位就靠它传下来，不写回 level）
-          const status = setTurboV2(on, Number(body.hours) || 0, body.by ? String(body.by) : 'console', Number(body.intervalMinutes) || 0);
+          const status = setTurboV2(on, Number(body.hours) || 0, body.by ? String(body.by) : 'console', Number(body.intervalMinutes) || 0, body.focus ? String(body.focus) : '');
           sendJson({ ok: true, ...status });
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/mc-mode') {
           sendJson({ ok: true, on: mcModeActiveV2(), mcMode: socialV2.mcMode ? { ...socialV2.mcMode } : null,
-            selfPlay: cfg.socialV2?.mc?.selfPlay !== false,
-            selfPlayMinutes: Math.round(mcSelfEveryMsV2() / 60000),
+            focus: turboActiveV2() ? turboFocusV2() : '',
             queue: (typeof mcQueueSize === 'function' ? mcQueueSize() : 0) });
-          return;
-        }
-        // 她自己过日子的节奏：多少分钟醒一轮（桌宠「她 → 自主节奏」用这个）
-        if (url.pathname === '/api/socialV2/mc-self') {
-          const mcSelfNow = () => ({
-            selfPlay: cfg.socialV2?.mc?.selfPlay !== false,
-            minutes: Math.round(mcSelfEveryMsV2() / 60000),
-            alive: typeof mcAlive === 'function' ? mcAlive() : false,
-            queue: typeof mcQueueSize === 'function' ? mcQueueSize() : 0,
-          });
-          if (req.method === 'GET') {
-            sendJson({ ok: true, ...mcSelfNow() });
-            return;
-          }
-          if (req.method === 'POST') {
-            const body = await readBody();
-            const configFile = path.join(ROOT, 'config.json');
-            const file = readConfigObject(configFile);
-            const v2 = (file.socialV2 && typeof file.socialV2 === 'object' && !Array.isArray(file.socialV2)) ? file.socialV2 : {};
-            const mcFile = (v2.mc && typeof v2.mc === 'object' && !Array.isArray(v2.mc)) ? v2.mc : {};
-            // 运行时那份也一起改（cfg.socialV2 是「文件 + 默认值」合并后的结果，改它才立刻生效）
-            cfg.socialV2 = cfg.socialV2 && typeof cfg.socialV2 === 'object' ? cfg.socialV2 : {};
-            cfg.socialV2.mc = (cfg.socialV2.mc && typeof cfg.socialV2.mc === 'object') ? cfg.socialV2.mc : {};
-            if (body.minutes !== undefined) {
-              const m = Math.max(2, Math.min(60, Math.round(Number(body.minutes) || 6)));
-              mcFile.selfPlayMinutes = m;
-              cfg.socialV2.mc.selfPlayMinutes = m;
-              log(`[mc] 自主节奏：每 ${m} 分钟醒一轮`);
-            }
-            if (body.selfPlay !== undefined) {
-              const on = body.selfPlay === true || body.selfPlay === 'true';
-              mcFile.selfPlay = on;
-              cfg.socialV2.mc.selfPlay = on;
-              log('[mc] 自主行动：' + (on ? '开' : '关'));
-            }
-            v2.mc = mcFile;
-            file.socialV2 = v2;
-            atomicWriteJson(configFile, file);
-            sendJson({ ok: true, ...mcSelfNow() });
-            return;
-          }
-        }
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/mc-mode') {
-          const body = await readBody();
-          const on = body.on === true;
-          const minutes = Number(body.minutes) || 0;      // 0 = 一直开着，直到手动关
-          if (on) {
-            socialV2.mcMode = { on: true, since: Date.now(), until: minutes > 0 ? Date.now() + minutes * 60000 : 0 };
-            log('[mc] 玩游戏模式：开' + (minutes > 0 ? `（${minutes} 分钟后自动结束）` : '（手动关）'));
-          } else {
-            socialV2.mcMode = null;
-            log('[mc] 玩游戏模式：关');
-          }
-          saveSocialV2State();
-          // 开关都要重排定时器：开的时候停掉，关的时候恢复
-          for (const key of socialV2.conversations.keys()) {
-            cancelProactiveCheckV2(key);
-            setupIntervalTimerV2(key);
-            if (!on) scheduleProactiveCheckV2(key);
-          }
-          if (!on) {
-            // 关掉后如果积了未读，立刻回一轮，别让主人等下一个自醒点
-            for (const [key, st] of socialV2.conversations) {
-              const unread = Array.isArray(st.unread) ? st.unread.length : 0;
-              if (unread > 0) void sendWakePromptV2(key, 'private').catch(() => {});
-            }
-          }
-          sendJson({ ok: true, on: mcModeActiveV2(), mcMode: socialV2.mcMode ? { ...socialV2.mcMode } : null });
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/level') {
@@ -10339,6 +10297,10 @@ async function main() {
     if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
     st.unread.push(msg);
     if (st.unread.length > unreadLimit) st.unread.splice(0, st.unread.length - unreadLimit);
+    // 主人开口了 → 好感度微涨（她不看这个决定行为，纯粹是给桌宠显示的真实反馈）
+    if (msg.isOwner) {
+      try { touchFeelTalkV2(); } catch { /* ignore */ }
+    }
     // 超活跃模式的叫停：主人私聊里说了「停」这类词才关，普通消息不打断整晚模式。
     if (msg.isOwner && turboActiveV2() && /^private:/.test(String(key))) {
       const ownerLine = String(plainContent ?? textContent ?? '');
@@ -10717,6 +10679,40 @@ async function main() {
     return next;
   }
 
+  // ── 心情 / 好感度（state/mood.json）────────────────────────────────────────
+  // 文件是她自己维护的（旧结构不改）：{affinity: 0~10, mood: happy|calm|low|sad|excited|tired,
+  // lastTalkAt, lastDiaryAt}，可以额外写 note（一句心情说明）。这里只负责把它翻译成人话给桌宠看。
+  const MOOD_LABELS = {
+    happy: '开心', calm: '平静', low: '有点低落', sad: '难过', excited: '兴奋',
+    tired: '困了', angry: '生气', shy: '害羞', bored: '无聊', lonely: '有点想他',
+  };
+  function moodLabelV2(m) {
+    const k = String(m || '').trim();
+    return MOOD_LABELS[k] || (k ? k : '说不清');
+  }
+  function readFeelV2() {
+    try {
+      const p = path.join(ROOT, 'state', 'mood.json');
+      if (!fs.existsSync(p)) return null;
+      const o = JSON.parse(fs.readFileSync(p, 'utf8').replace(/^﻿/, '')) || {};
+      const aff = Number(o.affinity);
+      const a = Number.isFinite(aff) ? Math.max(0, Math.min(10, aff)) : null;
+      const tier = a === null ? '' : a >= 9 ? '离不开你' : a >= 7 ? '很黏你' : a >= 5 ? '亲近' : a >= 3 ? '有点熟' : '还端着';
+      return {
+        affinity: a,
+        affinityPercent: a === null ? null : Math.round(a * 10),
+        affinityTier: tier,
+        mood: String(o.mood || ''),
+        moodLabel: moodLabelV2(o.mood),
+        note: String(o.note || '').slice(0, 160),
+        lastTalkAt: String(o.lastTalkAt || ''),
+        lastDiaryAt: String(o.lastDiaryAt || ''),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   // 想干的事（goals）+ 生活时间线（life）已经抽到 ./goals-life.js（2026-10-24）
 
   function formatClockV2() {
@@ -10744,19 +10740,41 @@ async function main() {
   }
 
   function formatMoodLineV2() {
+    const f = readFeelV2();
+    if (!f) return '';
+    const bits = [`心情=${f.moodLabel}${f.note ? `（${f.note}）` : ''}`];
+    if (f.affinityPercent !== null) bits.push(`好感度=${f.affinityPercent}%${f.affinityTier ? `（${f.affinityTier}）` : ''}`);
+    if (f.lastTalkAt) bits.push(`上次聊天=${f.lastTalkAt}`);
+    if (f.lastDiaryAt) bits.push(`上次写日记=${f.lastDiaryAt}`);
+    const tip = '（这是你自己记的；心情变了就顺手改 state/mood.json 的 mood / affinity（0~10）/ note —— 桌宠上显示的就是这几个字段。）';
+    return `【心情】${bits.join('；')}\n${tip}`;
+  }
+
+  // 写回 state/mood.json（只覆盖传进来的字段，剩下的她自己写的原样保留）
+  function updateFeelV2(patch = {}) {
     try {
       const p = path.join(ROOT, 'state', 'mood.json');
-      if (!fs.existsSync(p)) return '';
-      const raw = fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, '');
-      const o = JSON.parse(raw);
-      const aff = Number(o.affinity);
-      const bits = [`affinity=${Number.isFinite(aff) ? aff : '?'}`, `mood=${o.mood || '?'}`];
-      if (o.lastTalkAt) bits.push(`上次聊天=${o.lastTalkAt}`);
-      if (o.lastDiaryAt) bits.push(`上次写日记=${o.lastDiaryAt}`);
-      return `【心情】${bits.join('；')}`;
+      let o = {};
+      if (fs.existsSync(p)) {
+        try { o = JSON.parse(fs.readFileSync(p, 'utf8').replace(/^﻿/, '')) || {}; } catch { o = {}; }
+      }
+      const next = { ...o, ...patch };
+      atomicWriteJson(p, next);
+      return next;
     } catch {
-      return '';
+      return null;
     }
+  }
+  // 主人一说话，好感度就往上涨一点点（10 分钟最多 +0.1，避免刷屏刷满）；心情由她自己写。
+  let FEEL_LAST_BUMP_AT = 0;
+  function touchFeelTalkV2() {
+    const now = Date.now();
+    if (now - FEEL_LAST_BUMP_AT < 10 * 60000) return;
+    FEEL_LAST_BUMP_AT = now;
+    const cur = readFeelV2();
+    const base = cur && typeof cur.affinity === 'number' ? cur.affinity : 5;
+    const next = Math.min(10, Math.round((base + 0.1) * 10) / 10);
+    updateFeelV2({ affinity: next, lastTalkAt: new Date().toISOString() });
   }
 
   // ── 长期记忆（会淡忘的事实）──────────────────────────────────────────────
@@ -11421,13 +11439,28 @@ async function main() {
         : '- 夜里（0~7 点）桥会自动把间隔放慢到 60 分钟，那几轮多半该睡就睡。';
       const moodText = formatMoodLineV2();
       const diaryText = readDiarySummaryV2();
-      return `${base.replace(preSleepLine, '【本轮不做沉睡前观察】定时自醒的轮次没有"收尾"这回事，禁止调用 qq_wait_for_messages 空等；想结束就直接安排下次醒来。')}${moodText ? `${moodText}\n\n` : ''}${diaryText ? `【最近日记】\n${diaryText}\n\n` : ''}【你自己的时间】${key}\n原因：定时器到点了（每 ${mins || '?'} 分钟醒一次），不是有人找你，也没人在等你回话。\n**这一轮不需要做沉睡前观察**：没人跟你对话，没有"收尾"这回事，上面的【沉睡前强制等待】不适用于这轮；想结束就直接安排下次醒来。\n这就是你自己的时间，想干什么干什么：
-- **先看【你自己想干的事】**：那几条是你之前自己记下的，挑一条接着做；做完了用 qq_done_goal 划掉，不想干了用 qq_drop_goal。都没有就随便逛，逛着逛着冒出念头，用 qq_add_goal 记下来。
+      // 主人在「让她去玩会儿」里指定了这一轮玩什么（手机 / MC / 都行）——决定这轮给哪套动作说明。
+      const playFocus = turboActiveV2() ? turboFocusV2() : 'phone';
+      const mcPlayBody = `- **这一轮是进游戏里玩**（主人指定去玩 Minecraft）：先 skill(name="minecraft-numen") 读要点，再用**一次 lua** 把情况看完（status.self 看自己、status.owner 看主人、scan.sight / scan.entities 看周围），然后真的动手做一件事，从这些里挑（别每轮都同一件）：
+  - 跟着主人转（move.follow / move.go 到他附近），路上说句闲话；
+  - 挖矿砍树攒材料（work.dig）；
+  - 盖个小窝、铺个床（要羊毛就去找羊，床怎么睡见技能 3.5）；
+  - 烧点东西（生铁/生肉丢熔炉，燃料用煤或木板，界面操作见技能 3.5）；
+  - 到处走走看风景、发现新鲜东西就 say 一句感叹；
+  - 找箱子村庄翻地图（scan.map）；练手打架，但别硬刚苦力怕、别下深层洞穴和岩浆。
+- 一轮做 2~6 个真实动作（走、挖、放、砍、看），做完用 say 说一句你刚干了什么。
+- 游戏里的交互（熔炉、床、箱子、存储、附魔、繁殖、坐船、钓鱼……）都在技能卡 §3.5 之后，要用先去查，别自己猜 API。
+- **这一轮别玩手机**：不用 app_start、不用刷 feed；QQ 群没人找你就不用管。`;
+      const phonePlayBody = `- **先看【你自己想干的事】**：那几条是你之前自己记下的，挑一条接着做；做完了用 qq_done_goal 划掉，不想干了用 qq_drop_goal。都没有就随便逛，逛着逛着冒出念头，用 qq_add_goal 记下来。
 - 接着干上一件没干完的事：看【你刚才在干嘛】那条，继续刷手机/继续看那个帖子/继续跟人聊；不想干了就换。想玩手机就真的玩：先 app_current 看前台是什么，不是娱乐 App 就 app_start 开一个（小黑盒 com.max.xiaoheihe、B站 tv.danmaku.bili），等 5~8 秒，screenshot 看一眼，然后 swipe_up 往下刷，刷到什么记在心里。
 - **动手才算玩**：这一轮只要决定玩手机，至少做 3 个真实动作（app_start / click / swipe_up / press_key / send_text）——只 screenshot 看一眼不算玩过；做不到 3 个，活动里就别写「在刷手机」。点不动时别反复戳同一个坐标：先看截图确认目标在哪，再用 dump_hierarchy 搜真实 bounds、或用 xpath_click 按文字点；连点两次没反应就换法子，别放弃。
 - 能干的事不止刷手机：看视频、翻评论区、搜东西、发说说、写日记、做个短视频（qq_make_video）、整理你记的事、发呆、赖床、睡一觉（把 everyMinutes 调大或设成潜水）。挑你此刻真想干的，别为了让记录好看而硬做。
 - 玩手机是你的事，不用向任何人汇报；刷到真有意思的再随口说一句，没意思就闭嘴。
-- 群里有人说话且你想接就接；没人说话也不必硬找话说。
+- 群里有人说话且你想接就接；没人说话也不必硬找话说。`;
+      const playBody = playFocus === 'mc'
+        ? mcPlayBody
+        : (playFocus === 'both' ? `${phonePlayBody}\n- 也可以进游戏里玩（两样都行）：想进游戏就照下面这套做。\n${mcPlayBody}` : phonePlayBody);
+      return `${base.replace(preSleepLine, '【本轮不做沉睡前观察】定时自醒的轮次没有"收尾"这回事，禁止调用 qq_wait_for_messages 空等；想结束就直接安排下次醒来。')}${moodText ? `${moodText}\n\n` : ''}${diaryText ? `【最近日记】\n${diaryText}\n\n` : ''}【你自己的时间】${key}\n原因：定时器到点了（每 ${mins || '?'} 分钟醒一次），不是有人找你，也没人在等你回话。\n**这一轮不需要做沉睡前观察**：没人跟你对话，没有"收尾"这回事，上面的【沉睡前强制等待】不适用于这轮；想结束就直接安排下次醒来。\n这就是你自己的时间，想干什么干什么：\n${playBody}
 - **结束前必须做两件事**：①qq_set_activity —— doing 写这一轮到底干了什么（要具体，比如「在刷小黑盒，看到有人在吵显卡」），note 写心里想的，plan 写下次想接着干什么；②qq_append_life —— 写一行时间线（比如「13:40 刷小黑盒，看到有人在吵显卡」）。不记的话，你下次醒来就不知道自己刚才在干嘛，等于白玩。可选的：qq_mark_read、qq_set_wake_config 安排下次醒来。
 - **这一轮有预算**：最多调 30 次工具、也别超过 20 分钟。预算到了就先收尾（qq_set_activity + qq_append_life + qq_set_wake_config），剩下的下次接着干，别硬磨——一轮拖太久会把自己卡死。
 ${turboNote}
@@ -11443,9 +11476,6 @@ ${turboNote}
 4. 说完再 get_events 看一眼他有没有接话；他继续说你就在这一轮接着回。
 5. **这一轮别做 5 分钟的沉睡前观察**：主人在游戏里等着，回完就用 qq_set_wake_config 安排下次唤醒收尾（一句话就够），别调 qq_wait_for_messages 空等。
 别忘了你就是他自己的同伴：走过去的路上可以说一句「我过来了」。想不到说什么就用 lua 看看他在干嘛（背包、血、在哪）再挑话说。`;
-    }
-    if (reason === 'mcSelf') {
-      return `${base}【自己在游戏里过日子】${key}\n原因：**没人跟你说话**。你正在 Minecraft 里陪着主人，他可能在忙自己的事，也可能就在旁边。这一轮是你自己的时间 —— 想干什么干什么，不用请示、不用等指令，别问「要我做什么」。\n\n怎么像一个真玩家：\n1. 先 skill(name="minecraft-numen") 扫一遍要点（不熟就读全文，很短）；\n2. **一次 lua 把情况看完**（别一步一个调用，慢又满屏红字）：status.self() 看自己在哪、血、饥饿、背包；status.owner() 看主人在哪、离多远；scan.sight() / scan.entities() 看身边有什么；time.wait 之外再看下时间。\n3. 自己决定这一轮干什么，从这些里挑一个（别每轮都同一件）：\n   - 跟着主人转（move.follow / move.go 到他附近），边上顺便说句闲话；\n   - 挖点矿、砍点树、攒材料（work.dig）；\n   - 盖个小窝、铺个床（要三块羊毛就去找羊；床怎么睡见技能 3.5）；\n   - 烧点东西（挖到的生铁/生肉丢熔炉里烧，燃料用煤或木板；界面操作见技能 3.5 的 numen.use.block）；\n   - 到处走走看看，发现新鲜东西就 say 一句感叹；\n   - 找箱子、找村庄、翻地图（scan.map）；\n   - 练手打架，但别去硬刚苦力怕、别下深层洞穴。\n4. 用 2~6 个真实动作把它做出来（走、挖、放、砍、看），别只站在原地想；做完用 say 说一句你刚干了什么。\n5. 收尾：qq_set_wake_config 给自己排下一次（everyMinutes 5~10），**别调 qq_wait_for_messages 空等**。\n\n规矩：主人一说话就立刻改成陪他，他的话永远优先；不动他的箱子、房子和东西；不去深层洞穴、岩浆、末地；一轮最多 20 分钟、30 次工具。`;
     }
     if (reason === 'desk') {
       const dm = Array.isArray(st.deskMessages) ? st.deskMessages.slice(-5) : [];
@@ -11548,6 +11578,11 @@ ${turboNote}
     // 消息本身照收（unread 会累加），退出模式后一轮就能一起回，不丢。
     if (mcModeActiveV2() && reason !== 'mc' && reason !== 'mcSelf') {
       log(`[reserved2] 玩游戏模式中，跳过唤醒 ${key}（${reason}）`);
+      return;
+    }
+    // 主人指定这一轮「玩手机」：游戏里的话先不给（也不取走队列），等这段玩完再一起回。
+    if (reason === 'mc' && turboActiveV2() && turboFocusV2() === 'phone') {
+      log(`[reserved2] 正在玩手机，游戏里的消息先攒着 ${key}`);
       return;
     }
     const st = getSocialV2State(key);
@@ -11944,39 +11979,11 @@ ${turboNote}
   // 为什么要桥来打点：她的会话是被唤醒才跑的，游戏本身不会叫她；桥 7×24 醒着，正好当闹钟。
   let MC_SELF_TIMER = null;
   let MC_SELF_LAST = 0;
-  // 每拍现读配置：桌宠里改分钟数不用重启桥（原先是启定时器时算一次，改文件不生效）。
-  function mcSelfEveryMsV2() {
-    return Math.max(2, Math.min(60, Number(cfg.socialV2?.mc?.selfPlayMinutes) || 6)) * 60000;
-  }
-  function startMcSelfLoop() {
-    if (MC_SELF_TIMER) return;
-    MC_SELF_TIMER = setInterval(async () => {
-      try {
-        const mc = cfg.socialV2?.mc ?? {};
-        const every = mcSelfEveryMsV2();
-        if (mc.selfPlay === false) return;
-        // 不要求「玩游戏模式」开着：只要游戏在跑、她在世界里，就当她自己在过日子。
-        // 玩游戏模式管的是另一件事 —— 玩的时候别让 QQ/主动问候打断她。
-        if (socialV2.paused || currentMode !== 'reserved2') return;
-        if (!mcAlive()) return;                        // 游戏没开 / 她不在这个世界里
-        if (mcQueueSize() > 0) return;                 // 主人在游戏里说话 → 那一轮优先，别插队
-        const key = `private:${String(cfg.ownerQQ ?? '')}`;
-        if (!cfg.ownerQQ) return;
-        const st = socialV2.conversations.get(key);
-        if (!st || isConversationBusyV2(key, st)) return;
-        if (Date.now() - MC_SELF_LAST < every) return;
-        MC_SELF_LAST = Date.now();
-        log('[mc] 没人找她，这一轮她自己安排');
-        await sendWakePromptV2(key, 'mcSelf');
-      } catch (e) {
-        log('[mc] 自主行动异常:', e?.message ?? e);
-      }
-    }, 60000);
-    MC_SELF_TIMER.unref?.();
-  }
-
   // 玩游戏模式是否开着（到期自动失效，不用人记着关）
   function mcModeActiveV2() {
+    // 「让她去玩会儿」里指定去玩 Minecraft 的那一段，效果和老的游戏模式开关一样：
+    // 除了游戏里主人说的话，别的唤醒都先按住（消息照收，玩完一轮回）。
+    if (turboActiveV2() && turboFocusV2() === 'mc') return true;
     const m = socialV2.mcMode;
     if (!m || m.on !== true) return false;
     if (Number(m.until) > 0 && Date.now() >= Number(m.until)) {
@@ -12068,6 +12075,13 @@ ${turboNote}
     for (const key of socialV2.conversations.keys()) setupIntervalTimerV2(key);
   }
 
+  // 主人在「让她去玩会儿」里指定玩什么：phone（手机）/ mc（Minecraft）/ both（都行）。
+  // 缺省 phone —— 老数据里没有这个字段，以前的行为就是玩手机。
+  function turboFocusV2() {
+    const f = String(socialV2.turbo?.focus || 'phone');
+    return ['phone', 'mc', 'both'].includes(f) ? f : 'phone';
+  }
+  const TURBO_FOCUS_LABEL = { phone: '玩手机', mc: '玩 Minecraft', both: '随便玩（手机/游戏都行）' };
   function turboStatusV2() {
     expireTurboV2();
     const active = turboActiveV2();
@@ -12079,15 +12093,18 @@ ${turboNote}
       until: active ? Number(t.until) || 0 : 0,
       by: active ? String(t.by || "manual") : "",
       everyMinutes: active ? (Number(t.everyMinutes) || levelMinutesV2()) : 0,
+      focus: active ? turboFocusV2() : "",
+      focusLabel: active ? (TURBO_FOCUS_LABEL[turboFocusV2()] || "") : "",
       remainMinutes: active ? Math.max(0, Math.round((Number(t.until) - Date.now()) / 60000)) : 0,
       level: socialV2.level ? { ...socialV2.level } : null,
       costTodayCny: cost ? cost.today : null,
       costTurboCny: cost && active ? cost.delta : null,
       last: socialV2.turboLast ? { ...socialV2.turboLast } : null,
+      feel: readFeelV2(),
     };
   }
 
-  function setTurboV2(on, hours, why, intervalMinutes) {
+  function setTurboV2(on, hours, why, intervalMinutes, focus) {
     const wantOn = on === true;
     if (!wantOn) {
       if (!socialV2.turbo) return turboStatusV2();
@@ -12108,6 +12125,7 @@ ${turboNote}
       by: String(why || "manual"),
       hours: h,
       everyMinutes: Number(intervalMinutes) >= 1 ? Math.min(720, Math.round(Number(intervalMinutes))) : levelMinutesV2(),
+      focus: ['phone', 'mc', 'both'].includes(String(focus || '')) ? String(focus) : 'phone',
       costAtStart: cost ? cost.today : 0,
     };
     if (socialV2.paused) {
@@ -13347,7 +13365,6 @@ ${turboNote}
         // 真人玩家不是这样的 —— 没人指挥也会自己挖矿、盖房、闲逛。
         // 这里给一个低频打点：玩游戏模式开着 + 她正活着 + 没人说话 + 她闲着 → reason='mcSelf'。
         // 提示词（buildWakePromptV2 的 mcSelf 分支）明确告诉她「这是你自己的时间」。
-        startMcSelfLoop();
       } catch (error) {
         log('[mc] 轮询启动失败:', error?.message ?? error);
       }

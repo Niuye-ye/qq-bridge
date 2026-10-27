@@ -196,12 +196,28 @@ let bridgeState = null;
 let turboState = null;   // 超活跃模式状态（/api/socialV2/turbo 的快照，9 秒刷一次）
 // 2026-10-27：玩游戏模式（玩 MC 时只听游戏里的），同样 9 秒刷一次
 let mcModeState = null;
-// 她自己在游戏里多久醒一轮（分钟）；跟 mc-mode 一起取回来，不额外发请求
-const MC_SELF_PRESETS = [3, 5, 6, 8, 10, 15, 20, 30];
-let mcSelfState = null;
 // 2026-10-27：去掉「一直玩到我说停（10 小时）」后，时长一律由「让她去玩会儿」选，
 // 这里不再需要固定的 10 小时默认值。
-// 让她去玩一会儿：时长由这里给（hours），间隔由活跃度档位决定
+// 让她去玩会儿：先去哪玩（focus），再玩多久（hours）；醒多勤由活跃度档位决定
+const PLAY_FOCUS = [
+  { id: 'phone', label: '玩手机' },
+  { id: 'mc', label: '玩 Minecraft' },
+  { id: 'both', label: '随便玩（手机/游戏都行）' },
+];
+
+// 心情 / 好感度菜单项（数据来自 /api/socialV2/turbo 的 feel 字段，每 9 秒刷一次）
+function feelMenuItems(st) {
+  const f = (st && st.turbo && st.turbo.feel) || null;
+  if (!f) return [{ label: '心情：她还没记过（state/mood.json）', enabled: false }];
+  const aff = (typeof f.affinityPercent === 'number')
+    ? `${f.affinityPercent}%${f.affinityTier ? ` · ${f.affinityTier}` : ''}`
+    : '—';
+  const note = f.note ? ` · ${trimTo(f.note, 16)}` : '';
+  return [
+    { label: `心情：${f.moodLabel}${note}`, enabled: false },
+    { label: `好感度：${aff}`, enabled: false },
+  ];
+}
 const PLAY_PRESETS = [
   { label: '20 分钟', hours: 20 / 60 },
   { label: '1 小时', hours: 1 },
@@ -808,7 +824,6 @@ async function pollBridge() {
 
   turboState = s.turbo || null;
   mcModeState = s.mcMode || null;
-  mcSelfState = s.mcSelf || null;
   const prev = bridgeState;
   bridgeState = s;
   const changed = !prev || safeStr(prev) !== safeStr(s);
@@ -845,21 +860,28 @@ function popupMenu() {
     {
       label: '她',
       submenu: [
-        { label: st.doing ? `她在干嘛：${trimTo(st.doing, 12)}` : '她在干嘛', click: showActivity },
+        // 心情 / 好感度（state/mood.json 是她自己维护的；读不到就说明她还没记过）
+        ...feelMenuItems(st),
+        { type: 'separator' },
+        { label: st.doing ? `她在干嘛：${trimTo(st.doing, 14)}` : '她在干嘛', click: showActivity },
+        { label: '她现在的详细状态', click: showActivityBox },
         { label: '今天的日记', click: () => openPreview(todayDiary(), '今天的日记', 'diary') },
         { label: '长期记忆', click: () => openPreview(FACTS_JSON, '长期记忆', 'facts') },
         { type: 'separator' },
+        // 让她去玩会儿 = 玩什么（手机 / MC / 都行）× 玩多久；醒多勤看下一条「活跃度」。
         {
-          label: '让她去玩会儿 ▸',
-          submenu: PLAY_PRESETS.map((p) => ({
-            label: (st.turbo && st.turbo.on) ? `${p.label}（换成这个时长）` : p.label,
-            click: () => playFor(p.hours, p.label),
+          label: `让她去玩会儿${(st.turbo && st.turbo.on) ? `（现在在${(st.turbo.focusLabel || '玩')}）` : ''}`,
+          submenu: PLAY_FOCUS.map((foc) => ({
+            label: `去${foc.label}${(st.turbo && st.turbo.on && st.turbo.focus === foc.id) ? '（正在）' : ''}`,
+            submenu: PLAY_PRESETS.map((p) => ({
+              label: `${p.label}${(st.turbo && st.turbo.on) ? '（换成这个）' : ''}`,
+              click: () => playFor(p.hours, p.label, foc.id, foc.label),
+            })),
           })),
         },
-        // 只在"正在玩"时出现，点它就是喊停。以前那条「一直玩到我说停（10 小时）」
-        // 已按主人要求去掉：时长统一从上面的「让她去玩会儿」选。
+        // 只在"正在玩"时出现，点它就是喊停。
         ...((st.turbo && st.turbo.on) ? [{
-          label: `她正在玩：剩 ${st.turbo.remainMinutes || 0} 分钟 · 每 ${st.turbo.everyMinutes || '?'} 分钟一轮 · 这段 ¥${Number(st.turbo.costTurboCny || 0).toFixed(2)}（${clock(st.turbo.until)} 收）· 点这里喊停`,
+          label: `她正在${(st.turbo.focusLabel || '玩')}：剩 ${st.turbo.remainMinutes || 0} 分钟 · 每 ${st.turbo.everyMinutes || '?'} 分钟一轮 · 这段 ¥${Number(st.turbo.costTurboCny || 0).toFixed(2)}（${clock(st.turbo.until)} 收）· 点这里喊停`,
           click: () => toggleTurbo(),
         }] : []),
         // 玩完之后还留着一条结算：这段多久、花了多少钱。
@@ -881,31 +903,6 @@ function popupMenu() {
             ? `她今天花了 ¥${st.turbo.costTodayCny.toFixed(2)}`
             : '她今天花了（统计不到）',
           enabled: false,
-        },
-        {
-          label: (st.mcMode && st.mcMode.on)
-            ? '玩游戏模式：开着（只听游戏里的）· 点这里关'
-            : '玩游戏模式：陪主人玩 MC 时不被别的事打断',
-          click: () => toggleMcMode(),
-        },
-        {
-          // 她自己在游戏里多久醒一轮（没人说话时自己找事做）；关掉整个自主行动也能从这里点
-          label: `游戏里她自己过日子：${(st.mcSelf && st.mcSelf.selfPlay === false) ? '关着' : `每 ${(st.mcSelf && st.mcSelf.minutes) || 6} 分钟醒一轮`}`,
-          submenu: [
-            ...MC_SELF_PRESETS.map((m) => ({
-              label: `${m} 分钟一轮`,
-              type: 'radio',
-              checked: !!(st.mcSelf && st.mcSelf.selfPlay !== false && Number(st.mcSelf.minutes) === m),
-              click: () => setMcSelfMinutes(m),
-            })),
-            { type: 'separator' },
-            {
-              label: '关掉（不自己找事做）',
-              type: 'radio',
-              checked: !!(st.mcSelf && st.mcSelf.selfPlay === false),
-              click: () => setMcSelfMinutes(0),
-            },
-          ],
         },
         { label: st.paused ? '恢复她的自主时间' : '暂停她的自主时间', click: () => togglePause() },
         { label: readPetState().noAnim ? '恢复动画' : '暂停动画', click: () => toggleAnim() },
@@ -996,28 +993,57 @@ function showActivity() {
   } else {
     line = '没记着在干嘛，大概在发呆';
   }
+  // 正在玩什么、多久前更新的，一起塞进气泡（原来只有一句 doing，看不出来她在干嘛）
+  const play = st.turbo && st.turbo.on
+    ? `（在${st.turbo.focusLabel || '玩'}，剩 ${st.turbo.remainMinutes || 0} 分钟）`
+    : '';
+  const ago = st.activityAt ? `，${Math.max(1, Math.round((Date.now() - st.activityAt) / 60000))} 分钟前记的` : '';
   const d = st.doing || '';
   const face = /睡|困|歇|躺/.test(d) ? 'sleepy'
     : /刷|玩|游戏|看|听/.test(d) ? 'happy'
       : /写|学|想|研/.test(d) ? 'determined' : 'smug';
   send('pet:ui', { t: 'do', word: face });
-  send('pet:ui', { t: 'bubble', text: line, ms: 22000 });
-  log('她在干嘛 →', line);
+  send('pet:ui', { t: 'bubble', text: `${line}${play}${ago}`, ms: 22000 });
+  log('她在干嘛 →', line, play, ago);
   return line;
 }
 
-function showActivityBox() {
+// 详情弹窗：一次把 /api/socialV2/self 的全部内容摊开（活动 / 心情好感 / 想干的事 / 今天的时间线 / 在玩什么）
+async function showActivityBox() {
   const st = bridgeState || {};
+  let self = null;
+  try { self = await getJson('/api/socialV2/self'); } catch (_) { self = null; }
+  const a = (self && self.activity) || { doing: st.doing, note: st.note, plan: st.plan };
+  const f = (self && self.feel) || (st.turbo && st.turbo.feel) || null;
+  const playing = self && self.playing;
+  const goals = (self && Array.isArray(self.goals)) ? self.goals : [];
+  const life = (self && Array.isArray(self.life)) ? self.life : [];
+  const mc = (self && self.mc) || null;
   const lines = [
-    `在干嘛：${st.doing || '（没记）'}`,
-    `心里想：${st.note || '—'}`,
-    `接下来：${st.plan || '—'}`,
+    `【此刻】${a.doing || '（没记）'}`,
+    `心里想：${a.note || '—'}`,
+    `接下来：${a.plan || '—'}`,
+    a.updatedAt ? `记录时间：${clock(Date.parse(a.updatedAt) || 0) || '—'}` : '记录时间：—',
     '',
-    `更新时间：${clock(st.activityAt) || '—'}`,
-    `心情：${st.mood || '—'}　亲密：${st.affinity ?? '—'}`,
-    `她最后说：${st.lastLine || '—'}`,
-  ];
-  dialog.showMessageBox({ type: 'info', title: '她', message: '她现在这样', detail: lines.join('\n'), buttons: ['知道了'] });
+    `【心情】${f ? `${f.moodLabel}${f.note ? ` —— ${f.note}` : ''}` : '（她还没记）'}`,
+    `【好感度】${f && typeof f.affinityPercent === 'number' ? `${f.affinityPercent}%（${f.affinityTier}）` : '—'}`,
+    '',
+    `【正在】${playing ? `${playing.focusLabel} · 剩 ${playing.remainMinutes} 分钟 · 每 ${playing.everyMinutes} 分钟一轮 · 这段 ¥${Number(playing.costCny || 0).toFixed(2)}` : (self && self.paused ? '她的自主时间被暂停了' : '没在玩，待机')}`,
+    `【游戏】${mc ? (mc.alive ? `在游戏里${mc.queue ? `（攒着 ${mc.queue} 句话没说）` : ''}` : '游戏没开 / 不在这个世界') : '—'}`,
+    (self && self.level) ? `【活跃度】${self.level.label}（每 ${self.level.minutes} 分钟醒一轮）` : '',
+    '',
+    `【她想干的事】${goals.length ? '' : '（没记）'}`,
+    ...goals.map((g) => `· ${g}`),
+    '',
+    `【今天】${life.length ? '' : '（没记）'}`,
+    ...life.map((l) => `· ${l}`),
+    '',
+    `她最后一句：${st.lastLine || '—'}`,
+  ].filter((x) => x !== '');
+  dialog.showMessageBox({
+    type: 'info', title: '她', message: '她现在这样',
+    detail: lines.join(String.fromCharCode(10)), buttons: ['知道了'],
+  });
 }
 
 // ── MuMu 虚拟机状态 ───────────────────────────────────────────────────────────
@@ -1132,14 +1158,16 @@ function lastPlayLine(last) {
 }
 
 // 让她去玩一会儿：开一段有时长的「活跃期」，到时自动收；间隔取当前活跃度档位
-async function playFor(hours, label) {
+async function playFor(hours, label, focus, focusLabel) {
   const lv = levelNow();
   const intervalMinutes = lv.minutes >= 1 ? lv.minutes : 5;
+  const foc = focus || 'phone';
   try {
-    const r = await postJson('/api/socialV2/turbo', { on: true, hours, intervalMinutes, by: 'pet' });
-    log('去玩会儿 →', label, safeStr(r));
+    const r = await postJson('/api/socialV2/turbo', { on: true, hours, intervalMinutes, by: 'pet', focus: foc });
+    log('去玩会儿 →', focusLabel || foc, label, safeStr(r));
     const cost = r && typeof r.costTodayCny === 'number' ? `（今天已花 ¥${r.costTodayCny.toFixed(2)}）` : '';
-    win?.webContents.send('pet:ui', { t: 'bubble', text: `好，我去玩${label}，每 ${intervalMinutes} 分钟醒一轮${cost}` });
+    const what = focusLabel || (foc === 'mc' ? 'Minecraft' : foc === 'both' ? '手机或者游戏' : '手机');
+    win?.webContents.send('pet:ui', { t: 'bubble', text: `好，我去玩${what}，玩 ${label}，每 ${intervalMinutes} 分钟醒一轮${cost}` });
     await pollBridge();
     return r;
   } catch (e) { log('去玩会儿失败', e.message); return { ok: false, error: e.message }; }
@@ -1167,35 +1195,6 @@ async function toggleTurbo() {
     win?.webContents.send('pet:ui', { t: 'bubble', text: last ? `停了。${last}` : '停了，我先歇会儿' });
     await pollBridge();
   } catch (e) { log('超活跃模式切换失败', e.message); }
-}
-
-// 玩游戏模式开关（2026-10-27）：开了之后除了 MC 里主人说的话，其它唤醒全跳过。
-async function toggleMcMode() {
-  const on = !!(mcModeState && mcModeState.on);
-  try {
-    const r = await postJson('/api/socialV2/mc-mode', { on: !on });
-    log('玩游戏模式 →', on ? '关' : '开', safeStr(r));
-    win?.webContents.send('pet:ui', {
-      t: 'bubble',
-      text: on ? '好，我回来了' : '玩去了，游戏里说话我就来',
-    });
-    await pollBridge();
-  } catch (e) { log('玩游戏模式切换失败', e.message); }
-}
-
-// 她自己在游戏里多久醒一轮：minutes = 0 表示关掉自主行动，其余 2~60 分钟
-async function setMcSelfMinutes(minutes) {
-  try {
-    const m = Math.max(0, Math.min(60, Math.round(Number(minutes) || 0)));
-    const r = await postJson('/api/socialV2/mc-self', m === 0 ? { selfPlay: false } : { selfPlay: true, minutes: m });
-    log('自主节奏 →', m === 0 ? '关' : `${m} 分钟`, safeStr(r));
-    win?.webContents.send('pet:ui', {
-      t: 'bubble',
-      text: m === 0 ? '好，那我自己不折腾了' : `行，我每 ${m} 分钟自己找点事做`,
-    });
-    await pollBridge();
-    return r;
-  } catch (e) { log('自主节奏切换失败', e.message); return { ok: false, error: e.message }; }
 }
 
 // 动画开关：只停渲染层的动作（呼吸/走路/待机），不影响她的自主时间
