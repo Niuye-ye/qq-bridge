@@ -278,6 +278,12 @@ export function parseSocialV2State(raw, opts = {}) {
       modelSeenSeqs: new Set(),
       activeTopics: list(val.activeTopics),
       pendingThoughts: list(val.pendingThoughts),
+      // 2026-10-27：deskMessages 原来只写不读（B1 同族缺口）—— 桥一重启，reason='desk' 的唤醒提示词
+      // 就变成「（没留下记录）」，主人在桌宠窗口当面说的话全丢。这里补上读回，形状与写入口一致：{at, text}。
+      deskMessages: list(val.deskMessages)
+        .filter((m) => m && typeof m === 'object' && typeof m.text === 'string')
+        .map((m) => ({ at: num(m.at), text: String(m.text).slice(0, 2000) }))
+        .slice(-20),
       memberImpressions: (() => {
         const rawImp = val.memberImpressions && typeof val.memberImpressions === 'object' ? val.memberImpressions : {};
         const clean = {};

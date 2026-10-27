@@ -6,16 +6,33 @@ import vm from 'node:vm';
 import { test } from 'node:test';
 import { z } from 'zod';
 
+/**
+ * ESM 源码 → 能塞进 vm.runInNewContext 的脚本。
+ *
+ * 2026-10-27（审计 P1，MCP 安全套件 8/8 全灭）：这个 loader 只剥了 import，没剥 export ——
+ * 源文件里一旦出现 `export function registerTools` 就整段 SyntaxError；
+ * 而 `import.meta`（vm 里没有）同样是语法错误，只替换写死的那一行也挡不住新增的。
+ * 现在统一做三件事：剥 import / 剥 export 前缀 / 把 import.meta.url 换成一个固定的 file URL。
+ */
+function toVmScript(fileName) {
+  const abs = new URL('../src/' + fileName, import.meta.url);
+  const nl = String.fromCharCode(10);
+  return fs.readFileSync(abs, 'utf8')
+    .replace(new RegExp('^import .*;[' + String.fromCharCode(13) + ']?' + nl, 'gm'), '')
+    .replace(new RegExp('^export' + String.fromCharCode(92) + 's+default' + String.fromCharCode(92) + 's+', 'gm'), 'module.exports = ')
+    .replace(new RegExp('^export' + String.fromCharCode(92) + 's+(?=(?:async' + String.fromCharCode(92) + 's+)?function|const|let|var|class|' + String.fromCharCode(92) + '{)', 'gm'), '')
+    .replace(/import\.meta\.url/g, JSON.stringify(abs.href));
+}
+
 function loadWebTools({ safeFetch, webSearch }) {
   const tools = new Map();
-  const source = fs.readFileSync(new URL('../src/mcp-web-search-safe.js', import.meta.url), 'utf8')
-    .replace(/^import .*;\r?\n/gm, '')
+  const source = toVmScript('mcp-web-search-safe.js')
     .replace('await server.connect(new StdioServerTransport());', 'server.connect(new StdioServerTransport());');
   class McpServer {
     tool(name, description, schema, callback) { tools.set(name, { schema, callback }); }
     connect() {}
   }
-  vm.runInNewContext(source, {
+  const sandbox = {
     safeFetch,
     webSearch,
     McpServer,
@@ -24,7 +41,12 @@ function loadWebTools({ safeFetch, webSearch }) {
     URL,
     path,
     process,
-  });
+  };
+  vm.runInNewContext(source, sandbox);
+  // 2026-10-27（审计）：三个 MCP 合并后（src/mcp-all.js 时代）web_search/web_fetch 改成了
+  // "仅当自己是被 node 直接执行的入口文件时才注册并起 stdio"，单测里 process.argv[1] 是测试脚本，
+  // 于是一个工具都注册不上（8 条全灭）。这里显式调用它导出的 registerTools。
+  if (tools.size === 0 && typeof sandbox.registerTools === 'function') sandbox.registerTools(new McpServer());
   return async (name, arguments_) => {
     const tool = tools.get(name);
     return tool.callback(z.object(tool.schema).parse(arguments_));
@@ -78,9 +100,10 @@ test('empty searches are rejected without calling the transport', async () => {
 function loadSnowlumaTools(fetchImpl, fixtureConfig = null, httpImpl = null) {
   const tools = new Map();
   // vm 里没有 ESM 的 import.meta，把模块顶部的 __dirname 推导整段替换成固定值。
-  const source = fs.readFileSync(new URL('../src/mcp-snowluma-safe.js', import.meta.url), 'utf8')
-    .replace(/^import .*;\r?\n/gm, '')
-    .replace("const __dirname = path.dirname(fileURLToPath(import.meta.url));", "const __dirname = '/fixture/src';")
+  const source = toVmScript('mcp-snowluma-safe.js')
+    // toVmScript 已经把 import.meta.url 换成了固定的 file URL，所以这里按整行匹配，
+    // 把 __dirname 钉在 /fixture/src（测试用 fixture config.json 就靠这个前缀识别）。
+    .replace(/^const __dirname = .*;$/m, "const __dirname = '/fixture/src';")
     .replace('await server.connect(new StdioServerTransport());', 'server.connect(new StdioServerTransport());');
   class McpServer {
     constructor() { this.tool = (name, description, schema, callback) => tools.set(name, { schema, callback }); }

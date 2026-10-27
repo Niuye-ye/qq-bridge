@@ -1914,7 +1914,9 @@ server.tool(
 );
 
 // ── 视频：让她自己挑内容、自己生成 ───────────────────────────────────────────
-const MCP_HERE = path.dirname(fileURLToPath(import.meta.url));
+// 2026-10-27：这里原来又推了一遍 import.meta.url —— 离线测试把这个文件塞进 vm.Script 执行，
+// 那里没有 import.meta（直接语法错误，整个安全套件 8 条全灭）。模块顶部已经有 __dirname，复用它。
+const MCP_HERE = __dirname;
 const VIDEO_SCRIPT = path.join(MCP_HERE, '..', 'scripts', 'make-video.py');
 const VIDEO_DIR = path.join(MCP_HERE, '..', 'videos');
 const VIDEO_JOBS = path.join(MCP_HERE, '..', 'state', 'video-jobs');

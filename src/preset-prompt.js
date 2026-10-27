@@ -22,8 +22,13 @@ export const PRESET_REQUIRED_MARKERS = ['【二代仿真模式 —— 安全规�
 // 但保存/还原的校验对两个预设用的是同一份清单 —— 结果一代预设（qq-chat，本来就
 // 不用工具、也从不自称「你没有本地工具」）在控制台里 100% 存不进去也还原不了，
 // 报错还声称它「缺少安全不变量」。一代确实需要的不变量只有下面这几条。
+//
+// 2026-10-27（审计 P1）：每条不变量允许写成「同义写法数组」，命中任意一个即算通过。
+// 起因：现网二代预设把「你没有本地工具」改写成了「你没有电脑上的工具」，而校验还在找旧字面 ——
+// 于是控制台保存与还原 100% 被自己的校验卡死（报「缺少安全不变量」，其实文案只是改了措辞）。
+// 加新文案时只补同义写法，不要删旧的：旧预设、备份、别人的分支都可能还是老措辞。
 export const PRESET_BLOCKING_SUBSTRINGS = [
-  '你没有本地工具',
+  ['你没有本地工具', '你没有电脑上的工具'],
   '群友没有管理权限',
   'API 令牌',
   '角色由桥接注入',
@@ -39,9 +44,13 @@ export const PRESET_BLOCKING_SUBSTRINGS_V1 = [
 ];
 export const PRESET_MIN_BODY_CHARS = 500;
 
-/** 取某个预设对应的硬性不变量清单（未知预设按更严的二代替处理）。 */
+/**
+ * 取某个预设对应的硬性不变量清单（未知预设按更严的二代替处理）。
+ * 返回「同义写法数组」的数组：每条不变量命中数组里任意一个字符串即算通过。
+ */
 export function presetBlockingSubstrings(preset = 'v2') {
-  return preset === 'v1' ? PRESET_BLOCKING_SUBSTRINGS_V1 : PRESET_BLOCKING_SUBSTRINGS;
+  const raw = preset === 'v1' ? PRESET_BLOCKING_SUBSTRINGS_V1 : PRESET_BLOCKING_SUBSTRINGS;
+  return raw.map((item) => (Array.isArray(item) ? item : [item]));
 }
 
 /** 硬性校验：返回阻止保存的原因列表（空数组=可保存）。preset 取 'v1' / 'v2'。 */
@@ -52,10 +61,10 @@ export function presetPromptBlockers(content, preset = 'v2') {
     blockers.push('仿真提示词不能为空');
     return blockers;
   }
-  for (const needle of presetBlockingSubstrings(preset)) {
-    if (!text.includes(needle)) {
-      blockers.push(`缺少安全不变量「${needle}」：删除它会让 AI 的权限边界失效，并使 npm run test:audit 失败`);
-    }
+  for (const group of presetBlockingSubstrings(preset)) {
+    if (group.some((needle) => text.includes(needle))) continue;
+    // 报错文案用第一条（最新写法）当标签，方便一眼知道缺的是哪一条。
+    blockers.push(`缺少安全不变量「${group[0]}」：删除它会让 AI 的权限边界失效，并使 npm run test:audit 失败`);
   }
   if (text.trim().length < PRESET_MIN_BODY_CHARS) {
     blockers.push(`正文过短（${text.trim().length} 字符 < ${PRESET_MIN_BODY_CHARS}）：疑似内容被误删`);

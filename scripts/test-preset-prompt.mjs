@@ -37,9 +37,13 @@ test('每代内置预设都满足自己那一代的安全不变量', () => {
 });
 
 test('一代与二代的硬性不变量清单确实不同（防止又合并成一份）', () => {
-  assert.notDeepEqual(presetBlockingSubstrings('v1'), presetBlockingSubstrings('v2'));
-  // 二代的工具面不变量不应该出现在一代清单里
-  assert.ok(!presetBlockingSubstrings('v1').includes('你没有本地工具'));
+  const v1 = presetBlockingSubstrings('v1');
+  const v2 = presetBlockingSubstrings('v2');
+  assert.notDeepEqual(v1, v2);
+  // 二代的工具面不变量不应该出现在一代清单里（清单是同义写法数组的数组，逐条摊平了看）
+  const flatV1 = v1.flat();
+  assert.ok(!flatV1.includes('你没有本地工具'));
+  assert.ok(!flatV1.includes('你没有电脑上的工具'));
 });
 
 test('真实预设能定位到 persona 的 prefix 块', () => {
@@ -117,13 +121,15 @@ test('危险输入被拒绝，且不产生半截结果', () => {
 test('删掉安全不变量或正文过短时阻断保存（保护 AI 效果与自家测试）', () => {
   // 正文过短
   assert.throws(() => renderPresetPromptYaml(source, '太短了'), /过短/);
-  // 逐条移除安全不变量，必须被拦住
-  for (const needle of PRESET_BLOCKING_SUBSTRINGS) {
-    const tampered = originalPrefix.replace(needle, '（已删除）');
+  // 逐条移除安全不变量，必须被拦住。一条不变量可能是「同义写法数组」（例如
+  // 「你没有本地工具」/「你没有电脑上的工具」），那就把所有写法都换掉才算真删。
+  for (const group of presetBlockingSubstrings('v2')) {
+    let tampered = originalPrefix;
+    for (const needle of group) tampered = tampered.split(needle).join('（已删除）');
     assert.throws(
       () => renderPresetPromptYaml(source, tampered),
-      new RegExp(`缺少安全不变量「${needle}」`),
-      `删除「${needle}」后仍被允许保存`,
+      new RegExp(`缺少安全不变量「${group[0]}」`),
+      `删除「${group[0]}」后仍被允许保存`,
     );
   }
   // 只做无损追加则应当通过
@@ -133,21 +139,37 @@ test('删掉安全不变量或正文过短时阻断保存（保护 AI 效果与�
 });
 
 test('写回沿用文件主导行尾，且不吞掉块尾空行', () => {
-  const next = renderPresetPromptYaml(source, originalPrefix);
-  const crlf = (next.match(/\r\n/g) ?? []).length;
-  const lfOnly = (next.match(/\n/g) ?? []).length - crlf;
-  assert.ok(crlf > 0, 'CRLF 文件写回后应仍使用 CRLF');
-  assert.equal(lfOnly, 0, '写回后不应残留/新增 LF-only 行');
-  assert.ok(next.includes('prefix: |-\r\n'), '新增行应使用 CRLF');
-  // 块之后的内容（空行、注释、后续条目）必须逐字保留
-  const before = locatePresetPromptBlock(source);
-  const after = locatePresetPromptBlock(next);
-  assert.deepEqual(
-    next.split('\n').slice(after.blockEnd),
-    source.split('\n').slice(before.blockEnd),
-    'prefix 块之后的内容应逐字不变（含块尾空行与注释）',
-  );
-  assert.ok(source.split('\n').slice(before.blockEnd).some((l) => l.trim() === ''), '样本应确实包含块尾空行，否则该断言无意义');
+  // 2026-10-27（审计）：原来写死断言「CRLF 文件写回后仍用 CRLF」，可是内置二代预设
+  // （dsh/agent-presets/qq-chat-v2/agent.cordis.yml）本身是纯 LF，测试必红且与代码无关。
+  // 现在改为「跟随样本文件自己的主导行尾」，另用一份 CRLF 副本单独覆盖 CRLF 分支。
+  const countEol = (text) => {
+    const crlf = (text.match(/\r\n/g) ?? []).length;
+    const all = (text.match(/\n/g) ?? []).length;
+    return { crlf, lfOnly: all - crlf };
+  };
+  const assertRoundTrip = (label, sample, prefix) => {
+    const next = renderPresetPromptYaml(sample, prefix);
+    const eol = countEol(next);
+    const dominant = countEol(sample).crlf > 0 ? 'crlf' : 'lf';
+    if (dominant === 'crlf') {
+      assert.ok(eol.crlf > 0, label + '：CRLF 文件写回后应仍使用 CRLF');
+      assert.equal(eol.lfOnly, 0, label + '：写回后不应残留/新增 LF-only 行');
+      assert.ok(next.includes('prefix: |-\r\n'), label + '：新增行应使用 CRLF');
+    } else {
+      assert.equal(eol.crlf, 0, label + '：LF 文件写回后不应冒出 CRLF');
+    }
+    // 块之后的内容（空行、注释、后续条目）必须逐字保留
+    const before = locatePresetPromptBlock(sample);
+    const after = locatePresetPromptBlock(next);
+    assert.deepEqual(
+      next.split('\n').slice(after.blockEnd),
+      sample.split('\n').slice(before.blockEnd),
+      label + '：prefix 块之后的内容应逐字不变（含块尾空行与注释）',
+    );
+    assert.ok(sample.split('\n').slice(before.blockEnd).some((l) => l.trim() === ''), label + '：样本应确实包含块尾空行，否则该断言无意义');
+  };
+  assertRoundTrip('内置预设', source, originalPrefix);
+  assertRoundTrip('CRLF 副本', source.replace(/\r?\n/g, '\r\n'), originalPrefix.replace(/\r?\n/g, '\r\n'));
 });
 
 test('只含空格/Tab 的行也能安全往返（不会被当成空行读丢）', () => {

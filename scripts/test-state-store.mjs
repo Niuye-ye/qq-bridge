@@ -234,3 +234,39 @@ test('S6 load()：文件被别的进程改写时不回写', () => {
   assert.equal(store.writes, 0, '文件被改写时不得回写');
   fs.rmSync(path.dirname(file), { recursive: true, force: true });
 });
+
+test('S7 deskMessages 写得出就读得回（B1 同族最后缺口）', () => {
+  // 桥的 /api/socialV2/desk-message 会把主人当面说的话 push 进 st.deskMessages（{at, text}），
+  // 但 parseSocialV2State 曾经根本没有这个字段 —— 桥一重启，reason='desk' 的唤醒提示词
+  // 就变成「（没留下记录）」。这里钉住写→读的往返。
+  const conversations = new Map([
+    ['private:1946431105', convState({
+      deskMessages: [
+        { at: 1700000000000, text: '帮我看看桌面这个报错' },
+        { at: 1700000001000, text: '在吗' },
+        { text: '缺 at 也要留着' },
+        { at: 1, text: 123 },
+        null,
+        'junk'
+      ]
+    })]
+  ]);
+  const text = serializeSocialV2State({ paused: false, conversations, seenForwardIds: new Map() });
+  const back = parseSocialV2State(JSON.parse(text), { sanitizeForwardId });
+  const dm = back.conversations.get('private:1946431105').deskMessages;
+  assert.equal(dm.length, 3, '非对象/非字符串条目必须被剔掉');
+  assert.equal(dm[0].text, '帮我看看桌面这个报错');
+  assert.equal(dm[0].at, 1700000000000);
+  assert.equal(dm[2].at, 0, '缺 at 的条目 at 归一成 0，不许丢');
+  // 超长文本按写入口的 2000 字符上限截断，防止状态文件被一条长文撑爆
+  const long = parseSocialV2State({
+    conversations: { 'private:1': { deskMessages: [{ at: 1, text: 'x'.repeat(5000) }] } }
+  }, { sanitizeForwardId }).conversations.get('private:1').deskMessages;
+  assert.equal(long[0].text.length, 2000);
+  // 只要最后 20 条
+  const many = parseSocialV2State({
+    conversations: { 'private:1': { deskMessages: Array.from({ length: 40 }, (_, i) => ({ at: i, text: 'm' + i })) } }
+  }, { sanitizeForwardId }).conversations.get('private:1').deskMessages;
+  assert.equal(many.length, 20);
+  assert.equal(many[19].text, 'm39');
+});
