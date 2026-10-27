@@ -154,6 +154,13 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     // 锁文件探测用（bridge.js 顶层的 consolePortInUse）；
     // 固定桩掉：测试不应该真去 netstat 宿主机。
     execFileSync: () => '',
+    // 2026-10-27：adb 探测 / 截图 / 唤醒管家都改成 execFile（异步）。测试里绝不真 spawn，
+    // 立刻回一个错误，让调用方走「失败 / 重试 / 降级」分支。
+    execFile: (bin, args, options, callback) => {
+      const done = typeof options === 'function' ? options : callback;
+      if (typeof done === 'function') setImmediate(() => done(new Error('execFile stubbed in tests')));
+      return { kill() {}, on() {} };
+    },
     // process 桩要带 env：voice-core / bridge 会读 process.env.FFMPEG_PATH、FFPROBE_PATH 等。
     // 之前只给 pid/platform/kill/exit，导致 `process.env.FFMPEG_PATH` 直接抛 TypeError。
     process: { pid: process.pid, platform: process.platform, kill: process.kill, env: {}, exit: (code) => { throw new Error('unexpected exit ' + code); } },

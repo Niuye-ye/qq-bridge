@@ -10,7 +10,7 @@ import os from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execFileSync, spawnSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
 import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
@@ -2148,17 +2148,26 @@ async function main() {
     return adbPath;
   }
 
-  function adbRunV2(adbPath, args, timeout = 8000) {
-    try {
-      const out = execFileSync(adbPath, args, { timeout, encoding: 'utf8', windowsHide: true });
-      return { ok: true, out: String(out || '') };
-    } catch (error) {
-      return { ok: false, out: String(error?.stdout || ''), err: String(error?.stderr || error?.message || error) };
-    }
+  // ── 子进程统一走异步（2026-10-27）───────────────────────────────────────────
+  // 这一组函数在 HTTP 处理链上（截图 / 发图 / qq_see_screen）：同步版本会把事件循环按住
+  // —— adb connect 一轮最多试 4 个端口（≈24s）、唤醒管家冷启（≈12s）、screencap（≤25s），
+  // 期间所有会话、定时器、事件流一起停，表现就是「她突然不说话了」。
+  function execFileAsync(bin, args, options = {}) {
+    return new Promise((resolve) => {
+      execFile(bin, args, { windowsHide: true, ...options }, (error, stdout, stderr) => {
+        resolve({ error, stdout: stdout ?? '', stderr: stderr ?? '' });
+      });
+    });
   }
 
-  function adbOnlineSerialsV2(adbPath) {
-    const out = adbRunV2(adbPath, ['devices'], 8000).out;
+  async function adbRunV2(adbPath, args, timeout = 8000) {
+    const { error, stdout, stderr } = await execFileAsync(adbPath, args, { timeout, encoding: 'utf8' });
+    if (!error) return { ok: true, out: String(stdout || '') };
+    return { ok: false, out: String(error?.stdout || stdout || ''), err: String(stderr || error?.message || error) };
+  }
+
+  async function adbOnlineSerialsV2(adbPath) {
+    const out = (await adbRunV2(adbPath, ['devices'], 8000)).out;
     return out.split(/\r?\n/).slice(1).map((line) => line.trim()).filter(Boolean)
       .map((line) => line.split(/\s+/))
       .filter((parts) => parts[1] === 'device')
@@ -2176,12 +2185,12 @@ async function main() {
     return list;
   }
 
-  function resolveAdbSerialV2(adbPath) {
+  async function resolveAdbSerialV2(adbPath) {
     const prefer = String(cfg.socialV2?.image?.serial || '').trim();
     const preferIsAuto = !prefer || prefer.toLowerCase() === 'auto';
     const now = Date.now();
     const cached = ADB_DEVICE_CACHE.serial;
-    if (cached && now - ADB_DEVICE_CACHE.at < ADB_DEVICE_CACHE_TTL_MS && adbOnlineSerialsV2(adbPath).includes(cached)) {
+    if (cached && now - ADB_DEVICE_CACHE.at < ADB_DEVICE_CACHE_TTL_MS && (await adbOnlineSerialsV2(adbPath)).includes(cached)) {
       return cached;
     }
     const remember = (serial) => {
@@ -2190,7 +2199,7 @@ async function main() {
       ADB_DEVICE_CACHE.at = Date.now();
       return serial;
     };
-    const online = adbOnlineSerialsV2(adbPath);
+    const online = await adbOnlineSerialsV2(adbPath);
     if (!preferIsAuto && online.includes(prefer)) return remember(prefer);
     if (online.length) {
       const first = online[0];
@@ -2202,15 +2211,14 @@ async function main() {
     const ports = adbPortCandidatesV2(prefer);
     for (const port of ports) {
       const target = `${host}:${port}`;
-      adbRunV2(adbPath, ['connect', target], 6000);
-      if (adbOnlineSerialsV2(adbPath).includes(target)) {
+      await adbRunV2(adbPath, ['connect', target], 6000);
+      if ((await adbOnlineSerialsV2(adbPath)).includes(target)) {
         log(`[screen] adb connect ${target} 成功（配置的 serial：${prefer || '(空)'}）`);
         return remember(target);
       }
     }
     throw new Error(`adb 找不到可用设备（配置 serial：${prefer || '(空)'}；已试 ${ports.map((p) => `${host}:${p}`).join(' / ')}）——先确认 MuMu 开着，或改 config.json 的 socialV2.image.serial`);
   }
-
   // 现拍一张 MuMu 的屏幕（adb exec-out screencap -p），给"发张截图给我"这种请求用。
   // 第一次用缓存串号；失败就清缓存重解析（含 adb connect 重连）再试一次。
   // 2026-10-26：MuMu 改成按需（mumu-butler :8790）。任何要碰设备的操作前，先请管家把模拟器拉起来。
@@ -2221,8 +2229,7 @@ async function main() {
   //      等于「按需唤醒」这个功能在他们的机器上静默失效；
   //   ② -m 默认 90 秒，而这是同步调用：最坏把整个事件循环按住 95 秒（所有会话、定时器、
   //      事件流一起停），一轮 QQ 消息全卡住。
-  // 现在改成 spawnSync 一个最小 node 进程（node 一定存在，因为我们就跑在 node 里）发 HTTP，
-  // 默认 45 秒上限；冷启实测 12 秒，45 秒足够，真卡住也只按住 45 秒。
+  // 2026-10-27：再改成 execFile 异步 —— 原来同步等的那一轮（冷启 12s、上限 45s）会按住整个事件循环。
   const WAKE_HELPER_SRC = [
     "const http=require('http');",
     "const raw=process.env.WAKE_URL||'';const body=process.env.WAKE_BODY||'{}';",
@@ -2237,7 +2244,9 @@ async function main() {
     "req.write(body);req.end();",
   ].join('');
   let WAKE_LAST_OK_AT = 0;
-  function wakeMuMuV2(reason) {
+  // 2026-10-27：spawnSync → execFile（异步）。原来冷启那 12 秒（最坏 45 秒）是**按住事件循环**等的，
+  // 期间所有会话、定时器、事件流一起停；现在只挡住这一条截图请求。
+  async function wakeMuMuV2(reason) {
     const ic = cfg.socialV2?.image ?? {};
     if (ic.wake === false) return;
     const url = String(ic.wakeUrl ?? 'http://127.0.0.1:8790/ensure').trim();
@@ -2246,18 +2255,14 @@ async function main() {
     if (Date.now() - WAKE_LAST_OK_AT < 45000) return;
     const t0 = Date.now();
     const wakeMs = Number(ic.wakeTimeoutMs) > 0 ? Math.min(Number(ic.wakeTimeoutMs), 120000) : 45000;
-    let out = '';
     try {
-      const r = spawnSync(process.execPath, ['-e', WAKE_HELPER_SRC], {
+      const { error, stdout, stderr } = await execFileAsync(process.execPath, ['-e', WAKE_HELPER_SRC], {
         timeout: wakeMs + 5000,
         encoding: 'utf8',
-        windowsHide: true,
         env: { ...process.env, WAKE_URL: url, WAKE_BODY: JSON.stringify({ reason }), WAKE_MS: String(wakeMs) },
       });
-      out = String(r.stdout || '').trim();
-      if (r.status !== 0 && !out) {
-        throw new Error(String(r.stderr || '').trim() || ('wake helper exit ' + r.status));
-      }
+      const out = String(stdout || '').trim();
+      if (error && !out) throw new Error(String(stderr || '').trim() || String(error?.message || error));
       let parsed = null;
       try { parsed = JSON.parse(out); } catch { /* 非 JSON 视为失败 */ }
       if (parsed?.ok) {
@@ -2271,21 +2276,22 @@ async function main() {
     }
   }
 
-  function captureDeviceScreenshotV2() {
-    wakeMuMuV2('screenshot');
+  async function captureDeviceScreenshotV2() {
+    await wakeMuMuV2('screenshot');
     const adbPath = adbPathV2();
     let lastError = '';
     let lastSerial = '';
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const serial = resolveAdbSerialV2(adbPath);
+      const serial = await resolveAdbSerialV2(adbPath);
       lastSerial = serial;
       try {
-        const buf = execFileSync(adbPath, ['-s', serial, 'exec-out', 'screencap', '-p'], {
+        const { error, stdout } = await execFileAsync(adbPath, ['-s', serial, 'exec-out', 'screencap', '-p'], {
           timeout: 25000,
           maxBuffer: 64 * 1024 * 1024,
           encoding: 'buffer',
-          windowsHide: true
         });
+        if (error) throw error;
+        const buf = stdout;
         if (!looksLikeImageBuffer(buf)) {
           throw new Error('截图回来的不是图片：模拟器可能没连上（先确认 MuMu 开着、adb connect 成功）');
         }
@@ -2295,7 +2301,7 @@ async function main() {
         lastError = String(error?.stderr || error?.message || error).trim();
         ADB_DEVICE_CACHE.serial = '';
         ADB_DEVICE_CACHE.at = 0;
-        adbRunV2(adbPath, ['disconnect', serial], 4000);
+        await adbRunV2(adbPath, ['disconnect', serial], 4000);
         log(`[screen] 第 ${attempt + 1} 次截图失败（${serial}）：${lastError.slice(0, 200)}`);
       }
     }
@@ -6324,7 +6330,7 @@ async function main() {
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           try {
-            const shot = captureDeviceScreenshotV2();
+            const shot = await captureDeviceScreenshotV2();
             sendJson({ ok: true, key, bytes: shot.length, mimeType: 'image/png', data: shot.toString('base64') });
           } catch (error) {
             sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
@@ -6391,7 +6397,7 @@ async function main() {
               buffer = fetched.buffer;
               sourceLabel = String(rawUrl).slice(0, 120);
             } else if (wantShot) {
-              buffer = captureDeviceScreenshotV2();
+              buffer = await captureDeviceScreenshotV2();
               sourceLabel = '模拟器截图';
             }
           } catch (error) {

@@ -87,3 +87,4 @@ audio/
 /scripts/videos/
 __pycache__/
 *.pyc
+*.log.*
