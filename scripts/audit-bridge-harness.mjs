@@ -23,6 +23,12 @@ import * as stateAcl from '../src/state-acl.mjs';
 // 2026-10-27 抽出来的纯数据层（social-v2 序列化/解析/防抖写入）——桥在 VM 里跑，
 // 它的 import 被剥掉了，所以这里显式注入同名绑定。
 import * as stateStore from '../src/state-store.mjs';
+// 2026-10-27：VM 里 bridge.js 的 import 被剥掉，凡是它 import 了、这里又没注入的模块，
+// 一调用就是 ReferenceError（#29「formatGoalsLineV2 is not defined」就是这么来的 ——
+// 生产代码没问题，是测试边界漏了一块）。所以下面把 bridge.js 需要的模块**全部**显式补齐，
+// 并且区分「纯逻辑直接 import 真文件」和「会碰真盘 / 会起轮询的一律用桩」：
+import * as roleCard from '../src/role-card.js';        // 纯解析，无 I/O
+import * as mcCompanion from '../src/mc-companion.js';  // 模块级只有队列，startMcWatcher 不调用就不轮询
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -43,6 +49,8 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     fs.writeFileSync(target, typeof content === 'string' ? content : JSON.stringify(content));
   }
   const calls = { created: [], archived: [], sent: [], prompts: [], follows: [], cancelled: [], images: [], faces: [], http: [] };
+  // goals-life 的内存替身（见下面注入段）：每个 harness 实例各自独立，测试之间不串。
+  const goalMem = { goals: [], timeline: [], seq: 0 };
   // 语音发送在桥接里是**直接 fetch 网关**（与文本/表情共用 sendChain，但要自己带 record 段），
   // 所以这里给 VM 注入一个记录型 fetch：既不让测试真的发 QQ 消息，又能断言发出的段内容。
   const fakeFetch = async (url, init = {}) => {
@@ -171,6 +179,44 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...stateStore,
+    ...roleCard, ...mcCompanion,
+    // snowluma-conn 会写 config.json / 磁盘上的 token 文件 —— VM 里绝不能真写，桩掉。
+    discoverSnowLumaConnection: async () => null,
+    persistSnowLumaEndpoint: async () => ({ ok: true, detail: 'stub' }),
+    persistToken: async () => ({ ok: true, detail: 'stub' }),
+    // goals-life.js 的路径是模块加载时按仓库根算死的（state/goals.json、state/life.json），
+    // 在测试里 import 真文件会导致 addGoalV2/appendLifeV2 写进**真** state 目录。
+    // 这里给一份等价的内存实现：格式化文案与真实现保持一致，测试只关心「有没有这一段」。
+    readGoalsV2: () => goalMem.goals.slice(),
+    addGoalV2: (text, opts = {}) => {
+      const item = { id: `g${++goalMem.seq}`, text: String(text ?? ''), status: 'open', want: Number(opts.want ?? 0), createdAt: new Date().toISOString() };
+      goalMem.goals.push(item);
+      return item;
+    },
+    closeGoalV2: (needle, status = 'done') => {
+      const hit = goalMem.goals.find((g) => g.status === 'open' && (g.id === needle || g.text.includes(String(needle ?? ''))));
+      if (!hit) return null;
+      hit.status = status;
+      hit.closedAt = new Date().toISOString();
+      return hit;
+    },
+    formatGoalsLineV2: () => {
+      const open = goalMem.goals.filter((g) => g.status === 'open').sort((a, b) => b.want - a.want).slice(0, 5);
+      if (!open.length) return '';
+      return `【你自己想干的事】\n${open.map((g) => `- ${g.text}`).join('\n')}`;
+    },
+    readLifeV2: () => goalMem.timeline.slice(),
+    appendLifeV2: (text) => {
+      const at = new Date();
+      const hh = String(at.getHours()).padStart(2, '0');
+      const mm = String(at.getMinutes()).padStart(2, '0');
+      goalMem.timeline.push({ t: `${hh}:${mm}`, text: String(text ?? ''), at: at.toISOString() });
+      return true;
+    },
+    formatLifeLineV2: () => {
+      if (!goalMem.timeline.length) return '';
+      return `【今天早些时候】\n${goalMem.timeline.slice(-6).map((e) => `- ${e.t}${e.text}`).join('\n')}`;
+    },
     // bridge.js 用别名导入这两个（本机同名薄包装占用原名字），VM 里得补上同样的绑定名
     defaultWakeConfigFrom: stateStore.defaultWakeConfigV2,
     refreshDefaultWakeConfigFrom: stateStore.refreshDefaultWakeConfigV2,
