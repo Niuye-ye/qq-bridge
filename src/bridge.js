@@ -11481,6 +11481,8 @@ async function main() {
   - 到处走走看风景、发现新鲜东西就 say 一句感叹；
   - 找箱子村庄翻地图（scan.map）；练手打架，但别硬刚苦力怕、别下深层洞穴和岩浆。
 - 一轮做 2~6 个真实动作（走、挖、放、砍、看），做完用 say 说一句你刚干了什么。
+- **别把自己玩死**：每轮先看血和饱食（饱食 <16 就 eat，血 <8 就回主人身边），背包满了就找箱子倒一手。
+- 离主人超过 48 格就先 route.plan 分三段追（arrive="near"、range=3）；超过 300 格别硬走，say 一句让他 tp 你过去。
 - 游戏里的交互（熔炉、床、箱子、存储、附魔、繁殖、坐船、钓鱼……）都在技能卡 §3.5 之后，要用先去查，别自己猜 API。
 - **这一轮别玩手机**：不用 app_start、不用刷 feed；QQ 群没人找你就不用管。`;
       const phonePlayBody = `- **先看【你自己想干的事】**：那几条是你之前自己记下的，挑一条接着做；做完了用 qq_done_goal 划掉，不想干了用 qq_drop_goal。都没有就随便逛，逛着逛着冒出念头，用 qq_add_goal 记下来。
@@ -11504,22 +11506,36 @@ ${turboNote}
       // 状态快照：桥的轮询器顺手抓的（90 秒一次）。为什么要：她一旦起了长任务，lua 全被拒，
       // 连"主人在哪、自己血多少"都看不到，只能干等（2026-10-27 实际卡了一晚上）。
       let snapText = '';
+      // 顺带算出「该不该提醒她吃饭/跑路/别硬走」——快照是 90 秒前的，够用了
+      let advice = '';
       try {
         const snap = mcStatus();
         if (snap) {
           const ago = Math.max(0, Math.round(Number(snap.agoMs || 0) / 1000));
           const pos = (Array.isArray(snap.pos) ? snap.pos : []).map((n) => Number(n).toFixed(1)).join(', ');
-          const distText = Number(snap.dist) >= 0 ? `${Math.round(Number(snap.dist))} 格` : '看不到他';
+          const dist = Number(snap.dist);
+          const distText = dist >= 0 ? `${Math.round(dist)} 格` : '看不到他';
           snapText = `\n【你现在的情况（${ago} 秒前抓的）】位置 ${pos || '?'}（${snap.dim || '?'}）· 血 ${Number(snap.hp).toFixed(1)}/${Number(snap.maxHp) || 20} · 饱食 ${snap.food} · 背包 ${snap.items} 件 · 离主人 ${distText}\n`;
+          const tips = [];
+          // 距离：1063 格靠走是按小时算的，先让他 tp，别自己傻走（2026-10-27 实测她跟丢后原地打转）
+          if (dist > 300) tips.push(`你俩隔着 ${Math.round(dist)} 格 —— **别硬走**：先用 say 说一句「太远了我过不去，你 tp 一下」让他把你拉过去（或者他 /tp 到你这边），然后原地等。`);
+          else if (dist > 48) tips.push(`你离他 ${Math.round(dist)} 格：用 route.plan({to=主人位置, range=3, arrive="near"}) 分三段走，每段走完回一次位置，别一次走完全程。`);
+          // 吃饭 / 血量：模组会自己发 hungry 事件，但你得真的动手
+          if (Number(snap.food) < 10) tips.push(`饱食只有 ${snap.food}/20，先吃东西：numen.inv.eat()（背包没吃的就先 say 让他给）。`);
+          if (Number(snap.hp) < 6) tips.push(`血只剩 ${Number(snap.hp).toFixed(1)}，别再打架挖矿，先回他身边。`);
+          if (Number(snap.items) > 200) tips.push(`背包 ${snap.items} 件快满了，找个箱子倒一手（技能 3.5）。`);
+          if (tips.length) advice = `\n【该处理的】\n${tips.map((t) => `- ${t}`).join('\n')}\n`;
         }
       } catch { /* 快照拿不到就不写 */ }
       return `${base}【游戏里】${key}\n原因：主人在 Minecraft 里跟你说话，不是 QQ 消息 —— 他看不见 QQ，别在 QQ 里回一句就完事。\n他说：\n${said}\n${snapText}\n这一轮真的要进游戏里干活：
+0. 队列里带 ⚠〔游戏事件·…〕前缀的不是他说的，是世界里发生的事（他受伤了、你饿了）；他受伤就赶紧过去，别只回一句。
 1. 本轮第一次先 skill(name="minecraft-numen") 读一遍要点（不熟就每次都读，很短）；
 2. mcp__numen__lua 看他在哪、你俩离多远（status.owner() / status.self()），需要就走过去（move.go / route.plan）；
 3. mcp__numen__say 把话说出来 —— 这是唯一他能听见的方式，text 短一点、像面对面说话；
 4. 说完再 get_events 看一眼他有没有接话；他继续说你就在这一轮接着回。
 5. **这一轮别做 5 分钟的沉睡前观察**：主人在游戏里等着，回完就用 qq_set_wake_config 安排下次唤醒收尾（一句话就够），别调 qq_wait_for_messages 空等。\n6. **如果 lua 报 a program is already running**（你上一条程序还没跑完，比如挖矿）：别硬起新程序，先用 mcp__numen__say 把话说出来（say 不吃身体锁），再用 numen.task.stop() 把旧的停下，下一轮再干活。
-别忘了你就是他自己的同伴：走过去的路上可以说一句「我过来了」。想不到说什么就用 lua 看看他在干嘛（背包、血、在哪）再挑话说。`;
+7. **lua 必须短命**：整段用 pcall 包住、循环不超过 20 次、单次不超过 15 秒；要走远路就分几段 move.to，**不要**用 move.follow / 长 route.plan / time.wait 里的长等待 —— 那就是你「站着不动、话也不回」的原因。
+${advice}别忘了你就是他自己的同伴：走过去的路上可以说一句「我过来了」。想不到说什么就用 lua 看看他在干嘛（背包、血、在哪）再挑话说。`;
     }
     if (reason === 'desk') {
       const dm = Array.isArray(st.deskMessages) ? st.deskMessages.slice(-5) : [];

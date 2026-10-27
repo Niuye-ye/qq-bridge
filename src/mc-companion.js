@@ -38,6 +38,19 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/**
+ * 所有 lua 调用排一条队。
+ * 为什么：模组一个同伴同时只能跑一个程序，两条叠着发就变成
+ * "a program is already running for this companion"（她那一轮 + 我们的探活撞一起，
+ * 2026-10-27 实测卡过一整晚）。探活/快照/bodyBusy 都从这里过，至少桥这边不会自己撞自己。
+ */
+let LUA_CHAIN = Promise.resolve();
+function withLuaLock(fn) {
+  const run = LUA_CHAIN.then(fn, fn);
+  LUA_CHAIN = run.then(() => {}, () => {});
+  return run;
+}
+
 function saveQueue() {
   if (!QUEUE_FILE) return;
   try {
@@ -112,6 +125,28 @@ function pushMessage(text) {
   if (dropped > 0 && WATCHER) WATCHER.log(`[mc] 队列满了，丢掉最早的 ${dropped} 条`);
   saveQueue();
   return 1;
+}
+
+/**
+ * 把 <event type="…">正文</event> 变成队列里的一条（带清楚的前缀，让她一眼看出
+ * 这不是主人说的话，而是世界里发生的事）。URGENT 类（主人受伤）会免掉 25 秒等待。
+ * 事件种类见模组 EventTypes：query / hungry / owner_hurt。
+ */
+function pullEvents(text) {
+  const out = { added: 0, urgent: false, kinds: [] };
+  const src = String(text || '');
+  const re = /<event\b([^>]*)>([\s\S]*?)<\/event>/g;
+  let m;
+  while ((m = re.exec(src)) !== null) {
+    const attrs = String(m[1] || '');
+    const body = String(m[2] || '').trim().replace(/\s+/g, ' ');
+    if (!body) continue;
+    const type = (/type\s*=\s*"([^"]*)"/.exec(attrs) || /type\s*=\s*'([^']*)'/.exec(attrs) || [])[1] || 'event';
+    const urgent = /owner_hurt|owner_death|owner_died|danger/i.test(`${type} ${body}`);
+    if (urgent) { out.urgent = true; out.kinds.push(type); }
+    if (pushMessage(`⚠〔游戏事件·${type}〕${body}`) > 0) out.added += 1;
+  }
+  return out;
 }
 
 function parseBody(raw, ctype) {
@@ -217,7 +252,7 @@ async function bodyBusy(ctx) {
   try {
     // 注意：Numen 把「身体被占」当**正常文本**返回（isError 都不一定置位），
     // 所以不能靠 try/catch 判断，必须看正文（2026-10-27 实测：busyMs 一直是 0 就是这个坑）。
-    const text = await callTool(ctx, 'lua', { companion: ctx.companion, code: 'return 1' }, 8000);
+    const text = await withLuaLock(() => callTool(ctx, 'lua', { companion: ctx.companion, code: 'return 1' }, 8000));
     if (BUSY_RE.test(String(text || ''))) {
       BUSY_SINCE ||= Date.now();
       checkStuck(ctx);
@@ -274,7 +309,7 @@ async function sampleStatus(ctx) {
     '  tonumber(o.distance) or -1, tonumber(o.hp) or -1, inv))',
   ].join('\n');
   try {
-    const text = await callTool(ctx, 'lua', { companion: ctx.companion, code }, 15000);
+    const text = await withLuaLock(() => callTool(ctx, 'lua', { companion: ctx.companion, code }, 15000));
     const raw = String(text || '');
     // 「身体被占」是正常文本返回，不是异常（见 bodyBusy 的注释）
     if (/already running|already in progress|built-in brain/i.test(raw)) {
@@ -336,7 +371,7 @@ async function ensureCompanion(ctx) {
       try {
         const code = `local ok, err = pcall(ysm.model.switch, ${JSON.stringify(ctx.model)}); if not ok then print(err.kind, err.message) end`;
         // ysm 换模型要把 .ysm 解包加载，第一次可能十几秒；给足 120 秒（原来 30 秒会 timeout）
-        await callTool(ctx, 'lua', { companion: ctx.companion, code }, 120000);
+        await withLuaLock(() => callTool(ctx, 'lua', { companion: ctx.companion, code }, 120000));
         ctx.log(`[mc] 已把外观换成 ${ctx.model}`);
       } catch (e) {
         const m = String(e?.message ?? e);
@@ -400,10 +435,20 @@ async function loop(ctx) {
         let m;
         let added = 0;
         while ((m = re.exec(text)) !== null) added += pushMessage(m[1]);
+        // 游戏里的其他动静：模组会把它们包成 <event type="owner_hurt|hungry|…">正文</event>
+        // （EventTypes 里目前就 QUERY / HUNGRY / OWNER_HURT 三种）。
+        // 以前这里只解析 <query>，于是主人被苦力怕炸了她还在旁边挖矿 —— 完全没反应。
+        const urgent = pullEvents(text);
+        added += urgent.added;
+        if (urgent.added > 0) {
+          ctx.log(`[mc] 游戏事件 ${urgent.added} 条（${urgent.kinds.join(', ')}）`);
+        }
         if (added > 0) {
           ctx.log(`[mc] 游戏里收到 ${added} 条消息（队列 ${QUEUE.length}）`);
           const now = Date.now();
-          if (now - ctx.lastWakeAt > ctx.cooldownMs) {
+          // 紧急事件（主人受伤）不吃 25 秒冷却，最多 15 秒一条，别刷屏
+          const cd = urgent.urgent ? Math.min(ctx.cooldownMs, 15000) : ctx.cooldownMs;
+          if (now - ctx.lastWakeAt > cd) {
             // 先探一下她的身体是不是空着：previous 的 lua 没结束的话，叫醒她也是白花一轮钱
             // （2026-10-27 实测：身体被占时每次唤醒都只换来一句 already running）
             if (await bodyBusy(ctx)) {
