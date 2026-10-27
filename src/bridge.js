@@ -9086,9 +9086,18 @@ async function main() {
         clearTimeout(st.sleepTimer);
         st.sleepTimer = null;
       }
+      // 定时自醒也要按新配置重排：旧的 intervalTimer 是按被丢弃的 everyMinutes 算的，
+      // 不清掉就会在几分钟后按老间隔醒一次（2026-10-27 审计）。
+      if (st.intervalTimer) {
+        clearTimeout(st.intervalTimer);
+        st.intervalTimer = null;
+      }
       st.wakeConfig = defaultWakeConfigV2();
       if (!opts.skipSave) saveSocialV2State();
-      if (key) setupSleepTimerV2(key);
+      if (key) {
+        setupSleepTimerV2(key);
+        setupIntervalTimerV2(key);
+      }
       log(`[reserved2] 唤醒配置无任何触发条件，已重置为默认配置，避免永眠`);
     }
   }
@@ -10641,23 +10650,35 @@ async function main() {
   // 约定过期后再给 3 天宽限才归档（她可能还惦记着）。
   const FACT_EXPIRE_GRACE_MS = 3 * 86400000;
 
+  // 2026-10-27（审计 bridge-core P3，也是 P1 那条的引信）：原来读坏一律 return []，
+  // 而写入方都以它的返回值为基础整份覆盖 —— 坏一次就把 80 条记忆整体清空，日志一个字没有。
+  // 现在区分「文件不存在（真没记忆）」和「解析失败（切只读 + 拒绝覆盖）」，
+  // 写盘换成唯一的原子写（唯一临时名 + rename 重试，绕开 Windows 覆盖正被打开的文件会抛 EPERM）。
+  let FACTS_READONLY = '';
   function readFactsV2() {
     try {
       if (!fs.existsSync(FACTS_PATH)) return [];
       const raw = fs.readFileSync(FACTS_PATH, 'utf8').replace(/^\uFEFF/, '');
+      if (!raw.trim()) return [];
       const o = JSON.parse(raw);
-      return Array.isArray(o?.facts) ? o.facts : [];
-    } catch {
+      if (!Array.isArray(o?.facts)) throw new Error('顶层没有 facts 数组');
+      FACTS_READONLY = '';
+      return o.facts;
+    } catch (e) {
+      const why = e?.message ?? String(e);
+      if (FACTS_READONLY !== why) {
+        FACTS_READONLY = why;
+        log('[facts] state/facts.json 解析失败，已切成只读、拒绝覆盖：' + why);
+      }
       return [];
     }
   }
 
   function writeFactsV2(facts) {
-    const dir = path.dirname(FACTS_PATH);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const tmp = FACTS_PATH + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify({ facts }, null, 2), 'utf8');
-    fs.renameSync(tmp, FACTS_PATH);
+    if (FACTS_READONLY) {
+      throw new Error('state/facts.json 之前解析失败（' + FACTS_READONLY + '），已切成只读：先备份修好它再写，避免整份覆盖把记忆清空');
+    }
+    atomicWriteJson(FACTS_PATH, { facts });
   }
 
   // 遗忘池：还记得有过这回事，但细节已经想不起来了。不删，随时能被翻回来。
@@ -10676,10 +10697,8 @@ async function main() {
     try {
       const dir = path.dirname(FACTS_FORGOTTEN_PATH);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      const tmp = FACTS_FORGOTTEN_PATH + '.tmp';
       const keep = (Array.isArray(list) ? list : []).slice(-FACTS_FORGOTTEN_MAX);
-      fs.writeFileSync(tmp, JSON.stringify({ facts: keep }, null, 2), 'utf8');
-      fs.renameSync(tmp, FACTS_FORGOTTEN_PATH);
+      atomicWriteJson(FACTS_FORGOTTEN_PATH, { facts: keep });
     } catch (e) {
       log('[facts] 写遗忘池失败：' + (e?.message ?? e));
     }
@@ -10972,8 +10991,17 @@ async function main() {
     if (expiresAt) entry.expiresAt = expiresAt;
     facts.push(entry);
     if (facts.length > FACTS_MAX) {
-      const normals = facts.filter((f) => f.tier !== 'long').sort((a, b) => scoreFactV2(a) - scoreFactV2(b));
-      const kill = new Set(normals.slice(0, facts.length - FACTS_MAX).map((f) => f.id));
+      // 2026-10-27 修（审计 bridge-core P2）：原来只在 tier !== 'long' 里淘汰 —— 全被 long
+      // 占满时一条都删不掉（文件无上限增长），而刚写进去的新条目可能当场被裁掉却仍以
+      // 「成功」返回。现在全局按分数排（long 有 FACTS_LONG_FLOOR 兜底，不会先被淘汰），
+      // 并显式排除刚写入的那条。
+      const overflow = facts.length - FACTS_MAX;
+      const victims = facts
+        .filter((f) => f.id !== entry.id)
+        .sort((a, b) => scoreFactV2(a) - scoreFactV2(b))
+        .slice(0, overflow);
+      const kill = new Set(victims.map((f) => f.id));
+      if (kill.size) log('[facts] 超过上限 ' + FACTS_MAX + '，淘汰 ' + kill.size + ' 条最弱的记忆');
       writeFactsV2(facts.filter((f) => !kill.has(f.id)));
       return entry;
     }
@@ -11421,6 +11449,42 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
     });
   }
 
+  /**
+   * 模式守卫（玩游戏模式 / 只玩 Minecraft）挡下的一次唤醒。
+   *
+   * 不能只是 return：那一枪的定时器在处理之前就已经被清掉了，丢掉就再没人补。
+   * 压进与「会话繁忙」同一份 pendingWakeReasons，等模式结束时由
+   * replayAllPendingWakeReasonsV2 统一补发。带去重（同 reason + 同未读水位只留一条）与上限 20。
+   */
+  function stashModeBlockedWakeV2(key, st, reason) {
+    if (!st) return;
+    if (!Array.isArray(st.pendingWakeReasons)) st.pendingWakeReasons = [];
+    const seq = st.lastUnreadSeq || 0;
+    const dup = st.pendingWakeReasons.some((r) => r && r.reason === reason && Number(r.seq) === Number(seq));
+    if (!dup) {
+      st.pendingWakeReasons.push({ reason, seq });
+      if (st.pendingWakeReasons.length > 20) st.pendingWakeReasons.splice(0, st.pendingWakeReasons.length - 20);
+    }
+    saveSocialV2State();
+  }
+
+  /**
+   * 把积压的唤醒原因一条条补发完（replayPendingWakeReasonsV2 每次只处理一条，
+   * 且「已被当前回合处理」的分支也占一条），模式结束时用它一次性清干净。
+   */
+  function replayAllPendingWakeReasonsV2(key) {
+    let n = 0;
+    for (let i = 0; i < 20; i += 1) {
+      const st = socialV2.conversations.get(key);
+      if (!st || !Array.isArray(st.pendingWakeReasons) || !st.pendingWakeReasons.length) break;
+      const r = replayPendingWakeReasonsV2(key);
+      if (!r) break;
+      n += 1;
+    }
+    if (n > 0) log(`[reserved2] 模式结束，补发 ${key} 积压的 ${n} 条唤醒`);
+    return n;
+  }
+
   async function sendWakePromptV2(key, reason) {
     if (cfg.socialV2?.enabled === false) return;
     if (currentMode !== 'reserved2' || socialV2.paused) return;
@@ -11428,22 +11492,29 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
       log(`[reserved2] 跳过唤醒 ${key}（${reason}）：会话已不在当前模式允许范围内`);
       return;
     }
+    const st = getSocialV2State(key);
     // 玩游戏模式（2026-10-27）：玩 MC 的时候除了游戏里的消息，谁都别叫她。
     // 消息本身照收（unread 会累加），退出模式后一轮就能一起回，不丢。
+    // 2026-10-27 修（审计 bridge-core P1）：这两条守卫原来直接 return，但调用方
+    // （setupSleepTimerV2）在此之前已经清掉 sleepTimer、sleepUntil 也已过期 —— return 等于把
+    // 这个会话的闹钟一起丢掉，它就停在「infinite=false、sleepUntil 已过期、没有任何定时器」
+    // 的静默态，除了重启或 30~90 分钟的主动机会没有别的东西能救回来。
+    // 现在改成压进 pendingWakeReasons，模式一结束就补发（见 replayAllPendingWakeReasonsV2）。
     if (mcModeActiveV2() && reason !== 'mc') {
-      log(`[reserved2] 玩游戏模式中，跳过唤醒 ${key}（${reason}）`);
+      stashModeBlockedWakeV2(key, st, reason);
+      log(`[reserved2] 玩游戏模式中，暂存唤醒 ${key}（${reason}），退出模式后补发`);
       return;
     }
     // 去玩会儿 → 只玩 MC：定时自醒照跑（那是她进游戏玩的驱动），其余唤醒按住。
     if (mcOnlyModeV2() && reason !== 'mc' && reason !== 'interval') {
-      log(`[reserved2] 这一轮只玩 Minecraft，跳过唤醒 ${key}（${reason}）`);
+      stashModeBlockedWakeV2(key, st, reason);
+      log(`[reserved2] 这一轮只玩 Minecraft，暂存唤醒 ${key}（${reason}），玩完补发`);
       return;
     }
     // 主人指定这一轮「玩手机」：游戏里的话先不给（也不取走队列），等这段玩完再一起回。
     // 例外：主人本来就是**在游戏里喊她**（reason='mc'）—— 他人就在游戏里，注意力也在游戏里，
     // 这时候还拿「我在玩手机」把他晾着就太蠢了（2026-10-27 实测：主人喊了三句都没人应）。
     // 所以这个开关只管「她自己这一轮干什么」，管不到「主人叫她」。
-    const st = getSocialV2State(key);
     // 防重入：如果该会话已经有一个 DSH turn 在进行中（AI 正在思考/调用工具），
     // 或已有排队/在途 prompt，则不再投递新的候选唤醒，避免“思维链进行中又塞入一个 question 唤醒”。
     if (isConversationBusyV2(key, st) && !(await tryInterruptV2(key, st, reason))) {
@@ -11523,25 +11594,41 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
     st.wakeConfig.wakeCount = (st.wakeConfig.wakeCount || 0) + 1;
     st.lastWakeReason = reason;
     saveSocialV2State();
-    const promptText = buildWakePromptV2(key, reason);
-    log(`[reserved2] 唤醒 ${key}（${reason}）`);
     const rollbackWakeTime = () => {
       const idx = st.wakeTimes.lastIndexOf(wakeTime);
       if (idx >= 0) st.wakeTimes.splice(idx, 1);
       saveSocialV2State();
     };
+    const restoreFiniteSleep = () => {
+      if (hadFiniteSleep) {
+        st.wakeConfig.sleepUntil = prevSleepUntil;
+        st.wakeConfig.infinite = false;
+        saveSocialV2State();
+        setupSleepTimerV2(key);
+      }
+    };
+    // 2026-10-27 修（审计 bridge-core P1）：buildWakePromptV2 内部会走 formatFactsLineV2 /
+    // formatGoalsLineV2 / formatLifeLineV2 → 写盘。这一步原来在 try 之外，写盘一失败
+    // （facts.json 撞上 Defender 的 EPERM 窗口就是典型）异常就冒出去，而状态已经被改成
+    // 「本次唤醒已消费」：wakeTimes 已压入、sleepUntil=null、sleepTimer=null。
+    // setupSleepTimerV2 看到 sleepUntil 为空直接 return，从此没有任何代码再给这个会话排潜水，
+    // 线上表现就是「她不说话了、也不报错，重启才好」。现在构建放进 try，失败就整份回滚。
+    let promptText;
+    try {
+      promptText = buildWakePromptV2(key, reason);
+    } catch (error) {
+      rollbackWakeTime();
+      st.wakeConfig.wakeCount = Math.max(0, (st.wakeConfig.wakeCount || 1) - 1);
+      saveSocialV2State();
+      restoreFiniteSleep();
+      log(`[reserved2] 唤醒提示词构建失败 ${key}（${reason}）：${error?.message ?? error}；已回滚本次唤醒并重排潜水`);
+      return;
+    }
+    log(`[reserved2] 唤醒 ${key}（${reason}）`);
     try {
       pendingWakeKeys.add(key);
       armPendingWakeLease(key);
       const result = await deliverPrompt(key, promptText, { wakeReason: reason });
-      const restoreFiniteSleep = () => {
-        if (hadFiniteSleep) {
-          st.wakeConfig.sleepUntil = prevSleepUntil;
-          st.wakeConfig.infinite = false;
-          saveSocialV2State();
-          setupSleepTimerV2(key);
-        }
-      };
       if (result && result.ok === false) {
         pendingWakeKeys.delete(key);
         disarmPendingWakeLease(key);
@@ -11857,6 +11944,12 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
     if (Number(m.until) > 0 && Date.now() >= Number(m.until)) {
       socialV2.mcMode = null;               // 到期就安静收掉
       try { saveSocialV2State(); } catch { /* ignore */ }
+      // 到期补偿（只会走一次：上面刚把 mcMode 置 null）：模式期间被压住的唤醒要补发、
+      // 定时自醒也要重排 —— setupIntervalTimerV2 在模式里是直接 return 的，没有别的地方会替它排。
+      for (const key of [...socialV2.conversations.keys()]) {
+        try { setupIntervalTimerV2(key); } catch { /* 单个会话失败不影响别的 */ }
+        try { replayAllPendingWakeReasonsV2(key); } catch { /* 同上 */ }
+      }
       return false;
     }
     return true;
@@ -11981,6 +12074,10 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
       socialV2.turbo = null;
       saveSocialV2State();
       for (const key of socialV2.conversations.keys()) setupIntervalTimerV2(key);
+      // 模式期间被按住的消息类唤醒（mcMode / 只玩 MC）在这里补发。
+      if (!mcOnlyModeV2() && !mcModeActiveV2()) {
+        for (const key of socialV2.conversations.keys()) replayAllPendingWakeReasonsV2(key);
+      }
       log("[turbo] 超活跃模式已关闭（" + String(why || "manual") + "，从 " + new Date(Number(was.since) || Date.now()).toLocaleString("zh-CN") + " 开始）");
       return turboStatusV2();
     }
@@ -12005,6 +12102,10 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
     }
     saveSocialV2State();
     for (const key of socialV2.conversations.keys()) setupIntervalTimerV2(key);
+    // 焦点从 mc 切回 phone（或换了档位）时，把模式期间压住的唤醒补发掉。
+    if (!mcOnlyModeV2() && !mcModeActiveV2()) {
+      for (const key of socialV2.conversations.keys()) replayAllPendingWakeReasonsV2(key);
+    }
     log("[turbo] 超活跃模式已开启：每 " + socialV2.turbo.everyMinutes + " 分钟醒一次，夜间不放慢，" + h.toFixed(2) + " 小时后（" + new Date(socialV2.turbo.until).toLocaleString("zh-CN") + "）自动收");
     return turboStatusV2();
   }
@@ -12435,6 +12536,15 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
     }
   }
 
+  /** 移除一个挂起请求：清定时器 + 从表里摘掉（幂等，且只摘自己那一条）。 */
+  function dropPending(key, p) {
+    if (p && p.timer) {
+      clearTimeout(p.timer);
+      p.timer = null;
+    }
+    if (pending.get(key) === p) pending.delete(key);
+  }
+
   // 回答挂起的提问/审批
   async function handlePendingAnswer(p, answerText, key, isOwner = false) {
     if (p.kind === 'question') {
@@ -12452,8 +12562,10 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
           outcome: { kind: 'result', value: { answers } }
         });
         log(`已回答提问 (${key}):`, receipt);
-        // 只有回执成功才移除挂起，且必须仍是同一个挂起（防止期间被新请求覆盖）
-        if (pending.get(key) === p) pending.delete(key);
+        // 只有回执成功才移除挂起，且必须仍是同一个挂起（防止期间被新请求覆盖）。
+        // 2026-10-27 修（审计）：删条目时连超时定时器一起清 —— 原来只 delete，
+        // 定时器还在跑，几秒后照样触发 cancelPendingEntry + 「等待回答超时」的误报。
+        dropPending(key, p);
       } catch (error) {
         log('回答问题失败（保留挂起以便重试）:', error.message);
         await sendToQQ(key, '⚠️ 回答提交失败，请再回复一次。');
@@ -12482,7 +12594,7 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
         log(`已处理审批 (${key}): ${outcome}`, receipt);
         await sendToQQ(key, outcome === 'allowed-once' ? '✅ 已通过审批' : '❌ 已拒绝审批');
         // 只有回执成功才移除挂起，且必须仍是同一个挂起（防止期间被新请求覆盖）
-        if (pending.get(key) === p) pending.delete(key);
+        dropPending(key, p);
       } catch (error) {
         log('处理审批失败（保留挂起以便重试）:', error.message);
         await sendToQQ(key, '⚠️ 审批回执提交失败，请再回复一次「通过」或「拒绝」。');
@@ -12568,6 +12680,8 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
         sendToQQ(key, '⏰ 等待回答超时，已取消该请求');
       }
     }, cfg.questionTimeoutMs);
+    // unref：一个挂起请求的 5 分钟超时定时器不该把进程钉住不退出（2026-10-27 审计）。
+    timer.unref?.();
     entry.timer = timer;
     pending.set(key, entry);
   }

@@ -20,19 +20,50 @@ const LIFE_PATH = path.join(ROOT, 'state', 'life.json');
 const GOALS_MAX = 40;
 const LIFE_KEEP = 60;
 
+// 文件解析失败后置位：只读标记，写路径一律拒绝覆盖
+const BROKEN = new Set();
+let tmpSeq = 0;
+
+function logBroken(p, err) {
+  if (BROKEN.has(p)) return;
+  BROKEN.add(p);
+  console.error('[goals-life] ' + p + ' 解析失败，已切成只读、拒绝覆盖：' + (err?.message ?? err));
+}
+
 function readJsonFile(p, fallback) {
   try {
     if (!fs.existsSync(p)) return fallback;
-    const o = JSON.parse(fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, ''));
-    return o && typeof o === 'object' ? o : fallback;
-  } catch {
+    const txt = fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, '');
+    if (!txt.trim()) return fallback;          // 空文件（从没写过）不算损坏
+    const o = JSON.parse(txt);
+    if (!o || typeof o !== 'object') throw new Error('顶层不是对象');
+    BROKEN.delete(p);                           // 修好了就恢复可写
+    return o;
+  } catch (e) {
+    logBroken(p, e);
     return fallback;
   }
 }
 
+/** 唯一临时名 + rename 重试：Windows 上覆盖一个正被打开的目标会抛 EPERM/EBUSY */
 function writeJsonFile(p, o) {
+  if (BROKEN.has(p)) throw new Error(p + ' 之前解析失败，已切成只读：先备份修好它再写，避免整份覆盖');
   fs.mkdirSync(path.dirname(p), { recursive: true });
-  fs.writeFileSync(p, `${JSON.stringify(o, null, 2)}\n`, 'utf8');
+  const tmp = p + '.tmp-' + process.pid + '-' + (++tmpSeq);
+  fs.writeFileSync(tmp, JSON.stringify(o, null, 2) + '\n', 'utf8');
+  let lastErr = null;
+  for (let i = 0; i < 5; i++) {
+    try { fs.renameSync(tmp, p); return; } catch (e) {
+      lastErr = e;
+      if (e && (e.code === 'EPERM' || e.code === 'EBUSY' || e.code === 'EACCES')) {
+        try { fs.copyFileSync(tmp, p); fs.unlinkSync(tmp); return; } catch (_) { /* 继续重试 */ }
+        const until = Date.now() + 20 * (i + 1);
+        while (Date.now() < until) { /* 小睡，别引 async */ }
+      } else break;
+    }
+  }
+  try { fs.existsSync(tmp) && fs.unlinkSync(tmp); } catch (_) {}
+  throw lastErr || new Error('写入 ' + p + ' 失败');
 }
 
 export function readGoalsV2() {
@@ -108,11 +139,17 @@ export function appendLifeV2(text) {
   return entry;
 }
 
-export function formatLifeLineV2() {
-  const d = new Date();
+/** ISO 时间戳 → 本地日期 YYYY-MM-DD（'' 表示解析不了） */
+function localDay(iso) {
+  const d = new Date(String(iso || ''));
+  if (Number.isNaN(d.getTime())) return '';
   const pad = (n) => String(n).padStart(2, '0');
-  const today = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-  const items = readLifeV2().filter((x) => String(x.at || '').slice(0, 10) === today).slice(-6);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+export function formatLifeLineV2() {
+  const today = localDay(new Date().toISOString());
+  const items = readLifeV2().filter((x) => localDay(x.at) === today).slice(-6);
   if (!items.length) return '';
   return `【今天早些时候】\n${items.map((x) => `${x.t} ${x.text}`).join('\n')}\n\n`;
 }

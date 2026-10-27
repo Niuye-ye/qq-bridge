@@ -30,6 +30,7 @@ say 为空时用 dur 当段时长（纯画面段）。
 import os
 import re
 import sys
+import atexit
 import json
 import shutil
 import asyncio
@@ -734,6 +735,10 @@ def render(job_path, out_path=None):
     log(f"ffmpeg: {ffmpeg}")
 
     workdir = Path(tempfile.mkdtemp(prefix="petvideo_"))
+    # 2026-10-27 修（审计 P2）：原来只在成功路径 rmtree，渲染一失败就在 %TEMP% 里
+    # 留一份几百 MB 的 petvideo_*（有人连做几个坏片子能吃掉好几个 G）。
+    # 改成注册 atexit：正常结束、异常、SystemExit 都会清；下面那行 rmtree 保留无妨（幂等）。
+    atexit.register(shutil.rmtree, workdir, ignore_errors=True)
     log(f"临时目录: {workdir}")
 
     durs, audio = build_audio(job, ffmpeg, ffprobe, workdir)

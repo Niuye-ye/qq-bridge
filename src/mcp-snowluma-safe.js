@@ -2039,6 +2039,10 @@ server.tool(
       }
       fs.mkdirSync(VIDEO_JOBS, { recursive: true });
       fs.mkdirSync(VIDEO_DIR, { recursive: true });
+      // 做视频比画图重（ffmpeg 多遍编码），2026-10-27 起也走内存守护；
+      // 因为子进程是 detached 的，恢复交给 watchPidThenRestore 盯 pid，不用 finally。
+      const guard = await startMemGuard(memMinGB('video', 1.5), '做视频');
+      const memFreed = guard.freed;
 
       const id = 'v' + Date.now().toString(36);
       const mode = String(size || '1080p');
@@ -2059,6 +2063,8 @@ server.tool(
       fs.writeFileSync(jobPath, JSON.stringify(job, null, 2), 'utf8');
       const outPath = path.join(VIDEO_DIR, `${id}.mp4`);
       const logPath = path.join(VIDEO_JOBS, `${id}.log`);
+      // 2026-10-27 修（审计 P2）：原来父进程 open 出来的 fd 从不 close，每做一个视频泄漏一个句柄，
+      // 挂一整天就 EBADF/EMFILE。子进程 spawn 时已经 dup 过去，这里必须立刻关掉自己那份。
       const fd = fs.openSync(logPath, 'a');
       const ffmpeg = pickFfmpeg();
       const childEnv = { ...process.env, PYTHONIOENCODING: process.env.PYTHONIOENCODING || 'utf-8' };
@@ -2071,7 +2077,8 @@ server.tool(
         env: childEnv,
       });
       child.unref();
-      try { fs.writeSync(fd, ''); } catch { /* ignore */ }
+      try { fs.closeSync(fd); } catch (e) { console.error('[video] 关闭日志句柄失败: ' + (e?.message ?? e)); }
+      if (memFreed) watchPidThenRestore(child.pid);
       fs.writeFileSync(path.join(VIDEO_JOBS, `${id}.pid`), String(child.pid ?? ''), 'utf8');
 
       const est = Math.round(segments.length * 9 + 15);
@@ -2576,7 +2583,9 @@ function memRestoreLater() {
 function memMinGB(kind, dflt) {
   try {
     const c = readBridgeConfig()?.memory || {};
-    const v = Number(kind === 'animate' ? c.minFreeAnimate : c.minFreeDraw);
+    // video 没单独配就退回画图那个阈值：两者都是 ffmpeg/ComfyUI 吃内存的活
+    const key = kind === 'animate' ? c.minFreeAnimate : kind === 'video' ? (c.minFreeVideo ?? c.minFreeDraw) : c.minFreeDraw;
+    const v = Number(key);
     if (Number.isFinite(v) && v > 0) return v;
   } catch {}
   return dflt;
@@ -2600,6 +2609,22 @@ async function startMemGuard(minFreeGB, tag) {
     finish() { if (freed) memRestoreLater(); },
   };
 }
+// 做视频是 detached 后台跑，拿不到 finish：pid 还在就每 5 秒看一眼，消失后再把链路起回来。
+// （最多盯 30 分钟；MCP 进程重启就放弃——那种情况下次 mem-saver restore 也会兜回来）
+function watchPidThenRestore(pid) {
+  const startedAt = Date.now();
+  const timer = setInterval(() => {
+    let alive = false;
+    try { process.kill(pid, 0); alive = true; } catch { alive = false; }
+    if (!alive || Date.now() - startedAt > 30 * 60 * 1000) {
+      clearInterval(timer);
+      if (alive) console.error('[mem] 视频跑了 30 分钟还没结束，先恢复链路');
+      memRestoreLater();
+    }
+  }, 5000);
+  if (timer.unref) timer.unref();
+}
+
 const DRAW_ROOT = path.join(ROOT, 'state', 'draw');
 const DRAW_TIMEOUT_DEFAULT = 180;
 const DRAW_TIMEOUT_MAX = 600;
