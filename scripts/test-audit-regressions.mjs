@@ -249,7 +249,16 @@ await test('R8 wake-config 丢弃未知 triggers 键（不落盘、不回传模�
       assert.equal('another' in res.json.wakeConfig.triggers, false);
       assert.equal(st.wakeConfig.triggers.junkKey, undefined, '内存态不得被污染');
       assert.equal(st.wakeConfig.triggers.atMention, true, '已知字段仍需生效');
-      const file = JSON.parse(fs.readFileSync(path.join(h.temp, 'state', 'social-v2.json'), 'utf8'));
+      // 2026-10-27 起 saveSocialV2State() 是 400ms 防抖（B6）：突发改动合并成一次写盘，
+      // 所以落盘断言不能紧接着 POST 读文件，要等这一拍写下去（最多 ~1.5s）。
+      const statePath = path.join(h.temp, 'state', 'social-v2.json');
+      let file = null;
+      for (let i = 0; i < 40; i += 1) {
+        try { file = JSON.parse(fs.readFileSync(statePath, 'utf8')); } catch { file = null; }
+        if (file?.conversations?.['group:456']) break;
+        await sleep(50);
+      }
+      assert.ok(file?.conversations?.['group:456'], '防抖窗口过后必须已经落盘（最多 2s）');
       assert.equal(file.conversations['group:456'].wakeConfig.triggers.junkKey, undefined, '落盘文件不得含垃圾键');
     });
   } finally { await h.close(); }

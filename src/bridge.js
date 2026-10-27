@@ -26,6 +26,8 @@ import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, in
 import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
 import { hardenDir, manualDirCommand } from './state-acl.mjs';
 import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
+// social-v2.json 的序列化/加载/落盘（原 bridge.js:8925-9398 的数据部分）
+import { WAKE_TRIGGER_KEYS, createSocialV2Store, defaultWakeConfigV2 as defaultWakeConfigFrom, normalizeSpeakerIdsV2, pickWakeTriggersV2, refreshDefaultWakeConfigV2 as refreshDefaultWakeConfigFrom } from './state-store.mjs';
 import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
 import { addGoalV2, appendLifeV2, closeGoalV2, formatGoalsLineV2, formatLifeLineV2, readGoalsV2, readLifeV2 } from './goals-life.js';
@@ -7956,7 +7958,7 @@ async function main() {
             // 退出前落盘：SIGINT/SIGTERM 的收尾路径会 saveState()/saveSocialV2State()，
             // 而重启这条路径以前直接 process.exit，500ms 窗口内改动的唤醒配置/计数器会丢。
             try { saveState(); } catch (error) { log('重启前保存会话映射失败:', error?.message ?? error); }
-            try { saveSocialV2State(); } catch (error) { log('重启前保存二代会话状态失败:', error?.message ?? error); }
+            try { saveSocialV2StateNow(); } catch (error) { log('重启前保存二代会话状态失败:', error?.message ?? error); }
             releaseLock();
             process.exit(0);
           }, 500);
@@ -8971,93 +8973,30 @@ async function main() {
   // 二代会话见过的 forward id（有界，避免 recentMessages 滚动淘汰后无法读取刚见过的转发）
   const seenForwardIds = new Map(); // key -> Set<string>
 
-  // 归一化“指定群友发言唤醒”名单：
-  // - 只保留正整数 QQ 号（字符串形式），拒绝 null/对象/“null”/非法字符等脏数据；
-  // - 去重并限制最多 20 个，避免唤醒名单无限膨胀/被恶意塞入异常值；
-  // - undefined/null 都视为“不启用”（空数组）。
-  function normalizeSpeakerIdsV2(value) {
-    if (value === undefined || value === null) return [];
-    const rawList = Array.isArray(value) ? value : String(value).split(/[,，\s]+/);
-    const seen = new Set();
-    const clean = [];
-    for (const v of rawList) {
-      const s = String(v ?? '').trim();
-      if (!/^[1-9]\d*$/.test(s)) continue;
-      if (seen.has(s)) continue;
-      seen.add(s);
-      clean.push(s);
-      if (clean.length >= 20) break;
-    }
-    return clean;
-  }
+  // social-v2.json 的读写器（序列化白名单、加载归一化、防抖落盘）在 src/state-store.mjs。
+  // getState 传的是**活引用**：落盘那一刻才序列化，突发期间的 54 处 save() 合并成一次写。
+  const SOCIAL_V2_STORE = createSocialV2Store({
+    file: SOCIAL_V2_FILE,
+    log,
+    readJsonSafe,
+    atomicWriteJson,
+    getState: () => ({
+      paused: socialV2.paused,
+      turbo: socialV2.turbo,
+      turboLast: socialV2.turboLast,
+      level: socialV2.level,
+      mcMode: socialV2.mcMode,
+      conversations: socialV2.conversations,
+      seenForwardIds
+    }),
+    getWakeConfig: () => cfg.socialV2?.wake ?? {},
+    sanitizeForwardId
+  });
 
-  // triggers 的**唯一**合法字段集合。写入与加载都按它过滤：
-  // 旧写法 `{...current.triggers, ...inputTriggers}` 会把模型传来的任意键原样并入、
-  // 持久化、再由 qq_get_prompt 原样回给模型（每次请求都带着），等于给了一个
-  // 「用 1MB 垃圾键把状态文件与每轮 prompt 撑大」的入口。
-  const WAKE_TRIGGER_KEYS = Object.freeze(['atMention', 'nameMention', 'speakerIds', 'keywords', 'question', 'poke', 'anyMessage', 'probability']);
-  function pickWakeTriggersV2(source, fallback = {}) {
-    const out = {};
-    const src = source && typeof source === 'object' ? source : {};
-    const fb = fallback && typeof fallback === 'object' ? fallback : {};
-    for (const name of WAKE_TRIGGER_KEYS) {
-      const value = Object.prototype.hasOwnProperty.call(src, name) ? src[name] : fb[name];
-      if (value !== undefined) out[name] = value;
-    }
-    return out;
-  }
-
-  function defaultWakeConfigV2() {
-    const w = cfg.socialV2?.wake ?? {};
-    const defaultMode = w.defaultMode === 'active' ? 'active' : 'diving';
-    const defaultInfinite = w.recommendedDefaultInfinite !== false;
-    const recMin = Number(w.recommendedSleepMinMs) || 300000;
-    const recMax = Number(w.recommendedSleepMaxMs) || 7200000;
-    let finiteMs = recMin + Math.random() * Math.max(0, recMax - recMin);
-    const hardMin = Math.max(0, Number(w.sleepMinMs) || 0);
-    const hardMax = Number(w.sleepMaxMs) || 0;
-    if (hardMin > 0 && finiteMs < hardMin) finiteMs = hardMin;
-    if (hardMax > 0 && finiteMs > hardMax) finiteMs = hardMax;
-    return {
-      mode: defaultMode,
-      infinite: defaultInfinite,
-      sleepUntil: defaultInfinite ? null : new Date(Date.now() + Math.round(finiteMs)).toISOString(),
-      triggers: {
-        atMention: w.recommendedAtMention !== false,
-        nameMention: w.recommendedNameMention !== false,
-        speakerIds: [],
-        keywords: Array.isArray(w.recommendedKeywords) ? w.recommendedKeywords.map(String) : [],
-        question: w.recommendedQuestion !== false,
-        poke: w.recommendedPoke !== false,
-        anyMessage: defaultMode === 'active',
-        probability: Math.min(1, Math.max(0, Number(w.recommendedProbability) || 0))
-      },
-      batchWindowMs: Math.max(1000, Number(w.batchWindowMs) || 8000),
-      lastWakeAt: 0,
-      wakeCount: 0,
-      noActionCount: 0,
-      confirmedAt: 0,
-      confirmedBy: 'default'
-    };
-  }
-
-  // 把“仍使用默认唤醒配置”的会话刷新为当前推荐/默认参数。
-  // 只有 confirmedBy === 'default' 的会话才会被刷新；AI 或管理员显式设置过的（set_wake_config / mark_read）不会被覆盖。
-  function refreshDefaultWakeConfigV2(st) {
-    if (!st || !st.wakeConfig) return false;
-    if (st.wakeConfig.confirmedBy !== 'default') return false;
-    const def = defaultWakeConfigV2();
-    const old = st.wakeConfig;
-    st.wakeConfig = {
-      ...def,
-      lastWakeAt: old.lastWakeAt || 0,
-      wakeCount: old.wakeCount || 0,
-      noActionCount: old.noActionCount || 0,
-      confirmedAt: old.confirmedAt || 0,
-      confirmedBy: 'default'
-    };
-    return true;
-  }
+  // 唤醒配置的纯数据部分（默认值 / triggers 白名单 / 名单归一 / 默认值刷新）已搬到
+  // src/state-store.mjs；这里只留两个「按当前 cfg 取值」的薄包装，54 个调用点一个字没改。
+  function defaultWakeConfigV2() { return defaultWakeConfigFrom(cfg.socialV2?.wake ?? {}); }
+  function refreshDefaultWakeConfigV2(st) { return refreshDefaultWakeConfigFrom(st, cfg.socialV2?.wake ?? {}); }
 
   // 保存推荐/默认参数后，把所有仍使用默认配置的会话同步到新默认值。
   function refreshAllDefaultWakeConfigsV2() {
@@ -9202,200 +9141,47 @@ async function main() {
     return st;
   }
 
+  // 读 social-v2.json：解析（字段白名单/归一化/forward id 重建/改写保护）在 src/state-store.mjs，
+  // 这里只把结果装回运行时 —— 令牌账本、seenForwardIds、唤醒定时器、主动检查排程都是副作用，留在桥里。
   function loadSocialV2State() {
     try {
-      // 记下读取时刻的文件指纹。加载末尾会统一落盘一次（为了让 ensureWakeableV2
-      // 中途的改动不丢），但如果这期间**别的进程**已经写过这个文件，我们手上的
-      // 内存态就是旧的 —— 再写回去等于把它那份更新的状态覆盖掉。
-      // 这不是假想：日志里出现过两个桥接实例同时启动，第二个实例在加载后立刻回写，
-      // 把第一个实例刚更新的读水位/唤醒时间/转发 id 全部退回旧值。
-      const fileStamp = (() => {
-        try {
-          const s = fs.statSync(SOCIAL_V2_FILE);
-          return `${s.size}:${s.mtimeMs}`;
-        } catch {
-          return null;
-        }
-      })();
-      const raw = readJsonSafe(SOCIAL_V2_FILE, null);
-      socialV2.paused = raw?.paused === true;
-      // 活跃度档位从磁盘恢复；minutes 非法就当没设过
-      const rawLevel = raw?.level;
-      if (rawLevel && Number(rawLevel.minutes) >= 1) {
-        socialV2.level = { id: String(rawLevel.id || 'custom'), label: String(rawLevel.label || '自定义'), minutes: Math.min(720, Math.max(1, Number(rawLevel.minutes))) };
-      } else {
-        socialV2.level = null;
-      }
-      // 超活跃模式从磁盘恢复（重启桥不丢）；已过期的直接作废
-      const rawTurbo = raw?.turbo;
-      if (rawTurbo && rawTurbo.on === true) {
-        const until = Number(rawTurbo.until) || 0;
-        socialV2.turbo = (until && Date.now() >= until)
-          ? null
-          : { on: true, since: Number(rawTurbo.since) || Date.now(), until, by: String(rawTurbo.by || 'manual'), costAtStart: Number(rawTurbo.costAtStart) || 0 };
-      } else {
-        socialV2.turbo = null;
-      }
-      // 上一次「去玩会儿」的结算（桌宠关掉后还要显示花了多少）
-      const rawLast = raw?.turboLast;
-      if (rawLast && typeof rawLast === 'object') {
-        socialV2.turboLast = {
-          since: Number(rawLast.since) || 0,
-          until: Number(rawLast.until) || 0,
-          hours: Number(rawLast.hours) || 0,
-          everyMinutes: Number(rawLast.everyMinutes) || 0,
-          costCny: Number.isFinite(Number(rawLast.costCny)) ? Number(rawLast.costCny) : null,
-          endedAt: Number(rawLast.endedAt) || 0,
-          endedBy: String(rawLast.endedBy || ''),
-        };
-      }
-      if (raw && typeof raw.conversations === 'object') {
-        const seenTokens = new Set();
-        for (const [key, val] of Object.entries(raw.conversations)) {
-          if (!val || typeof val !== 'object') continue;
-          if (!/^(group|private):\d+$/.test(key)) continue;
-          const defaultWc = defaultWakeConfigV2();
-          let agentToken = String(val.agentToken || crypto.randomBytes(16).toString('hex'));
-          if (!agentToken || seenTokens.has(agentToken)) {
-            agentToken = crypto.randomBytes(16).toString('hex');
-          }
-          seenTokens.add(agentToken);
-          const st = {
-            wakeConfig: {
-              ...defaultWc,
-              ...(val.wakeConfig ?? {}),
-              // 加载时也按已知字段过滤：旧状态文件里可能残留任意键（见 WAKE_TRIGGER_KEYS）。
-              triggers: pickWakeTriggersV2((val.wakeConfig?.triggers) ?? {}, defaultWc.triggers)
-            },
-            recentMessages: Array.isArray(val.recentMessages) ? val.recentMessages : [],
-            unread: Array.isArray(val.unread) ? val.unread : [],
-            lastWakeReason: String(val.lastWakeReason ?? ''),
-            lastAiReplyAt: Number(val.lastAiReplyAt) || 0,
-            lastActionAt: Number(val.lastActionAt) || 0,
-            agentToken,
-            bootstrapSent: !!val.bootstrapSent,
-            wakeTimes: Array.isArray(val.wakeTimes) ? val.wakeTimes : [],
-            sendTimes: Array.isArray(val.sendTimes) ? val.sendTimes : [],
-            stickerCollectTimes: Array.isArray(val.stickerCollectTimes) ? val.stickerCollectTimes : [],
-            pendingWakeTimer: null,
-            sleepTimer: null,
-            replyCheckTimer: null,
-            proactiveTimer: null,
-            lastIncomingAt: Number(val.lastIncomingAt) || 0,
-            preSleepWaitSatisfiedAt: Number(val.preSleepWaitSatisfiedAt) || 0,
-            preSleepWaitObservedAt: Number(val.preSleepWaitObservedAt) || 0,
-            preSleepWaitAccumMs: Number(val.preSleepWaitAccumMs) || 0,
-            lastUnreadSeq: Number(val.lastUnreadSeq) || 0,
-            lastReadThroughSeq: Number.isSafeInteger(val.lastReadThroughSeq) && val.lastReadThroughSeq >= 0
-              ? Math.min(val.lastReadThroughSeq, Number(val.lastUnreadSeq) || 0) : 0,
-            modelSeenSeqs: new Set(),
-            activeTopics: Array.isArray(val.activeTopics) ? val.activeTopics : [],
-            pendingThoughts: Array.isArray(val.pendingThoughts) ? val.pendingThoughts : [],
-            memberImpressions: (() => {
-              const rawImp = (val.memberImpressions && typeof val.memberImpressions === 'object') ? val.memberImpressions : {};
-              const clean = {};
-              for (const [k, v] of Object.entries(rawImp)) {
-                if (['__proto__', 'constructor', 'prototype'].includes(k)) continue;
-                clean[k] = v;
-              }
-              return clean;
-            })()
-          };
-          // 旧状态/异常状态里的指定成员名单也统一归一化，防止“null”/非法值污染。
-          if (st.wakeConfig?.triggers && typeof st.wakeConfig.triggers === 'object') {
-            st.wakeConfig.triggers.speakerIds = normalizeSpeakerIdsV2(st.wakeConfig.triggers.speakerIds);
-            if (key.startsWith('private:')) st.wakeConfig.triggers.speakerIds = [];
-          }
-          // 仍使用默认唤醒配置的会话，在重启加载时同步到当前推荐/默认参数。
-          refreshDefaultWakeConfigV2(st);
+      const parsed = SOCIAL_V2_STORE.load({
+        // 元信息先就位：装配会话时要读 socialV2.paused 决定起不起定时器
+        onMeta: (p) => {
+          socialV2.paused = p.paused;
+          socialV2.turbo = p.turbo;
+          socialV2.turboLast = p.turboLast;
+          socialV2.level = p.level;
+          socialV2.mcMode = p.mcMode;
+        },
+        onConversation: (key, st, p) => {
           rememberAgentToken(key, st.agentToken);
           socialV2.conversations.set(key, st);
-          // 重启后从已持久化的消息与 seenForwardIds 字段重建“本会话见过的 forward id”
-          {
-            const rebuilt = new Set();
-            if (Array.isArray(val.seenForwardIds)) {
-              for (const fid of val.seenForwardIds) {
-                const safe = sanitizeForwardId(fid);
-                if (safe) rebuilt.add(safe);
-              }
-            }
-            for (const m of [...(st.recentMessages || []), ...(st.unread || [])]) {
-              if (Array.isArray(m?.forwardIds)) {
-                for (const fid of m.forwardIds) {
-                  const safe = sanitizeForwardId(fid);
-                  if (safe) rebuilt.add(safe);
-                }
-              }
-            }
-            if (rebuilt.size) seenForwardIds.set(key, rebuilt);
-          }
+          const seen = p.seenForwardIds.get(key);
+          if (seen && seen.size) seenForwardIds.set(key, seen);
           ensureWakeableV2(st, { skipSave: true, key });
           scheduleProactiveCheckV2(key);
         }
-        // 加载阶段统一落盘一次，避免 ensureWakeableV2 中途写盘覆盖未加载会话。
-        // 但只有在文件仍是「我们读到的那一份」时才写：否则说明有另一个进程写过它，
-        // 我们手里的内存态已经过时，回写会静默吞掉对方的新数据。
-        const nowStamp = (() => {
-          try {
-            const s = fs.statSync(SOCIAL_V2_FILE);
-            return `${s.size}:${s.mtimeMs}`;
-          } catch {
-            return null;
-          }
-        })();
-        if (fileStamp !== null && nowStamp !== null && fileStamp !== nowStamp) {
-          log('⚠️ state/social-v2.json 在本次加载期间被其它进程改写，跳过回写以免覆盖更新的状态（是否误开了第二个桥接实例？）');
-        } else {
-          saveSocialV2State();
-        }
-      }
+      });
+      // 文件不存在/读不动：保持默认空状态（与旧实现一致，不落盘）
+      if (!parsed) return;
     } catch (error) {
       log('读取 socialV2 状态失败:', error?.message ?? error);
     }
   }
 
-  // 2026-10-26 瘦身：状态文件有 51 处调用 saveSocialV2State()，绝大多数是「顺手存一下」，
-  // 内容其实一个字没变（定时器、轮询、读接口都会触发）。原来每次都 JSON.stringify(69KB) +
-  // 写临时文件 + rename，一天下来是几十万次无意义写盘。
-  // 现在记一份「上次写进去的文本」，一模一样就直接返回；只有真变了才落盘。
-  let SOCIAL_LAST_SAVED_TEXT = '';
+  // 落盘策略在 src/state-store.mjs：400ms 防抖 + 内容没变就不写 + 加载期被改写保护。
+  // 54 处调用点照旧调 saveSocialV2State()，但突发期间（轮询/GET/定时器）的多次改动
+  // 会合并成一次 JSON.stringify + rename，不再每次都付出 63KB 的代价（B6）。
+  // 需要「写完立刻要被读到」（重启、退出）的地方用 saveSocialV2StateNow()。
   function saveSocialV2State() {
-    try {
-      const obj = { paused: socialV2.paused, turbo: socialV2.turbo || null, level: socialV2.level || null, conversations: Object.create(null) };
-      for (const [key, st] of socialV2.conversations) {
-        obj.conversations[key] = {
-          wakeConfig: st.wakeConfig,
-          recentMessages: st.recentMessages.slice(-200),
-          unread: st.unread.slice(-100),
-          lastWakeReason: st.lastWakeReason,
-          lastAiReplyAt: st.lastAiReplyAt,
-          lastActionAt: st.lastActionAt,
-          agentToken: st.agentToken,
-          bootstrapSent: st.bootstrapSent,
-          wakeTimes: st.wakeTimes.slice(-200),
-          sendTimes: st.sendTimes.slice(-500),
-          stickerCollectTimes: Array.isArray(st.stickerCollectTimes) ? st.stickerCollectTimes.slice(-500) : [],
-          lastIncomingAt: st.lastIncomingAt || 0,
-          preSleepWaitSatisfiedAt: st.preSleepWaitSatisfiedAt || 0,
-          preSleepWaitObservedAt: st.preSleepWaitObservedAt || 0,
-          preSleepWaitAccumMs: st.preSleepWaitAccumMs || 0,
-          lastUnreadSeq: st.lastUnreadSeq || 0,
-          lastReadThroughSeq: st.lastReadThroughSeq || 0,
-          activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-50) : [],
-          pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.slice(-50) : [],
-          memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
-          seenForwardIds: Array.from(seenForwardIds.get(key) || []).slice(-1000),
-          deskMessages: Array.isArray(st.deskMessages) ? st.deskMessages.slice(-20) : []
-        };
-      }
-      const text = JSON.stringify(obj, null, 2) + '\n';
-      if (text === SOCIAL_LAST_SAVED_TEXT) return; // 内容没变，省掉一次 69KB 写盘
-      atomicWriteJson(SOCIAL_V2_FILE, obj);
-      SOCIAL_LAST_SAVED_TEXT = text;
-    } catch (error) {
-      log('保存 socialV2 状态失败:', error?.message ?? error);
-    }
+    SOCIAL_V2_STORE.save();
   }
+  function saveSocialV2StateNow() {
+    return SOCIAL_V2_STORE.flush();
+  }
+  // 进程退出钩子在 main() 外面，拿不到这个闭包 —— 挂一个模块级入口让它能强制落盘。
+  SOCIAL_V2_FLUSH = () => saveSocialV2StateNow();
 
   // ── 二代仿真：操作者预写的「初始提示词」（每个会话一份，只在首次唤醒时注入） ──────
   //
@@ -13474,13 +13260,22 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
   await pumpMux();
 }
 
+// social-v2.json 的强制落盘入口：saveSocialV2State() 是 400ms 防抖的，
+// 进程要退出时窗口里还没落到盘上的改动必须补一次（normalize 在 main() 里赋值）。
+let SOCIAL_V2_FLUSH = null;
+function flushSocialV2State() {
+  try { SOCIAL_V2_FLUSH?.(); } catch {}
+}
+
 process.on('SIGINT', () => {
   log('退出中…');
+  flushSocialV2State();
   saveState();
   releaseLock();
   process.exit(0);
 });
 process.on('SIGTERM', () => {
+  flushSocialV2State();
   saveState();
   releaseLock();
   process.exit(0);
@@ -13500,11 +13295,13 @@ process.on('unhandledRejection', (error) => {
  */
 process.on('uncaughtException', (error) => {
   try { log('致命异常（进程即将退出）:', error?.stack ?? error?.message ?? error); } catch {}
+  flushSocialV2State();
   try { saveState(); } catch {}
   releaseLock();
   process.exit(1);
 });
-process.on('exit', () => releaseLock());
+// exit 钩子里只能做同步事：flush 是同步写（临时文件 + rename），可以在这儿补最后一笔。
+process.on('exit', () => { flushSocialV2State(); releaseLock(); });
 
 main().catch((error) => {
   console.error('[bridge] 启动失败:', error);

@@ -20,6 +20,9 @@ import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import * as presetPrompt from '../src/preset-prompt.js';
 import * as stateAcl from '../src/state-acl.mjs';
+// 2026-10-27 抽出来的纯数据层（social-v2 序列化/解析/防抖写入）——桥在 VM 里跑，
+// 它的 import 被剥掉了，所以这里显式注入同名绑定。
+import * as stateStore from '../src/state-store.mjs';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -160,7 +163,10 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...stateStore,
+    // bridge.js 用别名导入这两个（本机同名薄包装占用原名字），VM 里得补上同样的绑定名
+    defaultWakeConfigFrom: stateStore.defaultWakeConfigV2,
+    refreshDefaultWakeConfigFrom: stateStore.refreshDefaultWakeConfigV2,
     // ACL 收紧会 spawn icacls 去改**真实**文件系统；测试不该做这件事（同理见下面的
     // cleanupTemp / processAudioVolume 桩）。桩成成功，让 hardenStateDirAcl 走正常分支。
     hardenDir: () => ({ ok: true, detail: 'stub' }),
