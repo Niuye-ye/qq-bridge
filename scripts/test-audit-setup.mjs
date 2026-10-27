@@ -58,9 +58,17 @@ try {
       const doc = yaml.load(fs.readFileSync(f.patchFile, 'utf8'));
       const entries = doc.flatMap((op) => op.insert || []);
       assert.deepEqual(entries.find((entry) => entry.id === 'custom'), originalCustom);
-      for (const id of ['mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe']) {
+      for (const id of ['mcp-snowluma', 'mcp-web-search-safe']) {
         assert.equal(entries.filter((entry) => entry.id === id).length, 1, `${id} duplicate`);
       }
+      // 2026-10-27（审计）：mcp-snowluma-host 已在 2026-10-26 并进 mcp-web-search-safe 那个合并进程，
+      // setup 的职责变成「把历史配置里那条旧条目删掉」—— 断言它被清干净（上面第 60 行同时钉住：
+      // 别人 config 里同名的嵌套项一个字都不许动）。
+      assert.equal(
+        entries.filter((entry) => entry.id === 'mcp-snowluma-host').length,
+        0,
+        'mcp-snowluma-host 是历史条目，应被清理而不是保留',
+      );
       assert.equal(entries.find((entry) => entry.id === 'mcp-snowluma').config.toolCallTimeoutMs, 725000);
     }
     const pkg = JSON.parse(fs.readFileSync(path.join(f.home, 'profiles/web/package.json')));

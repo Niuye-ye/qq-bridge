@@ -109,7 +109,10 @@ const LOCAL_EXECUTION_TOOLS = [
   // 插件/cordis 运行期检查：能读宿主状态（0.1.7 起只有这两个名字）
   'cordis_inspect_list', 'cordis_inspect_query',
   // 本机文件 + 进程：plugin-guard 会改写配置并 spawn pnpm
-  'dsh_snapshot', 'dsh_rollback', 'incident_resolved',
+  // 2026-10-27：`dsh_snapshot` / `dsh_rollback` / `incident_resolved` 三个名字已从名单**移除**——
+  // DSH 0.2.1-rc.3 的安装包里不再注册它们（`scripts/scan-dsh-tool-names.mjs` 实测 0 命中）。
+  // 留着不会放松限制（执行期白名单对未知名字同样 fail-closed），只会每次启动多打三条
+  // `skip restrict ...` 噪声，还会让 test-preset-local-tools 的「假名」对账一直红。
   // 会话/交付/任务面
   // 注意：`todo_write` 与 `ask_user_question` **故意不在**此名单——它们是下面
   // SAFE_EXACT 允许的无害模型侧工具，两边不能自相矛盾。

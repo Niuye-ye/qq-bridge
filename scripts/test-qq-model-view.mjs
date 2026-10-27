@@ -156,6 +156,13 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
     await Promise.all(['mcp-snowluma-safe.js', 'qq-model-view.js', 'sensitive.js'].map((name) =>
       fs.copyFile(path.join(ROOT, 'src', name), path.join(fixture, 'src', name))));
     await fs.writeFile(path.join(fixture, 'config.json'), JSON.stringify({ consolePort: api.address().port }));
+    // 2026-10-27：会话令牌已从工具 schema 里摘掉（省 token、免得模型抄错），改由 MCP 侧
+    // 按 key 从 state/social-v2.json 的 conversations[key].agentToken 现查。夹具必须把这份
+    // 状态摆好，否则请求会带着空令牌出去 —— 这里同时钉住「查表拿到的令牌真的被发出去」。
+    await fs.mkdir(path.join(fixture, 'state'), { recursive: true });
+    await fs.writeFile(path.join(fixture, 'state', 'social-v2.json'), JSON.stringify({
+      conversations: { 'group:123': { agentToken: 'fixture-token' } }
+    }));
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [path.join(fixture, 'src', 'mcp-snowluma-safe.js')], cwd: fixture, stderr: 'pipe'
@@ -173,7 +180,9 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
     const waitSchema = listed.tools.find((tool) => tool.name === 'qq_wait_for_messages').inputSchema;
     assert.deepEqual(waitSchema.properties.purpose.enum, ['messages', 'reply']);
     assert.equal(waitSchema.required.includes('purpose'), false);
-    const common = { key: 'group:123', token: 'fixture-token' };
+    // 不传 token：schema 里已经没有这个字段了（传了也会被注册期包装覆盖）
+    const common = { key: 'group:123' };
+    const expectedToken = 'fixture-token';
     const read = await client.callTool({ name: 'qq_get_unread_messages', arguments: common });
     const readText = read.content.find((part) => part.type === 'text').text;
     const data = JSON.parse(readText);
@@ -197,7 +206,7 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
     await client.callTool({ name: 'qq_wait_for_messages', arguments: common });
     assert.equal(requests.at(-1).url, '/api/socialV2/wait');
     assert.deepEqual(requests.at(-1).body, { key: common.key });
-    assert.equal(requests.at(-1).token, common.token);
+    assert.equal(requests.at(-1).token, expectedToken);
     for (const purpose of ['messages', 'reply']) {
       await client.callTool({ name: 'qq_wait_for_messages', arguments: {
         ...common, purpose, timeoutMs: 30000, quietMs: 10000, minNewMessages: 1
@@ -216,7 +225,7 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
     await client.callTool({ name: 'qq_mark_read', arguments: { ...common, throughSeq: 21 } });
     assert.equal(requests.at(-1).url, '/api/socialV2/mark-read');
     assert.deepEqual(requests.at(-1).body, { key: common.key, throughSeq: 21 });
-    assert.equal(requests.at(-1).token, common.token);
+    assert.equal(requests.at(-1).token, expectedToken);
 
     await client.callTool({ name: 'qq_set_wake_config', arguments: { ...common, config: { mode: 'diving' }, throughSeq: 0 } });
     assert.equal(requests.at(-1).url, '/api/socialV2/wake-config');

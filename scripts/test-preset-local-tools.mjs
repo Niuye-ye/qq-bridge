@@ -68,7 +68,9 @@ const LOCAL_EXECUTION_TOOLS = [
   'send_message', 'interrupt_agent', 'list_agents',
   'workflow', 'ralph',
   'cordis_inspect_list', 'cordis_inspect_query',
-  'dsh_snapshot', 'dsh_rollback', 'incident_resolved',
+  // 2026-10-27：移出 `dsh_snapshot` / `dsh_rollback` / `incident_resolved` —— DSH 0.2.1-rc.3
+  // 已不再注册这三个名字（scan-dsh-tool-names.mjs 实测 0 命中），留着就是三个假名。
+  // 执行期白名单对任何未知名字 fail-closed，所以移出名单不会放松边界。
   'job_list', 'job_output', 'job_kill', 'skill', 'present',
   'get_goal', 'create_goal', 'update_goal',
   'dev_mode_set', 'dev_mode_status', 'dev_mode_subagent',

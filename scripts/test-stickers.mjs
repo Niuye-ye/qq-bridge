@@ -92,7 +92,13 @@ console.log('## 配置文件');
   ok(tools.getStickerImage === true, 'config getStickerImage=true');
   ok(tools.sendSticker === true, 'config sendSticker=true');
   ok(tools.stickerNote === true, 'config stickerNote=true');
-  ok(tools.setStickerRemark === false, 'config setStickerRemark=false（默认禁用）');
+  // 现场 config.json 是主人自己按需改过的，不能拿它钉「默认值」（这条之前红过就是这原因）。
+  // 「默认禁用」的语义在代码默认值与随仓库发的示例配置里，两处一起查；现场只断言类型。
+  ok(typeof tools.setStickerRemark === 'boolean', 'config setStickerRemark 是布尔开关（现场值随主人设置变化）');
+  const exampleCfg = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.example.json'), 'utf8'));
+  ok(exampleCfg.socialV2?.tools?.setStickerRemark === false, 'config.example.json 默认 setStickerRemark=false');
+  const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+  ok((bridgeSrc.match(/setStickerRemark: false,/g) ?? []).length >= 2, 'bridge.js 两处默认配置都默认关掉 setStickerRemark');
   ok(cfg.socialV2?.sticker?.enabled === true, 'config sticker.enabled=true');
   ok(!('sendCaptionMaxChars' in (cfg.socialV2?.sticker ?? {})), 'config sticker 不再包含 sendCaptionMaxChars');
 }

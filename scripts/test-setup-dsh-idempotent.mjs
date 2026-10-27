@@ -68,13 +68,15 @@ runSetup('第 2 次运行');
 
 const finalPatch = fs.readFileSync(path.join(tmpHome, 'profiles', 'web', 'cordis.patch.yml'), 'utf8');
 
-// 断言 1：每个托管 id 恰好出现一次
+// 断言 1：每个托管 id 出现在期望次数
+// mcp-snowluma-host 已于 2026-10-26 并进 mcp-web-search-safe（src/mcp-all.js）；
+// setup-dsh.mjs 的 MANAGED_MCP_IDS 留着它只为清理历史条目，所以正确结果是 0 次。
 let failed = 0;
-for (const id of ['mcp-snowluma', 'mcp-snowluma-host', 'mcp-web-search-safe']) {
+for (const [id, expected] of [['mcp-snowluma', 1], ['mcp-web-search-safe', 1], ['mcp-snowluma-host', 0]]) {
   const n = finalPatch.split('\n').filter((l) => new RegExp(`^\\s*-\\s*id:\\s*${id}\\s*$`).test(l)).length;
-  const ok = n === 1;
+  const ok = n === expected;
   if (!ok) failed += 1;
-  console.log(`${ok ? '✅' : '❌'} id ${id} 出现 ${n} 次（期望 1）`);
+  console.log(`${ok ? '✅' : '❌'} id ${id} 出现 ${n} 次（期望 ${expected}）`);
 }
 
 // 断言 2：旧路径已被替换为本仓库路径

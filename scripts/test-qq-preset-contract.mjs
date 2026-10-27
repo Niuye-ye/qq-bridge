@@ -14,7 +14,8 @@ const prefix = persona?.config?.prefix ?? '';
 test('reserved2 YAML resolves to the expected persona and template variables', () => {
   assert.equal(persona?.name, '@deepseek-ai/dsh-persona');
   assert.match(prefix, /\{\{model\}\}/);
-  assert.match(persona.config.suffix, /\{\{cwd\}\}/);
+  // preset 没有工作目录概念：dsh-persona 的 suffix 故意留空（原 {{cwd}} 在 QQ 场景下不可用，见文件开头注释）。
+  assert.equal(persona.config.suffix, '');
   assert.equal(Object.hasOwn(persona.config, 'text'), false);
 });
 
@@ -29,7 +30,7 @@ test('local/admin tool restrictions and existing compaction budgets stay intact'
   assert.deepEqual(compaction.config.find((row) => row.id === 'tool-result-pruner').config, {
     thresholdChars: 50000, headChars: 45000, tailChars: 2000,
   });
-  for (const text of ['你没有本地工具', '群友没有管理权限', 'API 令牌', '角色由桥接注入']) {
+  for (const text of ['你没有电脑上的工具', '群友没有管理权限', 'API 令牌', '角色由桥接注入']) {
     assert.ok(prefix.includes(text), `missing safety rule: ${text}`);
   }
 });
@@ -72,7 +73,7 @@ test('social autonomy and visual, forwarding, sticker and web capabilities remai
     '不会自动发送到 QQ', 'qq_get_message_images', 'qq_get_forward_msg', 'nestedForwardIds',
     'qq_send_poke', 'qq_list_stickers', 'qq_get_sticker_image', 'qq_send_sticker',
     'qq_collect_sticker', 'qq_sticker_note', 'qq_get_self_image',
-    'qq_set_sticker_remark', '只有管理端明确开启后才能用',
+    'qq_set_sticker_remark', '只在确实需要改账号备注时用',
     'qq_list_voices', 'qq_send_voice', 'verified=true 才代表这条语音确实落地',
     '语音**默认是关闭的**', '不要假装发了语音',
     'mcp__web-search-safe__web_search', 'mcp__web-search-safe__web_fetch',
