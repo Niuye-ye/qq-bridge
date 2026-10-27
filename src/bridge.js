@@ -30,7 +30,7 @@ import { resolvePriceTable } from './model-prices.js';
 import { createTokenLedger } from './token-ledger.js';
 import { addGoalV2, appendLifeV2, closeGoalV2, formatGoalsLineV2, formatLifeLineV2, readGoalsV2, readLifeV2 } from './goals-life.js';
 // Minecraft 陪伴：轮询 Numen 模组内置 MCP 服务端的游戏内消息（纯 I/O + 队列，不碰会话状态机）
-import { dropMcMessages, mcAlive, mcQueueSize, peekMcMessages, startMcWatcher } from './mc-companion.js';
+import { dropMcMessages, mcAlive, mcBusyMs, mcQueueSize, mcStatus, peekMcMessages, startMcWatcher } from './mc-companion.js';
 import {
   loadSlang,
   saveSlang,
@@ -1222,6 +1222,30 @@ function log(...args) {
   // 而 log() 是从 socket 事件回调里被调用的 —— 一旦抛出就会变成未捕获异常把进程带走。
   try { console.log(line); } catch {}
   appendBridgeLog(`${line}\n`);
+}
+
+/**
+ * 直接给主人发一句私聊（不经会话，不花 token）。
+ * 用途：环境级故障提醒 —— 比如她在游戏里被自己的程序锁住、只有主人点「停止」能解。
+ */
+async function noticeOwnerV2(text) {
+  const owner = Number(cfg.ownerQQ || 0);
+  if (!owner) return;
+  try {
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+    const res = await fetch(`${httpUrl}/send_private_msg`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {}),
+      },
+      body: JSON.stringify({ user_id: owner, message: [{ type: 'text', data: { text } }] }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) log(`[notify] 提醒主人失败：HTTP ${res.status}`);
+  } catch (e) {
+    log(`[notify] 提醒主人失败：${e?.message ?? e}`);
+  }
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const convKey = (kind, id) => `${kind}:${id}`;
@@ -5003,7 +5027,15 @@ async function main() {
             lastAiReplyAt: selfSt.lastAiReplyAt || 0,
             unread: Array.isArray(selfSt.unread) ? selfSt.unread.length : 0,
             playing: t.on ? { focus: t.focus, focusLabel: t.focusLabel, remainMinutes: t.remainMinutes, everyMinutes: t.everyMinutes, costCny: t.costTurboCny, level: t.level } : null,
-            mc: { alive, queue: (() => { try { return mcQueueSize(); } catch { return 0; } })(), mode: mcModeActiveV2() },
+            mc: {
+              alive,
+              queue: (() => { try { return mcQueueSize(); } catch { return 0; } })(),
+              mode: mcModeActiveV2(),
+              // 身体此刻在哪、血多少（90 秒抓一次的快照，给桌宠和她自己的提示词用）
+              status: (() => { try { return mcStatus(); } catch { return null; } })(),
+              // 身体被上一条没跑完的程序锁了多久（>10 分钟就该在游戏里点「停止」了）
+              busyMs: (() => { try { return mcBusyMs(); } catch { return 0; } })(),
+            },
             paused: !!socialV2.paused,
             level: socialV2.level ? { ...socialV2.level } : null,
           });
@@ -11469,12 +11501,24 @@ ${turboNote}
     if (reason === 'mc') {
       const msgs = peekMcMessages();
       const said = msgs.length ? msgs.map((m) => `- ${m.text}`).join('\n') : '（消息没取到，自己去 get_events 看看）';
-      return `${base}【游戏里】${key}\n原因：主人在 Minecraft 里跟你说话，不是 QQ 消息 —— 他看不见 QQ，别在 QQ 里回一句就完事。\n他说：\n${said}\n\n这一轮真的要进游戏里干活：
+      // 状态快照：桥的轮询器顺手抓的（90 秒一次）。为什么要：她一旦起了长任务，lua 全被拒，
+      // 连"主人在哪、自己血多少"都看不到，只能干等（2026-10-27 实际卡了一晚上）。
+      let snapText = '';
+      try {
+        const snap = mcStatus();
+        if (snap) {
+          const ago = Math.max(0, Math.round(Number(snap.agoMs || 0) / 1000));
+          const pos = (Array.isArray(snap.pos) ? snap.pos : []).map((n) => Number(n).toFixed(1)).join(', ');
+          const distText = Number(snap.dist) >= 0 ? `${Math.round(Number(snap.dist))} 格` : '看不到他';
+          snapText = `\n【你现在的情况（${ago} 秒前抓的）】位置 ${pos || '?'}（${snap.dim || '?'}）· 血 ${Number(snap.hp).toFixed(1)}/${Number(snap.maxHp) || 20} · 饱食 ${snap.food} · 背包 ${snap.items} 件 · 离主人 ${distText}\n`;
+        }
+      } catch { /* 快照拿不到就不写 */ }
+      return `${base}【游戏里】${key}\n原因：主人在 Minecraft 里跟你说话，不是 QQ 消息 —— 他看不见 QQ，别在 QQ 里回一句就完事。\n他说：\n${said}\n${snapText}\n这一轮真的要进游戏里干活：
 1. 本轮第一次先 skill(name="minecraft-numen") 读一遍要点（不熟就每次都读，很短）；
 2. mcp__numen__lua 看他在哪、你俩离多远（status.owner() / status.self()），需要就走过去（move.go / route.plan）；
 3. mcp__numen__say 把话说出来 —— 这是唯一他能听见的方式，text 短一点、像面对面说话；
 4. 说完再 get_events 看一眼他有没有接话；他继续说你就在这一轮接着回。
-5. **这一轮别做 5 分钟的沉睡前观察**：主人在游戏里等着，回完就用 qq_set_wake_config 安排下次唤醒收尾（一句话就够），别调 qq_wait_for_messages 空等。
+5. **这一轮别做 5 分钟的沉睡前观察**：主人在游戏里等着，回完就用 qq_set_wake_config 安排下次唤醒收尾（一句话就够），别调 qq_wait_for_messages 空等。\n6. **如果 lua 报 a program is already running**（你上一条程序还没跑完，比如挖矿）：别硬起新程序，先用 mcp__numen__say 把话说出来（say 不吃身体锁），再用 numen.task.stop() 把旧的停下，下一轮再干活。
 别忘了你就是他自己的同伴：走过去的路上可以说一句「我过来了」。想不到说什么就用 lua 看看他在干嘛（背包、血、在哪）再挑话说。`;
     }
     if (reason === 'desk') {
@@ -11576,8 +11620,13 @@ ${turboNote}
     }
     // 玩游戏模式（2026-10-27）：玩 MC 的时候除了游戏里的消息，谁都别叫她。
     // 消息本身照收（unread 会累加），退出模式后一轮就能一起回，不丢。
-    if (mcModeActiveV2() && reason !== 'mc' && reason !== 'mcSelf') {
+    if (mcModeActiveV2() && reason !== 'mc') {
       log(`[reserved2] 玩游戏模式中，跳过唤醒 ${key}（${reason}）`);
+      return;
+    }
+    // 去玩会儿 → 只玩 MC：定时自醒照跑（那是她进游戏玩的驱动），其余唤醒按住。
+    if (mcOnlyModeV2() && reason !== 'mc' && reason !== 'interval') {
+      log(`[reserved2] 这一轮只玩 Minecraft，跳过唤醒 ${key}（${reason}）`);
       return;
     }
     // 主人指定这一轮「玩手机」：游戏里的话先不给（也不取走队列），等这段玩完再一起回。
@@ -11691,9 +11740,15 @@ ${turboNote}
         restoreFiniteSleep();
         log(`[reserved2] 唤醒投递被拒 ${key}: ${result.error || '未知错误'}`);
       } else if (result && result.queued === true) {
+        st.lastWakeDeliveredAt = Date.now();
         // 入队而非真正在途：保留 pendingWakeKeys，等 DSH 恢复后真正投递的 turn/end 再触发收尾保护；
         // 不能在这里删除，否则补投的唤醒回合会丢失“未设置唤醒配置”的安全兜底。
         log(`[reserved2] 唤醒已入队 ${key}（${reason}），等待 DSH 恢复后补投`);
+      } else {
+        // 真投出去了：打个时间戳。调用方（游戏内消息）靠它判断该不该清队列 ——
+        // 以前这里没有标记，onQuery 又是无条件清队列，凡命中上面某个提前 return，
+        // 主人的话就被静默吞掉（2026-10-27 审计）。
+        st.lastWakeDeliveredAt = Date.now();
       }
     } catch (error) {
       pendingWakeKeys.delete(key);
@@ -11980,10 +12035,14 @@ ${turboNote}
   let MC_SELF_TIMER = null;
   let MC_SELF_LAST = 0;
   // 玩游戏模式是否开着（到期自动失效，不用人记着关）
+  // 「这一轮只玩 Minecraft」（去玩会儿 → 玩 MC）。它**不能**关掉定时自醒：
+  // 定时自醒正是"她自己进游戏里玩"的唯一驱动（mcSelf 已于 2026-10-27 删掉）。
+  // 它只负责把跟游戏无关的唤醒按住（QQ/桌宠/poke/主动机会），消息照收、玩完一轮再回。
+  function mcOnlyModeV2() {
+    return turboActiveV2() && turboFocusV2() === 'mc';
+  }
+
   function mcModeActiveV2() {
-    // 「让她去玩会儿」里指定去玩 Minecraft 的那一段，效果和老的游戏模式开关一样：
-    // 除了游戏里主人说的话，别的唤醒都先按住（消息照收，玩完一轮回）。
-    if (turboActiveV2() && turboFocusV2() === 'mc') return true;
     const m = socialV2.mcMode;
     if (!m || m.on !== true) return false;
     if (Number(m.until) > 0 && Date.now() >= Number(m.until)) {
@@ -12154,6 +12213,11 @@ ${turboNote}
     let mins = Number(st.wakeConfig?.everyMinutes) || 0;
     // 超活跃模式：用开模式时的档位间隔（默认取当前活跃度），不再写死 1 分钟
     if (turboOn) mins = Number(socialV2.turbo && socialV2.turbo.everyMinutes) > 0 ? Number(socialV2.turbo.everyMinutes) : levelMinutesV2();
+    // 去玩会儿 → 玩 MC：1 分钟一轮在游戏里既贵又没意义（走过去就要几十秒），
+    // 单独用 socialV2.mc.playIntervalMinutes（默认 4 分钟）。主人在游戏里说话不受这个限制。
+    if (turboOn && turboFocusV2() === 'mc') {
+      mins = Math.max(1, Math.min(30, Number(cfg.socialV2?.mc?.playIntervalMinutes) || 4));
+    }
     if (!(mins > 0)) return;
     // 凌晨 0~7 点自动放慢到 60 分钟：真人不会半夜每十分钟醒一次。
     // 只影响这一次的定时器，不写回 wakeConfig —— 白天恢复她自己设的间隔。
@@ -13333,7 +13397,16 @@ ${turboNote}
           token: mc.token,
           companion: mc.companion,
           model: mc.model,
+          // 队列落盘：桥一天重启好几次，光放内存的话那几句"在游戏里喊的话"直接蒸发
+          queueFile: path.join(STATE_DIR, 'mc-queue.json'),
+          statusEveryMs: Number(mc.statusEveryMs) || 90000,
           log,
+          // 她身体被上一条没跑完的程序锁住时，桥这边一点办法都没有（MCP 没有停止类工具，
+          // lua 又被锁挡着），只有游戏内提示条上的「停止」能解 → 卡够久就提醒主人一次。
+          onStuck: async (minutes) => {
+            log(`[mc] 身体被锁了 ${minutes} 分钟，提醒主人去按「停止」`);
+            await noticeOwnerV2(`我在 Minecraft 里被自己上一条没跑完的程序卡住了（${minutes} 分钟了），动弹不了、lua 全被拒。你在游戏里点一下提示条上的「停止」（或者删掉我重召一次，但会清背包），我马上就能动。`);
+          },
           onQuery: async () => {
             const st = socialV2.conversations.get(mcKey);
             if (!st) {
@@ -13354,17 +13427,19 @@ ${turboNote}
                 return;
               }
             }
+            const t0 = Date.now();
             await sendWakePromptV2(mcKey, 'mc');
             // 交付成功才清队列：拼提示词用的是 peek，万一上面因为繁忙没投出去，
             // 消息还在队列里，轮询器过一会儿会再叫一次（否则主人在游戏里说一句就永远没人应）。
-            dropMcMessages();
+            // 判据是 sendWakePromptV2 真投递时打的 lastWakeDeliveredAt —— 它有一堆提前 return，
+            // 看返回值/看队列长度都不可靠（2026-10-27 审计）。
+            if (Number(st.lastWakeDeliveredAt) >= t0) {
+              dropMcMessages();
+            } else {
+              log('[mc] 这一轮没投出去（条件不满足），消息留在队列里');
+            }
           },
         });
-        // ── 她自己过日子（2026-10-27）──────────────────────────────────────
-        // 以前她只会「主人说一句、她动一下」：唤醒来自 QQ / 定时自醒，游戏里没人说话就不动。
-        // 真人玩家不是这样的 —— 没人指挥也会自己挖矿、盖房、闲逛。
-        // 这里给一个低频打点：玩游戏模式开着 + 她正活着 + 没人说话 + 她闲着 → reason='mcSelf'。
-        // 提示词（buildWakePromptV2 的 mcSelf 分支）明确告诉她「这是你自己的时间」。
       } catch (error) {
         log('[mc] 轮询启动失败:', error?.message ?? error);
       }

@@ -3,14 +3,31 @@
 //
 // 为什么单独一个模块：bridge.js 已经 1.2 万行，轮询器是纯 I/O + 队列，不碰会话状态机，
 // 拆出来零风险（同 goals-life.js 的思路）。队列模块级，buildWakePromptV2 直接 take。
+import fs from 'node:fs';
 import http from 'node:http';
+import path from 'node:path';
 
 const QUEUE = [];          // [{ at, text }]
-const MAX_QUEUE = 8;       // 攒太多轮也没意义，主人早就不等了
-let LAST_TEXT = '';        // 去重：同一条事件可能在下一次 get_events 里重复出现
-let LAST_AT = 0;
+const MAX_QUEUE = 20;      // 攒太多轮也没意义；20 条 ≈ 主人连说一阵子
+let QUEUE_FILE = '';       // 落盘位置（state/mc-queue.json），空 = 只放内存
+// 她的状态快照：轮询器顺手抓，桥拼提示词时兜底用（她身体被长任务锁住时唯一的信息源）
+let LAST_STATUS = null;
+let STATUS_AT = 0;
 let LAST_OK_AT = 0;        // 最近一次轮询成功（她在世界里、服务端答话）
+let BUSY_SINCE = 0;        // 身体被长任务锁住的起点（0 = 空着）
+let STUCK_NOTIFIED_AT = 0; // 上次因为「卡太久」提醒主人的时间
 let WATCHER = null;
+
+/** 最近一次抓到的她的状态（血/饱食/位置/离主人多远/背包件数）。没抓到过就是 null。 */
+export function mcStatus() {
+  if (!LAST_STATUS) return null;
+  return { ...LAST_STATUS, at: STATUS_AT, agoMs: Date.now() - STATUS_AT, busyMs: BUSY_SINCE ? Date.now() - BUSY_SINCE : 0 };
+}
+
+/** 她身体被长任务锁住多久了（毫秒，0 = 空着）。桌宠/接口用它提示「要按停止」。 */
+export function mcBusyMs() {
+  return BUSY_SINCE ? Date.now() - BUSY_SINCE : 0;
+}
 
 /** 她是不是正活在游戏里（桥用它判断「现在能不能叫她自己玩」）。 */
 export function mcAlive(maxAgeMs = 150000) {
@@ -21,9 +38,36 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function saveQueue() {
+  if (!QUEUE_FILE) return;
+  try {
+    fs.mkdirSync(path.dirname(QUEUE_FILE), { recursive: true });
+    fs.writeFileSync(QUEUE_FILE, JSON.stringify(QUEUE.slice(-MAX_QUEUE)), 'utf8');
+  } catch { /* 落盘失败不影响投递 */ }
+}
+
+function loadQueue() {
+  if (!QUEUE_FILE) return 0;
+  try {
+    const arr = JSON.parse(fs.readFileSync(QUEUE_FILE, 'utf8'));
+    if (!Array.isArray(arr)) return 0;
+    let n = 0;
+    for (const it of arr.slice(-MAX_QUEUE)) {
+      const text = String(it?.text ?? '').trim();
+      if (!text) continue;
+      QUEUE.push({ at: Number(it?.at) || Date.now(), text });
+      n++;
+    }
+    if (n > 0 && WATCHER) WATCHER.log(`[mc] 从上次退出时捡回 ${n} 条没送出去的话`);
+    return n;
+  } catch { return 0; }
+}
+
 /** 取走并清空待处理的游戏内消息。 */
 export function takeMcMessages() {
-  return QUEUE.splice(0, QUEUE.length);
+  const out = QUEUE.splice(0, QUEUE.length);
+  if (out.length) saveQueue();
+  return out;
 }
 
 /** 只看，不清空（拼提示词时用；真交付成功后再 drop）。 */
@@ -34,7 +78,9 @@ export function peekMcMessages() {
 /** 交付成功后清掉已带过去的那几条。 */
 export function dropMcMessages(n) {
   const count = Number(n) > 0 ? Math.min(Number(n), QUEUE.length) : QUEUE.length;
-  return QUEUE.splice(0, count);
+  const out = QUEUE.splice(0, count);
+  if (out.length) saveQueue();
+  return out;
 }
 
 /** 队列里还有多少条没交出去。 */
@@ -55,11 +101,16 @@ function pushMessage(text) {
   const now = Date.now();
   const t = String(text ?? '').trim();
   if (!t) return 0;
-  if (t === LAST_TEXT && now - LAST_AT < 20000) return 0; // 同一个事件重复上报
-  LAST_TEXT = t;
-  LAST_AT = now;
+  // 去重：只跟「队列里最后一条还没送出去」的比，窗口 8 秒。
+  // 原来是跟全局 LAST_TEXT 比 20 秒 —— 同一个事件确实会重复上报，但主人在游戏里
+  // 连说两句「过来」也会被当成重复吞掉（2026-10-27 审计）。
+  const last = QUEUE[QUEUE.length - 1];
+  if (last && last.text === t && now - last.at < 8000) return 0;
   QUEUE.push({ at: now, text: t });
-  while (QUEUE.length > MAX_QUEUE) QUEUE.shift();
+  let dropped = 0;
+  while (QUEUE.length > MAX_QUEUE) { QUEUE.shift(); dropped++; }
+  if (dropped > 0 && WATCHER) WATCHER.log(`[mc] 队列满了，丢掉最早的 ${dropped} 条`);
+  saveQueue();
   return 1;
 }
 
@@ -162,12 +213,99 @@ async function callTool(ctx, name, args, timeoutMs) {
  * 探不动（网络抖/服务刚重启）时按「不忙」处理 —— 宁可试一次，也不要把她的消息无限攒着。
  */
 async function bodyBusy(ctx) {
+  const BUSY_RE = /already running|already in progress|built-in brain/i;
   try {
-    await callTool(ctx, 'lua', { companion: ctx.companion, code: 'return 1' }, 8000);
+    // 注意：Numen 把「身体被占」当**正常文本**返回（isError 都不一定置位），
+    // 所以不能靠 try/catch 判断，必须看正文（2026-10-27 实测：busyMs 一直是 0 就是这个坑）。
+    const text = await callTool(ctx, 'lua', { companion: ctx.companion, code: 'return 1' }, 8000);
+    if (BUSY_RE.test(String(text || ''))) {
+      BUSY_SINCE ||= Date.now();
+      checkStuck(ctx);
+      return true;
+    }
+    BUSY_SINCE = 0;
     return false;
   } catch (e) {
     const m = String(e?.message ?? e);
-    return /already running|already in progress|built-in brain/i.test(m);
+    const busy = BUSY_RE.test(m);
+    if (busy) {
+      BUSY_SINCE ||= Date.now();
+      checkStuck(ctx);
+    }
+    return busy;
+  }
+}
+
+/**
+ * 身体卡太久就提醒主人一次。
+ * 为什么只能“提醒”：MCP 那 9 个工具里没有停止类工具（list/create/delete_companion、get_events、
+ * say、lua、skill、todo、memory），而 lua 又被身体锁挡着 —— 桥这边没有任何手段能自行解开，
+ * 只有游戏里提示条上的「停止」（numen.task.stop）或重召同伴能解。所以最多每 30 分钟喊一次。
+ */
+function checkStuck(ctx) {
+  if (!BUSY_SINCE) return;
+  const busyMs = Date.now() - BUSY_SINCE;
+  const limitMs = Number(ctx?.stuckAfterMs) || 10 * 60 * 1000;
+  if (busyMs < limitMs) return;
+  const now = Date.now();
+  if (now - STUCK_NOTIFIED_AT < 30 * 60 * 1000) return;
+  STUCK_NOTIFIED_AT = now;
+  try { ctx?.onStuck?.(Math.round(busyMs / 60000)); } catch { /* 提醒失败不影响轮询 */ }
+}
+
+/**
+ * 抓一份她的状态快照。为什么要：她身体被长任务锁住时，lua 全部被拒（"a program is already
+ * running"），她自己看不到主人在哪、血多少；桥这边留一份最近的快照，唤醒时塞进提示词，
+ * 至少她还能用 say 说话（say 不受身体锁影响，实测）。
+ * 90 秒一次，成本是纯本地一次 lua（不花钱）。
+ */
+async function sampleStatus(ctx) {
+  const code = [
+    'local s = numen.status.self()',
+    'local ok, o = pcall(numen.status.owner)',
+    'if not ok then o = { distance = -1, hp = -1 } end',
+    'local inv = 0',
+    'local ok2, items = pcall(numen.inv.items)',
+    'if ok2 and type(items) == "table" then',
+    '  for _, it in ipairs(items) do inv = inv + (it.count or 0) end',
+    'end',
+    'print(string.format("{\\"x\\":%.1f,\\"y\\":%.1f,\\"z\\":%.1f,\\"hp\\":%.1f,\\"maxHp\\":%.1f,\\"food\\":%.0f,\\"dim\\":\\"%s\\",\\"dist\\":%.1f,\\"ownerHp\\":%.1f,\\"items\\":%d}",',
+    '  s.pos.x, s.pos.y, s.pos.z, s.hp, s.max_hp, s.hunger, tostring(s.dimension),',
+    '  tonumber(o.distance) or -1, tonumber(o.hp) or -1, inv))',
+  ].join('\n');
+  try {
+    const text = await callTool(ctx, 'lua', { companion: ctx.companion, code }, 15000);
+    const raw = String(text || '');
+    // 「身体被占」是正常文本返回，不是异常（见 bodyBusy 的注释）
+    if (/already running|already in progress|built-in brain/i.test(raw)) {
+      BUSY_SINCE ||= Date.now();
+      checkStuck(ctx);
+      return;
+    }
+    const m = raw.match(/\{[^{}]*"hp"[^{}]*\}/);
+    if (!m) return;
+    const s = JSON.parse(m[0]);
+    LAST_STATUS = {
+      pos: [Number(s.x) || 0, Number(s.y) || 0, Number(s.z) || 0],
+      hp: Number(s.hp) || 0,
+      maxHp: Number(s.maxHp) || 0,
+      food: Number(s.food) || 0,
+      dim: String(s.dim || ''),
+      dist: Number(s.dist) || -1,
+      ownerHp: Number(s.ownerHp) || -1,
+      items: Number(s.items) || 0,
+    };
+    STATUS_AT = Date.now();
+    BUSY_SINCE = 0;
+  } catch (e) {
+    const msg = String(e?.message ?? e);
+    // 身体被占不是故障，安静跳过；下次再抓。但记下锁了多久，卡太久会提醒主人。
+    if (/already running|already in progress|built-in brain/i.test(msg)) {
+      BUSY_SINCE ||= Date.now();
+      checkStuck(ctx);
+    } else {
+      ctx.log(`[mc] 状态快照失败：${msg}`);
+    }
   }
 }
 
@@ -237,6 +375,8 @@ async function loop(ctx) {
   while (!ctx.stopped) {
     try {
       if (!ctx.ready) await handshake(ctx);
+      // 顺手留一份状态快照（90 秒一次，身体被占时自然跳过）
+      if (Date.now() - STATUS_AT > ctx.statusEveryMs) await sampleStatus(ctx);
       const res = await postJson(ctx, {
         jsonrpc: '2.0',
         id: ++ctx.id,
@@ -343,12 +483,15 @@ export function startMcWatcher(opts) {
     lastRejoinAt: 0,
     lastWakeAt: 0,
     fails: 0,
+    statusEveryMs: Math.max(30000, Number(opts.statusEveryMs) || 90000),
   };
+  QUEUE_FILE = String(opts.queueFile || '');
   if (!ctx.companion) {
     ctx.log('[mc] 没配置同伴名（socialV2.mc.companion），轮询不启动');
     return null;
   }
   WATCHER = ctx;
+  loadQueue();
   ctx.log(`[mc] 开始轮询 ${ctx.url}（同伴 ${ctx.companion}，每次等 ${ctx.waitSeconds} 秒）`);
   // unref 掉，别因为它在长轮询就拖住进程退出
   const t = setTimeout(() => { void loop(ctx); }, 1000);

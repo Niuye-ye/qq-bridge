@@ -1030,6 +1030,9 @@ async function showActivityBox() {
     '',
     `【正在】${playing ? `${playing.focusLabel} · 剩 ${playing.remainMinutes} 分钟 · 每 ${playing.everyMinutes} 分钟一轮 · 这段 ¥${Number(playing.costCny || 0).toFixed(2)}` : (self && self.paused ? '她的自主时间被暂停了' : '没在玩，待机')}`,
     `【游戏】${mc ? (mc.alive ? `在游戏里${mc.queue ? `（攒着 ${mc.queue} 句话没说）` : ''}` : '游戏没开 / 不在这个世界') : '—'}`,
+    // 身体被上一条没跑完的程序锁住时，只有游戏内点「停止」能解 —— 主人在桌宠上也该看见
+    (mc && mc.busyMs > 120000) ? `　⚠ 身体被上一条程序卡住 ${Math.round(mc.busyMs / 60000)} 分钟了，游戏里点一下提示条上的「停止」` : '',
+    (mc && mc.status) ? `　位置 ${Array.isArray(mc.status.pos) ? mc.status.pos.map((n) => Number(n).toFixed(0)).join(', ') : '?'} · 血 ${Number(mc.status.hp || 0).toFixed(1)}/${Number(mc.status.maxHp || 20).toFixed(0)} · 饱食 ${Number(mc.status.food || 0).toFixed(0)} · 离你 ${Number(mc.status.dist) >= 0 ? Math.round(mc.status.dist) + ' 格' : '看不到'}` : '',
     (self && self.level) ? `【活跃度】${self.level.label}（每 ${self.level.minutes} 分钟醒一轮）` : '',
     '',
     `【她想干的事】${goals.length ? '' : '（没记）'}`,

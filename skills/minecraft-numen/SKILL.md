@@ -107,6 +107,29 @@ dragon_combat end_game_overview blaze_rods world_atlas`
 - 万一还是卡住了：主人可以在游戏内的 MCP 提示条上点**「停止」**（`numen.task.stop`），
   或者你让主人删掉同伴重召一次 —— 后者会清空背包。
 
+### 4.2 活着优先：饿了自己吃，血低了自己撤（2026-10-27 补）
+
+翻过的最傻的一次：血 9.8 挂了一整晚没人管，饿着也没找吃的。每轮开工前先看这三样，
+**低于阈值就先处理，别急着挖矿盖房**：
+
+```lua
+local s = numen.status.self()
+if s.hunger < 16 then
+  local ok = pcall(numen.inv.eat)            -- 手上有吃的就吃
+  return { ate = ok, food = s.hunger }
+end
+if s.hp < 8 then
+  return { retreat = true, hp = s.hp }       -- 先往主人那边跑，别硬打
+end
+```
+
+- **饱食 < 16** 就 `numen.inv.eat()`；背包没吃的就先 `numen.inv.items()` 看有没有食物，
+  没有就喊主人给（`say`），别硬撑。
+- **血 < 8** 别再打怪/挖矿，先 `numen.move.to` 回主人身边（他那边相对安全）。
+- **主人血也低**（`status.owner().hp` 明显下降）→ 先 `say` 提醒他，别自己跑远。
+- **跟主人时保持 2~4 格**：不要贴脸（挡路、容易被他的剑打到），也不要超过 8 格（会跟丢）。
+  每段走完 `status.owner().distance` 看一眼，超了就补一段 `move.to`，**不要**用 `follow`。
+
 
 ## 5. 记住这个世界的几件事
 
