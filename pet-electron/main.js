@@ -8,6 +8,7 @@ const fs = require('fs');
 const { spawn, execFile } = require('child_process');
 const { createBridgeClient } = require('./lib/bridge-client');
 const { createOneClick } = require('./lib/oneclick');
+const { createMenu } = require('./lib/menu');
 
 // ────────────────────────────── 省内存开关 ──────────────────────────────
 // 桌宠是常驻程序：四个进程（main / gpu / utility / renderer）合计 455MB 太胖。
@@ -816,139 +817,56 @@ function startBridgePolling() {
 }
 
 // ────────────────────────────── 右键菜单（五组）──────────────────────────────
-function subItems(list) {
-  return list.map(([word, name]) => ({ label: name, click: () => win?.webContents.send('pet:ui', { t: 'do', word }) }));
-}
-
-function popupMenu() {
-  if (!win) return;
-  const st = bridgeState || {};
-  const tpl = [
-    { label: '跟她说句话…', click: () => openChat() },
-    { type: 'separator' },
-    {
-      label: '她',
-      submenu: [
-        // 心情 / 好感度（state/mood.json 是她自己维护的；读不到就说明她还没记过）
-        ...feelMenuItems(st),
-        { type: 'separator' },
-        { label: st.doing ? `她在干嘛：${trimTo(st.doing, 14)}` : '她在干嘛', click: showActivity },
-        { label: '她现在的详细状态', click: showActivityBox },
-        { label: '今天的日记', click: () => openPreview(todayDiary(), '今天的日记', 'diary') },
-        { label: '长期记忆', click: () => openPreview(FACTS_JSON, '长期记忆', 'facts') },
-        { type: 'separator' },
-        // 让她去玩会儿 = 玩什么（手机 / MC / 都行）× 玩多久；醒多勤看下一条「活跃度」。
-        {
-          label: `让她去玩会儿${(st.turbo && st.turbo.on) ? `（现在在${(st.turbo.focusLabel || '玩')}）` : ''}`,
-          submenu: PLAY_FOCUS.map((foc) => ({
-            label: `去${foc.label}${(st.turbo && st.turbo.on && st.turbo.focus === foc.id) ? '（正在）' : ''}`,
-            submenu: PLAY_PRESETS.map((p) => ({
-              label: `${p.label}${(st.turbo && st.turbo.on) ? '（换成这个）' : ''}`,
-              click: () => playFor(p.hours, p.label, foc.id, foc.label),
-            })),
-          })),
-        },
-        // 只在"正在玩"时出现，点它就是喊停。
-        ...((st.turbo && st.turbo.on) ? [{
-          label: `她正在${(st.turbo.focusLabel || '玩')}：剩 ${st.turbo.remainMinutes || 0} 分钟 · 每 ${st.turbo.everyMinutes || '?'} 分钟一轮 · 这段 ¥${Number(st.turbo.costTurboCny || 0).toFixed(2)}（${clock(st.turbo.until)} 收）· 点这里喊停`,
-          click: () => toggleTurbo(),
-        }] : []),
-        // 玩完之后还留着一条结算：这段多久、花了多少钱。
-        ...((!(st.turbo && st.turbo.on) && st.turbo && st.turbo.last) ? [{
-          label: lastPlayLine(st.turbo.last),
-          enabled: false,
-        }] : []),
-        {
-          label: `活跃度：${levelNow().label}（每 ${levelNow().minutes || '?'} 分钟醒一轮）`,
-          submenu: LEVEL_PRESETS.map((l) => ({
-            label: l.label,
-            type: 'radio',
-            checked: levelNow().id === l.id,
-            click: () => setLevel(l.id, l.label),
-          })),
-        },
-        {
-          label: (st.turbo && typeof st.turbo.costTodayCny === 'number')
-            ? `她今天花了 ¥${st.turbo.costTodayCny.toFixed(2)}`
-            : '她今天花了（统计不到）',
-          enabled: false,
-        },
-        { label: st.paused ? '恢复她的自主时间' : '暂停她的自主时间', click: () => togglePause() },
-        { label: readPetState().noAnim ? '恢复动画' : '暂停动画', click: () => toggleAnim() },
-      ],
-    },
-    {
-      label: '样子',
-      submenu: [
-        {
-          label: '换个样子',
-          submenu: SKINS.map((s) => ({
-            label: s.label,
-            type: 'checkbox',
-            checked: (readPetState().skin || 'deepseek-maid') === s.id,
-            click: () => {
-              writePetState({ skin: s.id });
-              send('pet:ui', { t: 'scheme', id: s.id });
-              log('换样子 →', s.id);
-            },
-          })),
-        },
-        {
-          label: `大小（当前 ${SIZE}px）`,
-          submenu: [
-            { label: `更大 +${SIZE_STEP}`, click: () => applySize(SIZE + SIZE_STEP) },
-            { label: `更小 −${SIZE_STEP}`, click: () => applySize(SIZE - SIZE_STEP) },
-            { type: 'separator' },
-            { label: '小 280', type: 'checkbox', checked: SIZE === 280, click: () => applySize(280) },
-            { label: '中 420（默认）', type: 'checkbox', checked: SIZE === 420, click: () => applySize(420) },
-            { label: '大 560', type: 'checkbox', checked: SIZE === 560, click: () => applySize(560) },
-            { label: '巨大 700', type: 'checkbox', checked: SIZE === 700, click: () => applySize(700) },
-            { type: 'separator' },
-            { label: '鼠标放她身上滚轮也能调', enabled: false },
-          ],
-        },
-        { label: '做个动作', submenu: subItems(MOTIONS) },
-        { label: '换个表情', submenu: subItems(FACES) },
-        {
-          label: '连播',
-          submenu: [
-            { label: '动作 × 8', click: () => win?.webContents.send('pet:ui', { t: 'seq', words: ['nod', 'wave', 'jump', 'spin', 'bow', 'dance', 'sit', 'happy'] }) },
-            { label: '表情 × 6', click: () => win?.webContents.send('pet:ui', { t: 'seq', words: ['happy', 'wink', 'love', 'shy', 'surprised', 'smug'] }) },
-          ],
-        },
-        { type: 'separator' },
-        { label: '藏起来', click: () => hideForGood() },
-      ],
-    },
-    {
-      label: 'QQ 链路',
-      submenu: [
-        { label: '看链路状态', click: showLinkStatus },
-        ...(ONECLICK ? [{ label: oneClick.busy ? '一键修复 · 启动（运行中…）' : '一键修复 · 启动', click: runOneClick }] : []),
-        { label: '打开桥控制台', click: () => openPath(`${BRIDGE}/?token=${encodeURIComponent(bridge.token)}`) },
-        { type: 'separator' },
-        { label: '打开桌宠日志', click: () => openPath(APP_LOG) },
-      ],
-    },
-    {
-      label: '系统',
-      submenu: [
-        {
-          label: '总在最前（打游戏时可关）',
-          type: 'checkbox',
-          checked: true,
-          click: (mi) => {
-            if (!win || win.isDestroyed()) return;
-            win.setAlwaysOnTop(!!mi.checked);
-            log('置顶 =', !!mi.checked);
-          },
-        },
-        { label: '退出', click: () => { quitRequested = true; app.quit(); } },
-      ],
-    },
-  ];
-  Menu.buildFromTemplate(tpl).popup({ window: win });
-}
+// ── 右键菜单：2026-10-27 整块搬进 lib/menu.js（交接文档第 4 项第三块）──
+// 菜单是纯模板树，引用主进程三十多个符号，所以依赖一律显式列出（下面这个对象就是契约）。
+// SIZE / SIZE_STEP 用 getter：滚轮改大小之后再右键，菜单里显示的必须是当前值。
+// 启动时会调一次 menu.selfCheck()（见文件末尾），漏传符号会在日志里当场炸，不用等右键。
+const menu = createMenu({
+  Menu,
+  getWin: () => win,
+  getState: () => bridgeState,
+  openChat,
+  feelMenuItems,
+  trimTo,
+  showActivity,
+  showActivityBox,
+  todayDiary,
+  openPreview,
+  FACTS_JSON,
+  PLAY_FOCUS,
+  PLAY_PRESETS,
+  playFor,
+  toggleTurbo,
+  clock,
+  lastPlayLine,
+  levelNow,
+  LEVEL_PRESETS,
+  setLevel,
+  togglePause,
+  readPetState,
+  toggleAnim,
+  SKINS,
+  writePetState,
+  send,
+  log,
+  MOTIONS,
+  FACES,
+  hideForGood,
+  showLinkStatus,
+  ONECLICK,
+  // oneClick / runOneClick 是在本文件更下面才 const 出来的（菜单这块必须排在它前面），
+  // 所以只能用 getter —— 直接写值会撞 TDZ：Cannot access 'oneClick' before initialization。
+  get oneClick() { return oneClick; },
+  get runOneClick() { return runOneClick; },
+  openPath,
+  BRIDGE,
+  bridge,
+  APP_LOG,
+  onQuit: () => { quitRequested = true; app.quit(); },
+  get SIZE() { return SIZE; },
+  get SIZE_STEP() { return SIZE_STEP; },
+});
+const popupMenu = menu.popupMenu;
 
 function showActivity() {
   const st = bridgeState || {};
@@ -1397,6 +1315,9 @@ if (!app.requestSingleInstanceLock()) {
     clearQuit();
     log('=== 桌宠启动', safeStr({ SIZE, K, FLOOR_Y }));
     log(ONECLICK ? `一键启动脚本: ${ONECLICK}` : '一键启动脚本: 没找到 —— 右键菜单里不会有「一键修复 · 启动」');
+  // 菜单模板自检：整个模板树当场建一遍，漏传的依赖立刻在这里报错（别等用户右键）
+  try { const mi = menu.selfCheck(); log('菜单模板', mi.top, '个顶级项 / 共', mi.total, '项'); }
+  catch (e) { log('!!! 菜单模板自检失败', e.message); }
     registerAppProtocol();
     createWindow();
     buildTray();
