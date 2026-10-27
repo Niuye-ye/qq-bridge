@@ -11575,7 +11575,13 @@ ${turboNote}
     const maxPerHour = Number(cfg.socialV2?.wake?.maxWakePerHour) || 0;
     const recentMinute = (st.wakeTimes || []).filter((t) => now - t < 60000).length;
     const recentHour = (st.wakeTimes || []).filter((t) => now - t < 3600000).length;
-    if ((maxPerMinute > 0 && recentMinute >= maxPerMinute) || (maxPerHour > 0 && recentHour >= maxPerHour)) {
+    // 主人正在游戏里说话（reason='mc'）**不参与限频**：这是唯一「有人正等着回应」的场景，
+    // 被限频压住的表现就是他在游戏里喊半天，她一动不动也不吭声（2026-10-27 实际踩到：
+    // 活跃度 1 分钟 + 超活跃模式 + mcSelf 三套定时器把每分钟的名额吃满，mc 全被延后重试）。
+    // 防刷屏交给 busy 判重与「同一条消息只投一次」，不靠限频。
+    const rateLimited = reason !== 'mc'
+      && ((maxPerMinute > 0 && recentMinute >= maxPerMinute) || (maxPerHour > 0 && recentHour >= maxPerHour));
+    if (rateLimited) {
       let retryAfterMs = 0;
       if (maxPerMinute > 0 && recentMinute >= maxPerMinute) {
         const times = (st.wakeTimes || []).filter((t) => now - t < 60000).sort((a, b) => a - b);
