@@ -35,7 +35,10 @@ function mcLog(line) {
   } catch {}
 }
 function spawnSafe(cmd, args, opts) {
-  const child = spawnSafe(cmd, args, opts);
+  // 注意：这里必须是 child_process 的 spawn —— 2026-10-27 的首轮审计修复把整个文件里的
+  // `spawn(` 批量替换成 `spawnSafe(`，连函数体自己也替换了，于是每次调用都是无限递归
+  // RangeError: Maximum call stack size exceeded（做视频 / 跑代码 / 生图 / 恢复链路全废）。
+  const child = spawn(cmd, args, opts);
   child.on('error', (e) => mcLog(`[spawn] ${cmd} 启动失败：${e?.message ?? e}`));
   return child;
 }
@@ -2296,14 +2299,33 @@ const CODE_TIMEOUT_DEFAULT = 240;
 const CODE_TIMEOUT_MAX = 900;
 const CODE_SRC_MAX = 200000;
 
-function codeJobDir(id) { return path.join(CODE_JOBS, String(id).trim()); }
+// 2026-10-28 审计 P1：原来直接 path.join(CODE_JOBS, id)，id 零校验 ——
+// qq_run_status 传 id="../../.." 就能把任意目录当任务目录读（还会递归列出文件）。
+// 这里改成只认「单段安全名」，并且再用 path.relative 复核一次落在 CODE_JOBS 里面。
+function codeJobDir(id) {
+  const raw = String(id ?? '').trim();
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(raw)) return null;
+  const dir = path.join(CODE_JOBS, raw);
+  const rel = path.relative(CODE_JOBS, dir);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  return dir;
+}
 
 function readCodeStatus(dir) {
   try { return JSON.parse(fs.readFileSync(path.join(dir, 'status.json'), 'utf8')); } catch { return null; }
 }
 
+// 2026-10-28 审计 P2：原来是直接 writeFileSync，进程被强杀时会留半截 JSON，
+// 之后 readCodeStatus 解析失败返回 null，调用方又当 running，永远不结束。改成 tmp+rename。
 function writeCodeStatus(dir, obj) {
-  try { fs.writeFileSync(path.join(dir, 'status.json'), JSON.stringify(obj, null, 2), 'utf8'); } catch { /* ignore */ }
+  const p = path.join(dir, 'status.json');
+  const tmp = p + '.tmp';
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2), 'utf8');
+    fs.renameSync(tmp, p);
+  } catch {
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+  }
 }
 
 function pidAlive(pid) {
@@ -2394,6 +2416,7 @@ server.tool(
       fs.mkdirSync(CODE_JOBS, { recursive: true });
       const id = 'r' + Date.now().toString(36);
       const dir = codeJobDir(id);
+      if (!dir) return { content: [{ type: 'text', text: '任务目录不合法：' + id }], isError: true };
       fs.mkdirSync(dir, { recursive: true });
       const mainPy = path.join(dir, 'main.py');
       fs.writeFileSync(mainPy, src, 'utf8');
@@ -2424,8 +2447,28 @@ server.tool(
         env: childEnv,
       });
       const startedAt = Date.now();
+      // 2026-10-28 审计 P2：父进程这份 fd 立刻关掉（子进程 spawn 时已经 dup 过去）。
+      // 原来只在 exit 回调里 closeSync，spawn 抛错或子进程长期不退出就一直占着句柄。
+      try { fs.closeSync(fd); } catch { /* ignore */ }
       writeCodeStatus(dir, { id, name: name || '', status: 'running', pid: child.pid ?? 0, startedAt, timeoutSec: tmo, dir });
+      // 2026-10-28 审计 P2：timeoutSec 原来只是写进 status、要等她下次 qq_run_status 查询才判，
+      // 她不查就永远跑。改成真的挂一个定时器到点就杀。
+      const killTimer = setTimeout(() => {
+        try {
+          const cur = readCodeStatus(dir) || {};
+          if (cur.status && cur.status !== 'running') return;
+          try { process.kill(Number(child.pid)); } catch { /* ignore */ }
+          writeCodeStatus(dir, {
+            ...cur, id, name: name || '', status: 'failed', pid: child.pid ?? 0,
+            startedAt, timeoutSec: tmo, dir, endedAt: Date.now(),
+            note: '超过 ' + tmo + ' 秒还没跑完，已杀掉',
+          });
+          try { fs.appendFileSync(logPath, '\r\n[task] 超时 ' + tmo + ' 秒，已杀掉\r\n', 'utf8'); } catch { /* ignore */ }
+        } catch { /* ignore */ }
+      }, tmo * 1000);
+      if (killTimer.unref) killTimer.unref();
       child.on('exit', (exitCode, signal) => {
+        clearTimeout(killTimer);
         const st = readCodeStatus(dir) || {};
         const ok = exitCode === 0;
         writeCodeStatus(dir, {
@@ -2436,8 +2479,7 @@ server.tool(
           endedAt: Date.now(),
           elapsedSec: Math.round((Date.now() - startedAt) / 100) / 10,
         });
-        try { fs.writeSync(fd, '\r\n[task] 结束 exit=' + String(exitCode) + (signal ? ' signal=' + signal : '') + '\r\n'); } catch { /* ignore */ }
-        try { fs.closeSync(fd); } catch { /* ignore */ }
+        try { fs.appendFileSync(logPath, '\r\n[task] 结束 exit=' + String(exitCode) + (signal ? ' signal=' + signal : '') + '\r\n', 'utf8'); } catch { /* ignore */ }
       });
       child.unref();
       return {
@@ -2476,12 +2518,16 @@ server.tool(
           .slice(0, 5);
         if (!dirs.length) return { content: [{ type: 'text', text: '还没跑过代码任务。' }] };
         return { content: [{ type: 'text', text: '最近的任务：\n' + dirs.map((d) => {
-          const st = readCodeStatus(codeJobDir(d.id)) || {};
-          const outs = listCodeOutputs(codeJobDir(d.id), 40);
+          const dd = codeJobDir(d.id);
+          if (!dd) return d.id + '  |  目录名不合法，跳过';
+          const st = readCodeStatus(dd) || {};
+          const outs = listCodeOutputs(dd, 40);
           return [d.id, (st.name || '(未命名)'), (st.status || '?'), outs.length + ' 个文件'].join('  |  ');
         }).join('\n') }] };
       }
       const dir = codeJobDir(id);
+      // 2026-10-28 审计 P1：id 不是单段安全名（例如 "../../.."）一律当非法，别去碰文件系统。
+      if (!dir) return { content: [{ type: 'text', text: '任务 id 不合法：' + id + '（只认 qq_run_code 返回的那种，比如 rk3f9a）' }], isError: true };
       if (!fs.existsSync(dir)) return { content: [{ type: 'text', text: '没有这个任务：' + id }], isError: true };
       let st = readCodeStatus(dir) || { id, status: 'running' };
       if (st.status === 'running') {
