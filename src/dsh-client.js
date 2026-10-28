@@ -16,6 +16,31 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 import YAML from 'js-yaml';
 import { AbstractApiClient } from '@deepseek-ai/dsh-host-apiproxy/client';
 
+/** 单会话流「连续被服务端 end」的最大重订阅次数（超过就退订，别形成重连风暴）。 */
+const MAX_FOLLOW_END_RETRIES = 5;
+/** 从启动日志里捞 token 时，每个文件最多读多少字节（头 + 尾各一份）。 */
+const TOKEN_SCAN_BYTES = 256 * 1024;
+
+/** 读文件的头尾各 N 字节：token banner 可能写在首启的开头，也可能写在重启后的末尾。 */
+function readEdge(file, bytes) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    const size = fs.fstatSync(fd).size;
+    if (size <= bytes * 2) {
+      const buf = Buffer.alloc(size);
+      const n = fs.readSync(fd, buf, 0, size, 0);
+      return buf.subarray(0, n).toString('utf8');
+    }
+    const head = Buffer.alloc(bytes);
+    const hn = fs.readSync(fd, head, 0, bytes, 0);
+    const tail = Buffer.alloc(bytes);
+    const tn = fs.readSync(fd, tail, 0, bytes, size - bytes);
+    return head.subarray(0, hn).toString('utf8') + '\n' + tail.subarray(0, tn).toString('utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 /** DSH home：凭据文件与（历史）启动日志都在这里。 */
 export function resolveDshHome() {
   return process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
@@ -50,9 +75,12 @@ export function discoverDshLaunchToken() {
     } catch {
       continue;
     }
-    for (const { name } of files) {
+    // 2026-10-28 审计 B-P1-7：原来把 logs/ 下**每一个** server-*.log 整份 readFileSync ——
+    // 而这个方法会在每次 WS 抖动（invalidateAuth）时被调用，日志累积到几百 MB 时就是同步卡死。
+    // 现在只看最新的 3 个，每个只读头尾各 256KB：banner 要么在首启开头，要么在重启后的末尾。
+    for (const { name } of files.slice(0, 3)) {
       try {
-        const text = fs.readFileSync(path.join(logsDir, name), 'utf8');
+        const text = readEdge(path.join(logsDir, name), TOKEN_SCAN_BYTES);
         const match = text.match(/[?&]token=([A-Za-z0-9_-]+)/);
         if (match) return match[1];
       } catch {
@@ -320,6 +348,14 @@ export class NodeApiClient extends AbstractApiClient {
     // 期望 follow 的会话集合：**跨重连保留**。DSH 重启或 WS 中断后必须重放，
     // 否则已有会话再也收不到 session 事件（turn/end 丢失 → QQ 上永远没有回复，且无报错）。
     this._desiredFollows = new Set();
+    // 当前所有活跃 mux 流的 sendOpen 函数（2026-10-28 审计 B-P2-7）。
+    // 原来只有一个槽位：events.mux / events.host / self-test 同时开两条流时，后注册者覆盖前一个，
+    // 前一条流上的 follow() 会被发到后一条连接的 socket 上 —— 前一条流永久收不到该会话的事件且无报错。
+    this._muxSenders = new Set();
+    // 每个会话「连续被服务端立刻 end」的次数（2026-10-28 审计 B-P1-5）。
+    // 收到过真实事件就清零；只有连续 end 才累加 —— 用来给重订阅做指数退避和上限，
+    // 免得一个服务端持续 end 的会话变成 open/end 重连风暴（每轮还回 200 条快照）。
+    this._endStreak = new Map();
     // WebSocket 实现可注入（默认就是 'ws'）：
     // 离线回归测试用 FakeWebSocket 顶替，靠 globalThis 是**不管用**的 —— 这里 import 的是
     // 'ws' 的具名类，跟浏览器全局是两个东西（2026-10-27 审计：三条协议回归因此一直红）。
@@ -469,7 +505,14 @@ export class NodeApiClient extends AbstractApiClient {
       failure = error;
     }
     try {
-      const response = await this.callUnary('session/cancel', { sessionId }, sig);
+      // 2026-10-28 审计 B-P1-6：原来 cancel 复用上面那个 sig —— 读队列本身还有一层 5s 子预算，
+      // 一旦把 timeoutMs 的 deadline 吃光，sig 就已 abort，callUnary 里的 throwIfAborted 直接抛：
+      // 队列清了、turn 没取消，旧任务继续烧 token，而且只在日志里留一句超时。
+      // cancel 是这条链路上最要紧的一步，给它自己的预算（外部 signal 仍然生效）。
+      const cancelSignal = signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+        : AbortSignal.timeout(timeoutMs);
+      const response = await this.callUnary('session/cancel', { sessionId }, cancelSignal);
       if (!response.result?.ok && response.result?.error?.code !== 'session/not-found') unwrap(response, 'session/cancel');
     } catch (error) {
       failure ??= error;
@@ -625,7 +668,9 @@ export class NodeApiClient extends AbstractApiClient {
    * 若旧路径 404 会由上层捕获并记录，不会影响新版链路。
    */
   async respond(message, signal) {
-    if (message?.clientId && message?.eventId && message?.outcome) {
+    // 2026-10-28 审计 B-P3-2：原来用 truthiness 判 outcome —— outcome 若是空串/0/false
+    // （协议上允许的取值之一），会静默掉到旧版 /api/respond 路径，新版链路直接 404。
+    if (message?.clientId && message?.eventId && message?.outcome != null) {
       const response = await this.callUnary('$events/result', {
         clientId: message.clientId,
         eventId: message.eventId,
@@ -683,7 +728,11 @@ export class NodeApiClient extends AbstractApiClient {
     const sid = String(sessionId);
     // 先记账再发送：即使此刻没有连接（或正处在重连窗口内），重连时也会重放。
     this._desiredFollows.add(sid);
-    if (this._muxSendOpen) this._muxSendOpen(sid);
+    // 对所有活跃流各发一次（B-P2-7）；槽位兼容保留，老代码若还读它也不会炸。
+    for (const send of this._muxSenders) {
+      try { send(sid); } catch { /* 单条流坏了不影响其它流 */ }
+    }
+    if (this._muxSenders.size === 0 && this._muxSendOpen) this._muxSendOpen(sid);
   }
 
   async *_remoteMuxGenerator(signal, onOpen) {
@@ -704,14 +753,32 @@ export class NodeApiClient extends AbstractApiClient {
     const followed = new Set();
     const streamToSession = new Map();
     const sessionToStream = new Map();
+    // 2026-10-28 审计 B-P2-6：inbox 原来无界。消费端一旦在某个 await 里卡住
+    // （桥处理一轮回复要几秒，含 QQ 发送、写盘），WS 回调会持续往里堆 session/event，
+    // 没有任何上限和丢弃策略 —— 长回合 + 高频事件时就是一路涨内存。
+    // 现在设上限：先丢最旧的 session/event（快照/错误/end 这些必须送达的帧一条不丢），
+    // 并且每丢一条就打一次日志（按 500 条聚合，别刷屏）。
+    const MAX_INBOX = 2000;
+    let backpressureDropped = 0;
     const enqueue = (item) => {
       inbox.push(item);
+      if (inbox.length > MAX_INBOX) {
+        const idx = inbox.findIndex((it) => it?.kind === 'frame' && it.envelope?.payload?.type === 'session/event');
+        if (idx >= 0) {
+          inbox.splice(idx, 1);
+          backpressureDropped += 1;
+          if (backpressureDropped === 1 || backpressureDropped % 500 === 0) {
+            console.error(`[dsh-client] 处理跟不上，已丢弃 ${backpressureDropped} 条 session/event（快照与错误帧不受影响）`);
+          }
+        }
+      }
       wake?.();
       wake = undefined;
     };
     const endStream = () => {
       if (ended) return;
       ended = true;
+      this._muxSenders.delete(sendOpen);
       if (this._muxSendOpen === sendOpen) this._muxSendOpen = null;
       // 连接断开（含鉴权失败/DSH 重启）时丢弃旧 Cookie，重连会重新 token exchange。
       if (!sig.aborted) this.invalidateAuth();
@@ -769,6 +836,7 @@ export class NodeApiClient extends AbstractApiClient {
       if (ended || sig.aborted) return;
       socketOpen = true;
       this._muxSendOpen = sendOpen;
+      this._muxSenders.add(sendOpen);
       // 重放**全部**期望 follow（跨重连保留），而不只是本次连接排队的那些。
       // 少了这一步，DSH 一重启，所有已存在的 QQ 会话就会静默失联。
       for (const sid of this._desiredFollows) sendOpen(sid);
@@ -828,6 +896,8 @@ export class NodeApiClient extends AbstractApiClient {
           }
           // emit/cancel 帧忽略
         } else if (sessionId && msg.value?.type === 'event') {
+          // 真的收到事件了 = 这条订阅是活的，连续 end 计数清零。
+          if (this._endStreak.size) this._endStreak.delete(sessionId);
           enqueue({
             kind: 'frame',
             envelope: {
@@ -866,10 +936,22 @@ export class NodeApiClient extends AbstractApiClient {
           // 该群所有唤醒都被塞进 pendingWakeReasons，群彻底哑掉且没有租约能救。
           // 这里主动重开一次订阅；仍然想订阅的会话才重开（forget 过的就让它走）。
           if (this._desiredFollows.has(sessionId)) {
-            console.error(`[dsh-client] session/follow 已被服务端结束，重新订阅：${sessionId}`);
-            setTimeout(() => {
-              if (!ended && this._desiredFollows.has(sessionId)) sendOpen(sessionId);
-            }, 2000);
+            // 2026-10-28 审计 B-P1-5：原来一律 2 秒后重开，而且不清 _desiredFollows ——
+            // 服务端若持续对这条流回 end（会话被归档/被回收/服务端空转），就是无限 open/end 风暴，
+            // 每一轮还附带一份 200 条消息的快照。现在连续 end 指数退避，超过上限就退订并说明原因。
+            const streak = (this._endStreak.get(sessionId) || 0) + 1;
+            if (streak > MAX_FOLLOW_END_RETRIES) {
+              this._desiredFollows.delete(sessionId);
+              this._endStreak.delete(sessionId);
+              console.error(`[dsh-client] ${sessionId} 连续 ${streak} 次被服务端结束，已停止重订阅（会话可能已被归档或回收）`);
+            } else {
+              this._endStreak.set(sessionId, streak);
+              const delay = Math.min(2000 * streak, 60000);
+              console.error(`[dsh-client] session/follow 已被服务端结束，${Math.round(delay / 1000)} 秒后重订阅（第 ${streak} 次）：${sessionId}`);
+              setTimeout(() => {
+                if (!ended && this._desiredFollows.has(sessionId)) sendOpen(sessionId);
+              }, delay);
+            }
           }
         }
       } else if (msg.type === 'error') {
@@ -914,6 +996,7 @@ export class NodeApiClient extends AbstractApiClient {
         await new Promise((resolve) => { wake = resolve; });
       }
     } finally {
+      this._muxSenders.delete(sendOpen);
       if (this._muxSendOpen === sendOpen) this._muxSendOpen = null;
       sig.removeEventListener('abort', handleAbort);
       socket.removeEventListener('open', handleOpen);

@@ -275,11 +275,19 @@ async function postJson(url, addresses, options) {
   for (let i = 0; i < attempts; i += 1) {
     const remaining = deadline - Date.now();
     if (remaining <= 500) break;
-    const budget = attempts === 1 ? options.timeoutMs : Math.min(remaining, Math.ceil(options.timeoutMs / 2));
+    // 2026-10-28 审计 B-P1-10：原来双栈时 budget = ceil(timeoutMs/2)，把配置的 35s 砍成 17.5s ——
+    // 而 DeepSeek 的联网搜索本身就常要 20s+，于是第一次（IPv4，几乎必然能连上）被自己的定时器杀掉，
+    // 第二次换到 IPv6（本机常无出口）快速失败，用户配的 35s 一秒都没生效过。
+    // 现在按剩余时间均分；并且**超时不换地址**（超时后再试一次等于把预算对半砍），
+    // 只有连接级失败（ECONNREFUSED/ENETUNREACH 之类）才换下一个地址。
+    const budget = attempts === 1
+      ? remaining
+      : Math.max(1000, Math.min(remaining, Math.ceil(remaining / (attempts - i))));
     try {
       return await postJsonOnce(url, list[i], { ...options, timeoutMs: budget });
     } catch (error) {
       lastError = error;
+      if (/联网搜索请求超时/.test(String(error?.message || ''))) break;
     }
   }
   throw lastError ?? new Error('联网搜索请求失败');
@@ -389,7 +397,12 @@ export function parseBingRss(xml, maxResults = 8) {
 export function parseBingHtml(html, maxResults = 8) {
   const results = [];
   const seen = new Set();
-  const blocks = String(html ?? '').split('<li class="b_algo"').slice(1);
+  // 2026-10-28 审计 B-P2-1：原来按 '<li class="b_algo"' 精确切分。Bing 实际会写成
+  // class="b_algo b_algoBorder" 或多一个空格，一旦不命中就**静默返回 []**（不抛错），
+  // 上层只看到「没搜到结果」。改成按 class 里含 b_algo 这个词来切。
+  const blocks = String(html ?? '')
+    .split(/<li[^>]*\bclass\s*=\s*"[^"]*\bb_algo\b[^"]*"[^>]*>/i)
+    .slice(1);
   for (const block of blocks) {
     const hrefMatch = block.match(/<a[^>]+href="(https?:\/\/[^"]+)"/i);
     if (!hrefMatch) continue;
@@ -447,7 +460,12 @@ export async function webSearch(query, options = {}) {
   if (!q) throw new Error('查询词为空');
   const config = { ...loadSearchConfig(options.root ?? process.cwd()), ...(options.config ?? {}) };
   const wanted = options.provider ?? config.provider;
-  const cacheKey = `${wanted}|${q}|${config.maxResults}`;
+  // 2026-10-28 审计 B-P2-8：键里原来只有 provider|query|maxResults —— 改了
+  // baseURL/apiKey/model 都不会改变键，换端点后 5 分钟内仍返回旧结果（还带着旧 provider 字段），
+  // 排查时极具迷惑性。这里把端点/模型也压进键（**不把 key 放进去**，只放它是否存在）。
+  const cacheFingerprint = [config.baseURL, config.model, config.provider, config.apiKey ? 'k1' : 'k0']
+    .map((x) => String(x ?? '')).join('~');
+  const cacheKey = `${wanted}|${q}|${config.maxResults}|${cacheFingerprint}`;
   const cached = cache.get(cacheKey);
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.value;
 

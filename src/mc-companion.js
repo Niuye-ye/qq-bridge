@@ -51,12 +51,37 @@ function withLuaLock(fn) {
   return run;
 }
 
+let SAVE_TIMER = null;
+let SAVE_DIRTY = false;
+
+/**
+ * 合并 + 原子落盘（2026-10-28 审计 B-P2-3）。
+ *
+ * 原来每条消息都同步 writeFileSync 整份队列，而且**直接覆盖**：写到一半被杀/断电，
+ * state/mc-queue.json 就是半截 JSON，loadQueue 里 JSON.parse 抛错后 return 0 ——
+ * 整条待投递队列静默消失，「主人在游戏里说的话永远没人回」还查不出原因。
+ * 现在 200ms 内的多次变更合并成一次写，并且走「临时文件 + rename」。
+ */
 function saveQueue() {
   if (!QUEUE_FILE) return;
+  SAVE_DIRTY = true;
+  if (SAVE_TIMER) return;
+  SAVE_TIMER = setTimeout(() => { SAVE_TIMER = null; flushQueue(); }, 200);
+  if (typeof SAVE_TIMER.unref === 'function') SAVE_TIMER.unref();
+}
+
+/** 真正落盘（退出前/停轮询时也要调一次，否则最后 200ms 的变更会丢）。 */
+function flushQueue() {
+  if (!QUEUE_FILE || !SAVE_DIRTY) return;
+  SAVE_DIRTY = false;
+  const tmp = `${QUEUE_FILE}.${process.pid}.${Date.now()}.tmp`;
   try {
     fs.mkdirSync(path.dirname(QUEUE_FILE), { recursive: true });
-    fs.writeFileSync(QUEUE_FILE, JSON.stringify(QUEUE.slice(-MAX_QUEUE)), 'utf8');
-  } catch { /* 落盘失败不影响投递 */ }
+    fs.writeFileSync(tmp, JSON.stringify(QUEUE.slice(-MAX_QUEUE)), 'utf8');
+    fs.renameSync(tmp, QUEUE_FILE);
+  } catch {
+    try { fs.unlinkSync(tmp); } catch { /* 临时文件可能没建出来 */ }
+  }
 }
 
 function loadQueue() {
@@ -88,9 +113,23 @@ export function peekMcMessages() {
   return QUEUE.slice();
 }
 
-/** 交付成功后清掉已带过去的那几条。 */
-export function dropMcMessages(n) {
-  const count = Number(n) > 0 ? Math.min(Number(n), QUEUE.length) : QUEUE.length;
+/**
+ * 交付成功后清掉已带过去的那几条。
+ *
+ * 2026-10-28 审计 B-P0：**优先传 peekMcMessages() 拿到的那批对象**（数组），按引用精确删。
+ * 原来桥调用时不传参 = 清空「此刻队列里的全部」——而投递（await sendWakePromptV2）要好几秒，
+ * 这期间主人在游戏里新说的话会被一并删掉，模型从头到尾没看见过，且没有任何日志。
+ * 传数字 n 仍按「最早的 n 条」删（旧行为，兼容），不传 = 全清（等价 takeMcMessages，慎用）。
+ */
+export function dropMcMessages(ref) {
+  if (Array.isArray(ref)) {
+    const set = new Set(ref);
+    const before = QUEUE.length;
+    for (let i = QUEUE.length - 1; i >= 0; i -= 1) if (set.has(QUEUE[i])) QUEUE.splice(i, 1);
+    if (QUEUE.length !== before) saveQueue();
+    return before - QUEUE.length;
+  }
+  const count = Number(ref) > 0 ? Math.min(Number(ref), QUEUE.length) : QUEUE.length;
   const out = QUEUE.splice(0, count);
   if (out.length) saveQueue();
   return out;
@@ -103,6 +142,9 @@ export function mcQueueSize() {
 
 /** 停掉轮询（重启/退出时用）。 */
 export function stopMcWatcher() {
+  // 停之前把还没落盘的队列写下去（saveQueue 是 200ms 合并写）。
+  if (SAVE_TIMER) { clearTimeout(SAVE_TIMER); SAVE_TIMER = null; }
+  flushQueue();
   if (WATCHER) {
     WATCHER.stopped = true;
     if (WATCHER.timer) clearTimeout(WATCHER.timer);
@@ -149,20 +191,37 @@ function pullEvents(text) {
   return out;
 }
 
+// 响应体上限：正常情况下这些返回都是几百字节的 JSON。
+const MAX_BODY_CHARS = 8 * 1024 * 1024;
+
+// 2026-10-28 审计 B-P1-2：SSE 一次可能带好几帧（进度通知 + 最终结果 + error），
+// 原来只取最后一帧，前面那些（包括 error 帧）直接扔掉。现在全部返回，由 selectResponse 按 id 挑。
 function parseBody(raw, ctype) {
   if (String(ctype || '').includes('text/event-stream')) {
     const out = [];
-    for (const line of raw.split(/\r?\n/)) {
+    for (const line of String(raw ?? '').split(/\r?\n/)) {
       if (!line.startsWith('data:')) continue;
       const payload = line.slice(5).trim();
       if (!payload || payload === '[DONE]') continue;
       try { out.push(JSON.parse(payload)); } catch { /* 忽略坏帧 */ }
     }
-    return out.length ? out[out.length - 1] : null;
+    return out;
   }
   const t = String(raw ?? '').trim();
-  if (!t) return null;
-  try { return JSON.parse(t); } catch { return null; }
+  if (!t) return [];
+  try {
+    const v = JSON.parse(t);
+    return Array.isArray(v) ? v : [v];
+  } catch { return []; }
+}
+
+// 2026-10-28 审计 B-P1-1：JSON-RPC 的 id 是**唯一**能把响应和请求对上号的东西。
+// 原来完全不看 id：一次超时之后迟到的旧响应、或者并发请求的结果，都会被当成这一次的返回值，
+// 于是「她要出门」拿到的是上一条 send 的回执，动作全错位。id 不匹配就当没收到。
+function selectResponse(frames, wantId) {
+  if (!Array.isArray(frames) || !frames.length) return null;
+  if (wantId === undefined || wantId === null) return frames[0];
+  return frames.find((x) => x && x.id === wantId) ?? null;
 }
 
 function postJson(ctx, payload, timeoutMs) {
@@ -185,16 +244,30 @@ function postJson(ctx, payload, timeoutMs) {
       headers,
     }, (res) => {
       const sid = res.headers['mcp-session-id'];
-      if (sid) ctx.sessionId = String(sid);
+      // 2026-10-28 审计 B-P1-4：错误响应上的 mcp-session-id 不能采纳 —— 初始化失败时服务端给的
+      // 往往是临时 id，采纳了就把有效会话覆盖掉，之后每次调用都撞 404。只在成功响应上记。
+      if (res.statusCode < 400 && sid) ctx.sessionId = String(sid);
       let raw = '';
       res.setEncoding('utf8');
-      res.on('data', (chunk) => { raw += chunk; });
+      res.on('data', (chunk) => {
+        // 2026-10-28 审计 B-P2-2：原来 raw 无上限，服务端一个超大回复就能把桥的内存啃掉。
+        raw += chunk;
+        if (raw.length > MAX_BODY_CHARS) {
+          try { res.destroy(); } catch {}
+          reject(new Error('响应体过大（超过 ' + MAX_BODY_CHARS + ' 字符），已断开'));
+        }
+      });
       res.on('end', () => {
         if (res.statusCode >= 400) {
           reject(new Error(`HTTP ${res.statusCode} ${raw.slice(0, 160)}`));
           return;
         }
-        resolve(parseBody(raw, res.headers['content-type']));
+        const picked = selectResponse(parseBody(raw, res.headers['content-type']), payload.id);
+        if (payload.id !== undefined && payload.id !== null && !picked) {
+          reject(new Error('响应里没有 id=' + payload.id + ' 的结果（可能是超时后迟到的旧响应，或服务端 JSON-RPC 出错）'));
+          return;
+        }
+        resolve(picked);
       });
     });
     req.setTimeout(timeoutMs, () => req.destroy(new Error('timeout')));
@@ -213,7 +286,7 @@ function extractText(res) {
 }
 
 async function handshake(ctx) {
-  await postJson(ctx, {
+  const res = await postJson(ctx, {
     jsonrpc: '2.0',
     id: ++ctx.id,
     method: 'initialize',
@@ -223,6 +296,12 @@ async function handshake(ctx) {
       clientInfo: { name: 'qq-bridge', version: '1.0.0' },
     },
   }, 15000);
+  // 2026-10-28 审计 B-P1-3：原来把 initialize 的返回整段丢掉 —— JSON-RPC 级失败（error 帧）
+  // 也算握手成功，ctx.ready=true 之后每次工具调用都拿着一个不存在的会话去撞，
+  // 表现是「她永远在忙/永远调不动」，而日志里全是成功的 initialize。
+  if (!res) throw new Error('initialize 没有返回结果');
+  if (res.error) throw new Error('initialize 失败：' + (res.error.message || JSON.stringify(res.error).slice(0, 160)));
+  if (!res.result) throw new Error('initialize 返回里没有 result');
   try {
     await postJson(ctx, { jsonrpc: '2.0', method: 'notifications/initialized', params: {} }, 8000);
   } catch { /* 通知失败不影响后面调用 */ }

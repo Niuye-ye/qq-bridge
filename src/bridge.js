@@ -12770,13 +12770,17 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
               }
             }
             const t0 = Date.now();
+            // 2026-10-28 审计 B-P0：先拍下这一批，投递成功后**只删这一批**。
+            // 原来 dropMcMessages() 不传参 = 清空当时队列里的全部，而投递要几秒，
+            // 这期间主人在游戏里新说的话会被无声删掉（模型从没看到）。
+            const deliveredMsgs = peekMcMessages();
             await sendWakePromptV2(mcKey, 'mc');
             // 交付成功才清队列：拼提示词用的是 peek，万一上面因为繁忙没投出去，
             // 消息还在队列里，轮询器过一会儿会再叫一次（否则主人在游戏里说一句就永远没人应）。
             // 判据是 sendWakePromptV2 真投递时打的 lastWakeDeliveredAt —— 它有一堆提前 return，
             // 看返回值/看队列长度都不可靠（2026-10-27 审计）。
             if (Number(st.lastWakeDeliveredAt) >= t0) {
-              dropMcMessages();
+              dropMcMessages(deliveredMsgs);
             } else {
               log('[mc] 这一轮没投出去（条件不满足），消息留在队列里');
             }

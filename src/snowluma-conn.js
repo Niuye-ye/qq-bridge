@@ -17,7 +17,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 /**
- * SnowLuma 主目录的常见位置。
+ * SnowLuma 主目录候选：**只来自配置与环境变量**，不做默认路径探测
+ * （2026-10-28 审计 B-P3-1：原来注释写「常见位置」，容易让人以为会自己去翻
+ *  %LOCALAPPDATA%\SnowLuma 之类，于是没配 homeDir 的部署里「换账号后自动跟上」
+ *  100% 不成立，报错却只说「所有候选 token 都被拒绝」）。
+ * 顺序：snowluma.homeDir → launcherPath 的目录 → SNOWLUMA_HOME。
  *
  * 同时接受两种 cfg 形状（踩过坑：图形界面传的是"窄对象"，没有 snowluma 这一层，
  * 于是 homeDir 被忽略、per-account token 一个都扫不到 → 换账号后界面显示未连接）：
@@ -140,9 +144,19 @@ export async function discoverSnowLumaConnection({
   }
   if (!explicit && candidates.length === 0) add('', 'no-token', base);
 
+  // 2026-10-28 审计 B-P1-9：原来每个候选各自 6 秒，候选一多（多账号 + 多个 home 目录）
+  // 整个发现过程可以挂到几十秒，而它被 ensureToken 之类的热路径同步调用 —— 那段时间桥不干活。
+  // 给整轮一个总预算，用完了就不再往下试，把已经试过的结果照实返回。
+  const totalBudgetMs = Math.max(timeoutMs, Math.min(timeoutMs * Math.max(1, candidates.length), 20000));
+  const discoverDeadline = Date.now() + totalBudgetMs;
   const tried = [];
   for (const c of candidates) {
-    const r = await probe(c.url, c.token, timeoutMs);
+    const left = discoverDeadline - Date.now();
+    if (left <= 250) {
+      tried.push({ source: c.source, url: c.url, token: c.token ? c.token.slice(0, 4) + '…' : '(空)', ok: false, status: 0, wording: '整轮探测预算用完，没来得及试' });
+      break;
+    }
+    const r = await probe(c.url, c.token, Math.min(timeoutMs, left));
     tried.push({ source: c.source, url: c.url, token: c.token ? c.token.slice(0, 4) + '…' : '(空)', ok: r.ok, status: r.status, wording: r.wording });
     if (r.ok) {
       // 找到有效 HTTP token 后，把**同一个账号**的 WS 信息也带回去：
@@ -218,6 +232,17 @@ export function persistSnowLumaEndpoint(cfgPath, { accessToken, wsUrl, httpUrl }
   // —— 那是对用户文件的**字节级**静默改动（Windows 编辑器/工具常写 BOM），会让文件在 git 里
   // 显示成整文件重写，也可能影响按字节读它的其它程序。只改该改的字段，编码原样保留。
   const serialized = JSON.stringify(cfg, null, 2) + '\n';
-  fs.writeFileSync(cfgPath, hadBom ? `\uFEFF${serialized}` : serialized, 'utf8');
+  // 2026-10-28 审计 B-P1-8：原来是直接 writeFileSync 覆盖 —— 写到一半断电/被杀，config.json 就是
+  // 半截 JSON，整个桥下一次启动直接起不来（这份文件里还有 master 之类的设置）。
+  // 改成「同目录临时文件 + rename」的原子替换，BOM 照旧保留。
+  const text2 = hadBom ? `\uFEFF${serialized}` : serialized;
+  const tmpPath = `${cfgPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, text2, 'utf8');
+    fs.renameSync(tmpPath, cfgPath);
+  } catch (error) {
+    try { fs.unlinkSync(tmpPath); } catch { /* 临时文件可能根本没建出来 */ }
+    throw error;
+  }
   return { updated: true, changed };
 }

@@ -10,6 +10,7 @@ import net from 'node:net';
 import http from 'node:http';
 import https from 'node:https';
 import { StringDecoder } from 'node:string_decoder';
+import zlib from 'node:zlib';
 
 const dnsLookup = dns.promises.lookup;
 
@@ -225,6 +226,9 @@ function attemptOnce(url, address, limit, binary, budgetMs) {
           'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36',
           accept: binary ? 'image/*,*/*;q=0.8' : 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           'accept-language': 'zh-CN,zh;q=0.9',
+          // 2026-10-28 审计 B-P2-4：显式声明 identity。规范上不发就该按不压缩处理，
+          // 但 CDN/部分源站照样回 gzip，下面的解码逻辑负责兜住。
+          'accept-encoding': 'identity',
         },
         servername: url.protocol === 'https:' && !net.isIP(hostname) ? hostname : undefined,
         rejectUnauthorized: url.protocol === 'https:',
@@ -244,6 +248,20 @@ function attemptOnce(url, address, limit, binary, budgetMs) {
           res.destroy();
           return;
         }
+        // 2026-10-28 审计 B-P2-4：SSRF 之外的另一类「静默没结果」来源 —— 响应带 content-encoding: gzip
+        // 时原来直接按 utf8 解，出来是乱码，parseBingRss/parseBingHtml 命中 0 条，上层只看到「没搜到」。
+        // 现在按 header 真的解压（gzip/deflate/br），其它编码明确报错而不是悄悄给出乱码。
+        const encoding = String(res.headers['content-encoding'] || '').toLowerCase().trim();
+        let source = res;
+        if (encoding === 'gzip' || encoding === 'x-gzip') source = res.pipe(zlib.createGunzip());
+        else if (encoding === 'deflate') source = res.pipe(zlib.createInflate());
+        else if (encoding === 'br') source = res.pipe(zlib.createBrotliDecompress());
+        else if (encoding && encoding !== 'identity') {
+          fail(new Error(`不支持的响应压缩编码：${encoding}`), false);
+          res.destroy();
+          return;
+        }
+        if (source !== res) source.on('error', (error) => fail(error, true));
         const chunks = [];
         const decoder = binary ? null : new StringDecoder('utf8');
         let size = 0;
@@ -257,7 +275,7 @@ function attemptOnce(url, address, limit, binary, budgetMs) {
             res.destroy();
           }
         };
-        res.on('data', (chunk) => {
+        source.on('data', (chunk) => {
           if (settled) return;
           if (!binary) { appendText(decoder.write(chunk)); return; }
           size += chunk.length;
@@ -268,7 +286,7 @@ function attemptOnce(url, address, limit, binary, budgetMs) {
           }
           chunks.push(chunk);
         });
-        res.on('end', () => {
+        source.on('end', () => {
           if (settled) return;
           if (binary) done({ statusCode, buffer: Buffer.concat(chunks) });
           else {
@@ -300,18 +318,20 @@ function attemptOnce(url, address, limit, binary, budgetMs) {
  * 而「第一个地址是坏的 IPv6」不会再白等 20 秒。
  * 所有地址都失败时抛最后一个错误（保留原始错误文案，便于日志排查）。
  */
-async function requestOnce(url, addresses, limit, binary = false) {
+async function requestOnce(url, addresses, limit, binary = false, deadlineArg = 0) {
   const list = (Array.isArray(addresses) ? addresses : [addresses]).filter(Boolean);
   if (!list.length) throw new Error(`没有可用地址：${url.hostname}`);
-  const deadline = Date.now() + REQUEST_TIMEOUT_MS;
+  // 2026-10-28 审计 B-P2-5：deadline 原来在这里现算 = 「每跳 20 秒」。safeFetch 最多 6 跳、
+  // safeFetchBuffer 也是，最坏 6×20s=120s 才返回，而调用方（MCP web_fetch）以为上限是 20s。
+  // 现在由 safeFetch/safeFetchBuffer 沿重定向链传同一个 deadline 下来。
+  const deadline = Number(deadlineArg) > 0 ? Number(deadlineArg) : Date.now() + REQUEST_TIMEOUT_MS;
   let lastError = null;
   const attempts = Math.min(list.length, MAX_ADDRESS_ATTEMPTS);
   for (let i = 0; i < attempts; i += 1) {
     const remaining = deadline - Date.now();
     if (remaining <= 250) break;
-    const budget = list.length === 1
-      ? REQUEST_TIMEOUT_MS
-      : Math.min(ATTEMPT_TIMEOUT_MS, remaining);
+    // 单个地址也受整次抓取的剩余预算约束（上面那个「慢慢地滴流」的场景仍然由 deadline 兜底）。
+    const budget = Math.min(list.length === 1 ? REQUEST_TIMEOUT_MS : ATTEMPT_TIMEOUT_MS, remaining);
     const outcome = await attemptOnce(url, list[i], limit, binary, budget);
     if (outcome.ok) return outcome.result;
     lastError = outcome.error;
@@ -331,8 +351,10 @@ export async function safeFetch(urlString, maxChars = 50000) {
   validateLimit(maxChars, 'maxChars');
   const MAX_REDIRECTS = 5;
   let { url, addresses } = await validateFetchUrl(urlString);
+  // 整次抓取（含全部重定向跳数）共享一个 20 秒预算（B-P2-5）。
+  const deadline = Date.now() + REQUEST_TIMEOUT_MS;
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
-    const result = await requestOnce(url, addresses, maxChars);
+    const result = await requestOnce(url, addresses, maxChars, false, deadline);
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();
@@ -365,8 +387,9 @@ export async function safeFetchBuffer(urlString, maxBytes = 8 * 1024 * 1024) {
   validateLimit(maxBytes, 'maxBytes');
   const MAX_REDIRECTS = 5;
   let { url, addresses } = await validateFetchUrl(urlString);
+  const deadline = Date.now() + REQUEST_TIMEOUT_MS;
   for (let i = 0; i <= MAX_REDIRECTS; i++) {
-    const result = await requestOnce(url, addresses, maxBytes, true);
+    const result = await requestOnce(url, addresses, maxBytes, true, deadline);
     if ([301, 302, 303, 307, 308].includes(result.statusCode)) {
       if (!result.redirect) throw new Error(`重定向缺少 Location: ${result.statusCode}`);
       const next = new URL(result.redirect, url).toString();
