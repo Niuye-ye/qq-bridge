@@ -88,3 +88,6 @@ audio/
 __pycache__/
 *.pyc
 *.log.*
+
+# 审计临时产物
+*.tmp.diff

@@ -36,7 +36,7 @@ function mcLog(line) {
 }
 function spawnSafe(cmd, args, opts) {
   // 注意：这里必须是 child_process 的 spawn —— 2026-10-27 的首轮审计修复把整个文件里的
-  // `spawn(` 批量替换成 `spawnSafe(`，连函数体自己也替换了，于是每次调用都是无限递归
+  // spawn 调用批量改名成 spawnSafe，连函数体自己也替换了，于是每次调用都是无限递归
   // RangeError: Maximum call stack size exceeded（做视频 / 跑代码 / 生图 / 恢复链路全废）。
   const child = spawn(cmd, args, opts);
   child.on('error', (e) => mcLog(`[spawn] ${cmd} 启动失败：${e?.message ?? e}`));
@@ -1992,12 +1992,51 @@ function pickFfmpeg() {
   return null;
 }
 
+// 读日志尾巴时最多读这么多字节（ffmpeg 的输出几分钟就能到几 MB）。
+const TAIL_BYTES = 64 * 1024;
+
 function readTailLines(file, n = 8) {
+  // 2026-10-28 审计 D-P3：原来整份 readFileSync 再 split —— video/run 日志是 ffmpeg 输出，
+  // 几分钟的片子能到几 MB，而 qq_video_status / qq_run_status 每次都调这个函数。
+  // 现在只从文件尾部读 64KB（够 10~15 行还富余），读失败再退回整读。
+  let text = '';
+  let fromStart = true;
   try {
-    return fs.readFileSync(file, 'utf8').split(/\r?\n/).filter((l) => l.trim()).slice(-n);
+    const fd = fs.openSync(file, 'r');
+    try {
+      const size = fs.fstatSync(fd).size;
+      const take = Math.min(size, TAIL_BYTES);
+      const buf = Buffer.alloc(take);
+      fs.readSync(fd, buf, 0, take, size - take);
+      text = buf.toString('utf8');
+      fromStart = take >= size;
+    } finally {
+      fs.closeSync(fd);
+    }
   } catch {
     return [];
   }
+  let lines = text.split(/\r?\n/).filter((l) => l.trim());
+  // 不是从文件头读的，第一行可能是被切断的半截（还可能是半个中文字符）。
+  if (!fromStart) lines = lines.slice(1);
+  return lines.slice(-n);
+}
+
+/** 清掉旧视频任务的残留（json/log/pid），只留最近 keep 个。 */
+function pruneVideoJobs(keep = 30) {
+  try {
+    const ids = fs.readdirSync(VIDEO_JOBS)
+      .filter((f) => f.endsWith('.json'))
+      .map((f) => ({ f, m: (() => { try { return fs.statSync(path.join(VIDEO_JOBS, f)).mtimeMs; } catch { return 0; } })() }))
+      .sort((a, b) => b.m - a.m)
+      .slice(keep)
+      .map((x) => x.f.slice(0, -5));
+    for (const id of ids) {
+      for (const ext of ['.json', '.log', '.pid']) {
+        try { fs.rmSync(path.join(VIDEO_JOBS, id + ext), { force: true }); } catch { /* 删不掉就算了 */ }
+      }
+    }
+  } catch { /* 目录还不存在 */ }
 }
 
 server.tool(
@@ -2042,6 +2081,9 @@ server.tool(
       }
       fs.mkdirSync(VIDEO_JOBS, { recursive: true });
       fs.mkdirSync(VIDEO_DIR, { recursive: true });
+      // 2026-10-28 审计 D-P3：state/video-jobs 原来只增不减（json + log，log 还是 ffmpeg 全文），
+      // 每做一次视频就多几百 KB 到几 MB，永远没人清。留最近 30 个够翻。
+      pruneVideoJobs(30);
       // 做视频比画图重（ffmpeg 多遍编码），2026-10-27 起也走内存守护；
       // 因为子进程是 detached 的，恢复交给 watchPidThenRestore 盯 pid，不用 finally。
       const guard = await startMemGuard(memMinGB('video', 1.5), '做视频');
@@ -2709,7 +2751,10 @@ async function comfyEnsureUp() {
   if (comfyStarting) return comfyStarting;
   const bat = comfyStartBat();
   if (!bat) return false;
-  comfyStarting = (async () => {
+  // 2026-10-28 审计 D-P3：原来 finally 无条件把 comfyStarting 置 null —— 两个并发调用里
+  // 后完成的那次会把「别人的」在途 promise 也当自己的清掉，第三次调用于是又去 spawn 一个
+  // start-comfyui.bat（双开 ComfyUI，端口打架）。现在只清自己那份。
+  const mine = (async () => {
     try {
       const child = spawnSafe('cmd.exe', ['/c', bat], {
         cwd: path.dirname(bat), detached: true, stdio: 'ignore', windowsHide: true,
@@ -2726,7 +2771,8 @@ async function comfyEnsureUp() {
     }
     return false;
   })();
-  try { return await comfyStarting; } finally { comfyStarting = null; }
+  comfyStarting = mine;
+  try { return await mine; } finally { if (comfyStarting === mine) comfyStarting = null; }
 }
 
 async function comfyFetch(url, opts = {}) {
