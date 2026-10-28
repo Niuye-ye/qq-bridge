@@ -128,12 +128,21 @@ export function createTokenLedger({
   let lastCompactedAt = 0;
   let droppedLines = 0;
 
+  // resolveKey 抛异常时**别装没事**（2026-10-28 审计 C-P3）：原来静默吞掉，这条 token 就归到
+  // 「未归属」上，花费按一个没有名字的模型估，界面上看不出任何异常。同一条错误消息只记一次，
+  // 免得每来一条 usage 就刷一行日志。
+  const keyOfWarned = new Set();
   function keyOf(sessionId) {
     let key;
     try {
       key = resolveKey?.(sessionId);
-    } catch {
+    } catch (error) {
       key = undefined;
+      const msg = String(error?.message ?? error);
+      if (!keyOfWarned.has(msg) && keyOfWarned.size < 5) {
+        keyOfWarned.add(msg);
+        log('token 账本：解析会话归属失败（这条计入「未归属」）', msg);
+      }
     }
     if (key) {
       sessionKeys.set(sessionId, key);
@@ -247,6 +256,7 @@ export function createTokenLedger({
         record = JSON.parse(line);
       } catch {
         droppedLines += 1; // 进程中断留下的半行：跳过
+        if (droppedLines <= 5) log('token 账本：跳过一行坏数据（第 ' + journalLines + ' 行）');
         continue;
       }
       try {

@@ -407,7 +407,19 @@ function addFactV2(text, opts = {}) {
       .sort((a, b) => scoreFactV2(a) - scoreFactV2(b))
       .slice(0, overflow);
     const kill = new Set(victims.map((f) => f.id));
-    if (kill.size) log('[facts] 超过上限 ' + FACTS_MAX + '，淘汰 ' + kill.size + ' 条最弱的记忆');
+    if (kill.size) {
+      // 2026-10-28 审计 A-P2：原来这里直接从文件里抹掉 —— 那不是「淡忘」，是凭空消失，
+      // 翻也翻不回来。现在和衰减归档走同一条路：挪进遗忘池（受 FACTS_FORGOTTEN_MAX 约束），
+      // qq_recall 还能翻到。
+      const evictedAt = new Date().toISOString();
+      const evicted = victims.map((f) => ({ ...f, forgotAt: evictedAt, evictedAt }));
+      try {
+        writeForgottenFactsV2(readForgottenFactsV2().concat(evicted));
+      } catch (e) {
+        log('[facts] 淘汰的记忆没能存进遗忘池：' + (e?.message ?? e));
+      }
+      log('[facts] 超过上限 ' + FACTS_MAX + '，淘汰 ' + kill.size + ' 条最弱的记忆（已挪进遗忘池，可翻回）');
+    }
     writeFactsV2(facts.filter((f) => !kill.has(f.id)));
     return entry;
   }

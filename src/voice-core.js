@@ -437,9 +437,14 @@ export async function processAudioVolume(file, {
     child.on('close', (code) => { clearTimeout(timer); resolve({ code }); });
   });
 
+  // 2026-10-28 审计 C-P3：失败/回退路径原来不清理中间产物 —— 第一次转出的半成品一直躺在
+  // %TEMP%\voice-processed，而调用方只 cleanupTemp(最终路径)，根本看不到被丢弃的那份。
+  const dropTemp = (p) => { if (p) { try { fs.unlinkSync(p); } catch {} } };
+
   let res = await run();
   // 原扩展名可能没有可用编码器（如 .amr/.silk 只读）→ 退回 wav 再试一次
   if ((res.error || res.code !== 0 || !fs.existsSync(outPath)) && ext && ext.toLowerCase() !== '.wav') {
+    dropTemp(outPath);
     const wavPath = outPath.replace(/\.[^.]+$/, '.wav');
     const wavArgs = ['-hide_banner', '-loglevel', 'error', '-y', '-i', file, '-af', filters.join(','), '-ac', '1', wavPath];
     res = await new Promise((resolve) => {
@@ -457,8 +462,9 @@ export async function processAudioVolume(file, {
     if (!res.error && res.code === 0 && fs.existsSync(wavPath)) outPath = wavPath;
   }
 
-  if (res.error) throw new Error(res.error);
+  if (res.error) { dropTemp(outPath); throw new Error(res.error); }
   if (res.code !== 0 || !fs.existsSync(outPath)) {
+    dropTemp(outPath);
     throw new Error(`ffmpeg 音量处理失败（退出码 ${res.code}）`);
   }
   const st = fs.statSync(outPath);

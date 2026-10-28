@@ -186,7 +186,8 @@ export function isPeakAt(atMs, table = DEFAULT_PRICE_TABLE) {
   const ms = Number(atMs);
   if (!Number.isFinite(ms)) return false;
   const { weekday, hour, date } = beijingParts(ms);
-  if (!table.peakWeekdays.includes(weekday)) return false;
+  // 2026-10-28 审计 C-P3：peakWeekdays 不是数组时 .includes 直接崩（自定义表常见）。
+  if (!Array.isArray(table.peakWeekdays) || !table.peakWeekdays.includes(weekday)) return false;
   const holidays = table.holidays instanceof Set ? table.holidays : new Set(table.holidays ?? []);
   if (holidays.has(date)) return false;
   return (table.peakWindows ?? []).some(([start, end]) => Number.isFinite(start) && Number.isFinite(end) && hour >= start && hour < end);
@@ -232,7 +233,12 @@ export function ratesAt(model, atMs, table = DEFAULT_PRICE_TABLE) {
   const { entry: found, key: resolvedKey } = resolveModelEntry(table, model);
   const key = resolvedKey || String(model ?? '').trim();
   const entry = found;
-  const chosen = entry ?? table.models[table.fallbackModel];
+  // 2026-10-28 审计 C-P3：原来只兜到 table.fallbackModel —— 传进来的自定义表如果没这条
+  // （或 models 压根不是对象），下面 chosen.off 直接 TypeError。这两个都是 export，任何新调用点
+  // 传一张表就会踩。三级兜底：命中 → 表自己的 fallback → 内置表的 fallback（永远在）。
+  const fallback = (table && table.models && table.models[table.fallbackModel])
+    || DEFAULT_PRICE_TABLE.models[DEFAULT_PRICE_TABLE.fallbackModel];
+  const chosen = entry ?? fallback;
   const off = chosen.off;
   const peak = isPeakAt(atMs, table);
   const factor = peak ? table.peakMultiplier : 1;

@@ -235,6 +235,24 @@ test('S6 load()：文件被别的进程改写时不回写', () => {
   fs.rmSync(path.dirname(file), { recursive: true, force: true });
 });
 
+test('S8 磁盘文件被外部删掉/改坏后，内容没变也要重写自愈', () => {
+  // 2026-10-28 审计 A-P2：原来 writeNow 只比内存文本，文本一样就跳过写盘。
+  // 文件被外部删掉或写坏时，内存里一切正常、磁盘上已经废了，跳过写入 = 坏文件留在原地，
+  // 下次启动 load() 只能把它改名成 .corrupt 再空跑。这里用真 stat 指纹测自愈。
+  const file = tmpFile('social-v2.json');
+  const state = { paused: false, turbo: null, level: null, turboLast: null, mcMode: null, conversations: new Map([['group:2', convState()]]), seenForwardIds: new Map() };
+  const store = makeStore(file, state);
+  assert.equal(store.flush(), true, '首次落盘');
+  assert.equal(store.flush(), false, '内容没变且磁盘没被动过 → 不写');
+  fs.writeFileSync(file, '{ 这不是 JSON');
+  assert.equal(store.flush(), true, '磁盘被改坏 → 必须重写覆盖');
+  assert.ok(JSON.parse(fs.readFileSync(file, 'utf8')).conversations['group:2']);
+  fs.rmSync(file, { force: true });
+  assert.equal(store.flush(), true, '磁盘文件不见了 → 必须重写回来');
+  assert.ok(fs.existsSync(file));
+  fs.rmSync(path.dirname(file), { recursive: true, force: true });
+});
+
 test('S7 deskMessages 写得出就读得回（B1 同族最后缺口）', () => {
   // 桥的 /api/socialV2/desk-message 会把主人当面说的话 push 进 st.deskMessages（{at, text}），
   // 但 parseSocialV2State 曾经根本没有这个字段 —— 桥一重启，reason='desk' 的唤醒提示词

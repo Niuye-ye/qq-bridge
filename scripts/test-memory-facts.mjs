@@ -94,6 +94,11 @@ test('超过上限淘汰最弱的，刚写入的那条一定留下', () => {
   assert.equal(facts.length, 80);
   assert.ok(facts.some((f) => f.text === '今天记住的一件新事'));
   assert.ok(!facts.some((f) => f.id === 'old7'));
+  // 2026-10-28 审计 A-P2：被淘汰的不该凭空消失，要像淡忘一样躺进遗忘池，还能翻回来。
+  const pool = store.readForgottenFactsV2();
+  assert.equal(pool.length, 1);
+  assert.equal(pool[0].id, 'old7');
+  assert.ok(pool[0].evictedAt);
 });
 
 test('过期约定：宽限期一过就归档，不再当约定', () => {

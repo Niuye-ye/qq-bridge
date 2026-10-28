@@ -349,6 +349,9 @@ export function createSocialV2Store(deps) {
     now = () => Date.now()
   } = deps;
   let lastSavedText = '';
+  // 与 lastSavedText 对应的磁盘指纹（size:mtimeMs）。用来区分「磁盘还是我写的那份」和
+  // 「文件被外部改过/删掉了，只是内存内容恰好没变」。
+  let lastStamp = null;
   let dirty = false;
   let timer = null;
   let writes = 0;
@@ -365,9 +368,18 @@ export function createSocialV2Store(deps) {
   function writeNow() {
     const state = getState();
     const text = serializeSocialV2State(state);
-    if (text === lastSavedText) return false; // 内容没变，省掉一次 63KB 写盘
+    if (text === lastSavedText) {
+      // 内容没变，省掉一次 63KB 写盘 —— 但只在「磁盘上还是我们上次写的那份」时才能省。
+      // 2026-10-28 审计 A-P2：文件被外部改坏（手工编辑、磁盘写一半、另一份脚本覆盖）或干脆被删掉时，
+      // 内存内容虽然与上次一模一样，磁盘上已经不是这套状态了；这里跳过写入就等于把坏文件/缺失留在原地，
+      // 下次启动 load() 只能把它改名成 .corrupt 再以空状态跑 —— 数据白丢。
+      const stampNow = statStamp();
+      if (stampNow !== null && stampNow === lastStamp) return false;
+      if (stampNow === null) log('⚠️ state/social-v2.json 不见了，按内存里的状态重写一份');
+    }
     atomicWriteJson(file, buildSocialV2Payload(state));
     lastSavedText = text;
+    lastStamp = statStamp();
     writes += 1;
     return true;
   }
@@ -403,7 +415,9 @@ export function createSocialV2Store(deps) {
     /** 立刻落盘（退出、重启前、写完就要读回来的地方）。 */
     flush() {
       cancelTimer();
-      if (!dirty && lastSavedText) return false;
+      // 2026-10-28 审计 A-P2：原来这里 `if (!dirty && lastSavedText) return false` 直接早退，
+      // 于是「磁盘被外部改坏/删掉、内存内容没变」这条自愈路径永远走不到 writeNow 的指纹校验。
+      // 无改动时是否真的要写，交给 writeNow 判（文本去重 + 磁盘指纹），flush 只负责别把改动丢掉。
       const wasDirty = dirty;
       dirty = false;
       try {
