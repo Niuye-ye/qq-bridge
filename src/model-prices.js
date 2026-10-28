@@ -94,6 +94,20 @@ export const DEFAULT_PRICE_TABLE = {
   peakWeekdays: [1, 2, 3, 4, 5],
   holidays: CN_HOLIDAYS,
   models: {
+    // 2026-10-28 审计 C-P2：现网模型名是 deepseek-v4.1-flash（config.dsh.model 带 provider 前缀时
+    // 是 opencodego/deepseek-v4.1-flash），而价目表里只有 flash / v4-flash，于是花费永久标「估算」。
+    'deepseek-v4.1-flash': {
+      label: 'DeepSeek-V4.1-Flash',
+      off: { cacheHit: 0.02, cacheMiss: 1, cacheWrite: 1, output: 4 }
+    },
+    'deepseek-v4.1-flash-vision-exp': {
+      label: 'DeepSeek-V4.1-Flash（视觉实验名）',
+      off: { cacheHit: 0.02, cacheMiss: 1, cacheWrite: 1, output: 4 }
+    },
+    'deepseek-v4.1-pro': {
+      label: 'DeepSeek-V4.1-Pro',
+      off: { cacheHit: 0.15, cacheMiss: 4.5, cacheWrite: 4.5, output: 13.5 }
+    },
     'deepseek-flash': {
       label: 'DeepSeek-V4.1-Flash',
       off: { cacheHit: 0.02, cacheMiss: 1, cacheWrite: 1, output: 4 }
@@ -178,10 +192,46 @@ export function isPeakAt(atMs, table = DEFAULT_PRICE_TABLE) {
   return (table.peakWindows ?? []).some(([start, end]) => Number.isFinite(start) && Number.isFinite(end) && hour >= start && hour < end);
 }
 
+/**
+ * 把一个模型名解析到价目表里的条目（2026-10-28 审计 C-P2）。
+ *
+ * 为什么要这么多层：现网名字五花八门 —— `opencodego/deepseek-v4.1-flash`（带 provider 前缀）、
+ * `deepseek-v4-flash-vision-exp`（带实验后缀）、`deepseek-v4.1-pro`（小数点版号）。
+ * 原来只做 `table.models[key]` 精确匹配，命中不了就静默套 **flash 兜底价**，
+ * 于是 pro 少算 4.5 倍、任何新名字都少算 —— 比标「估算」更危险的是这个。
+ * 查找顺序：精确 → 去 provider 前缀 → v4.1 归一成 v4 → 忽略大小写 → 最长表键做前缀匹配。
+ */
+export function resolveModelEntry(table, model) {
+  const models = table?.models && typeof table.models === 'object' ? table.models : {};
+  const raw = String(model ?? '').trim();
+  if (!raw) return { entry: null, key: '' };
+  const bare = raw.toLowerCase().split('/').pop();
+  const candidates = [];
+  for (const c of [raw, bare, raw.split('/').pop(), bare.replace(/v(\d+)[.-](\d+)/g, 'v$1'), bare.replace(/v(\d+)[.-](\d+)/g, 'v$1-$2')]) {
+    if (c && !candidates.includes(c)) candidates.push(c);
+  }
+  for (const c of candidates) {
+    if (Object.prototype.hasOwnProperty.call(models, c)) return { entry: models[c], key: c };
+  }
+  const lower = new Map(Object.keys(models).map((k) => [k.toLowerCase(), k]));
+  for (const c of candidates) {
+    const hit = lower.get(c);
+    if (hit) return { entry: models[hit], key: hit };
+  }
+  const keys = Object.keys(models).filter((k) => k !== table.fallbackModel).sort((a, b) => b.length - a.length);
+  for (const c of candidates) {
+    for (const k of keys) {
+      if (c.startsWith(k)) return { entry: models[k], key: k };
+    }
+  }
+  return { entry: null, key: bare || raw };
+}
+
 /** 取某模型在某一时刻生效的单价（含峰谷判定）。 */
 export function ratesAt(model, atMs, table = DEFAULT_PRICE_TABLE) {
-  const key = String(model ?? '').trim();
-  const entry = table.models[key];
+  const { entry: found, key: resolvedKey } = resolveModelEntry(table, model);
+  const key = resolvedKey || String(model ?? '').trim();
+  const entry = found;
   const chosen = entry ?? table.models[table.fallbackModel];
   const off = chosen.off;
   const peak = isPeakAt(atMs, table);

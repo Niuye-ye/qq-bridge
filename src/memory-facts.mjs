@@ -555,7 +555,15 @@ function formatFactsLineV2() {
     touchFactV2(f, 0.06, now);
     reviewed += 1;
   }
-  if (reviewed) writeFactsV2(facts);
+  // 2026-10-28 审计 A-P2：这里原来是裸调用 —— 一次 EPERM/EBUSY 就让 buildWakePromptV2 抛错，
+  // 整轮唤醒回滚（她不说话），而复习本身只是"顺手加固"，不值得拖垮整轮。写完失败只记日志。
+  if (reviewed) {
+    try {
+      writeFactsV2(facts);
+    } catch (error) {
+      log('记忆复习写盘失败（本轮记忆加固没落盘，不影响说话）:', error?.message ?? error);
+    }
+  }
   const tag = { pref: '喜好', promise: '约定', event: '见闻', fact: '事实' };
   const fmt = (x) => {
     const f = x.f;

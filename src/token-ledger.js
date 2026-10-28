@@ -231,8 +231,12 @@ export function createTokenLedger({
     let raw;
     try {
       raw = fs.readFileSync(file, 'utf8');
-    } catch {
-      return; // 首次运行：文件还不存在
+    } catch (error) {
+      // 2026-10-28 审计 C-P2：原来所有读盘错误都当「首次运行」静默返回空账本。
+      // EACCES / EBUSY / EISDIR 时会显示花费 0，而没有任何线索 —— 只有 ENOENT 才是正常的首次运行。
+      if (error && error.code === 'ENOENT') return;
+      log('token 账本：读取失败（已按空账本继续，花费会显示 0）', error?.message ?? error);
+      return;
     }
     const lines = raw.split('\n');
     for (const line of lines) {

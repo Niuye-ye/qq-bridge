@@ -100,17 +100,26 @@ export function closeGoalV2(idOrText, status) {
   if (!needle) return 0;
   const list = readGoalsV2();
   const now = new Date().toISOString();
-  let n = 0;
-  for (const g of list) {
-    if (g.status !== 'open') continue;
-    if (g.id === needle || String(g.text).includes(needle)) {
-      g.status = status;
-      g.closedAt = now;
-      n += 1;
+  const open = list.filter((g) => g.status === 'open');
+  // 2026-10-28 审计 A-P2：原来是「id 相同 或 text.includes(needle)」全量命中 ——
+  // 她传一个「写」字就能把一堆无关目标一次关掉（目标文本里几乎都有「写」）。
+  // 现在按确定性从强到弱：id → 整句全等 → 够长的模糊（≥4 字，且只关最贴近的那一条）。
+  let targets = open.filter((g) => g.id === needle);
+  if (!targets.length) targets = open.filter((g) => String(g.text) === needle);
+  if (!targets.length && needle.length >= 4) {
+    const fuzzy = open.filter((g) => String(g.text).includes(needle));
+    if (fuzzy.length === 1) targets = fuzzy;
+    else if (fuzzy.length > 1) {
+      // 多条命中：关最短的那条（最贴近 needle），其余留给她下一次明确指出来
+      targets = [fuzzy.slice().sort((a, b) => String(a.text).length - String(b.text).length)[0]];
     }
   }
-  if (n) writeGoalsV2(list);
-  return n;
+  for (const g of targets) {
+    g.status = status;
+    g.closedAt = now;
+  }
+  if (targets.length) writeGoalsV2(list);
+  return targets.length;
 }
 
 export function formatGoalsLineV2() {

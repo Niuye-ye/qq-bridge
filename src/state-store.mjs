@@ -387,10 +387,14 @@ export function createSocialV2Store(deps) {
       timer = setTimeout(() => {
         timer = null;
         if (!dirty) return;
+        // 2026-10-28 审计 A-P1：原来先把 dirty 清掉再写，写失败只 log 不恢复 ——
+        // 之后 flush() 的 `if (!dirty && lastSavedText) return false` 直接跳过，这批改动永久丢。
+        const wasDirty = dirty;
         dirty = false;
         try {
           writeNow();
         } catch (error) {
+          dirty = wasDirty;
           log('保存 socialV2 状态失败:', error?.message ?? error);
         }
       }, debounceMs);
@@ -400,10 +404,12 @@ export function createSocialV2Store(deps) {
     flush() {
       cancelTimer();
       if (!dirty && lastSavedText) return false;
+      const wasDirty = dirty;
       dirty = false;
       try {
         return writeNow();
       } catch (error) {
+        dirty = wasDirty;
         log('保存 socialV2 状态失败:', error?.message ?? error);
         return false;
       }
@@ -415,7 +421,25 @@ export function createSocialV2Store(deps) {
     load({ onConversation, onMeta } = {}) {
       const stampBefore = statStamp();
       const raw = readJsonSafe(file, null);
-      if (raw === null) return null;
+      if (raw === null) {
+        // 2026-10-28 审计 A-P0：readJsonSafe 把「文件不存在」和「解析失败」都吞成 null。
+        // 解析失败如果就这么返回，下一次 save（400ms 防抖）会用 {conversations:{}} 原子覆盖整份文件 ——
+        // 所有 agentToken（模型侧立刻 401）、未读、唤醒配置、turbo/paused 全丢，而且一个字日志都没有。
+        // 这里把两种情况分开：文件真不存在 = 正常首启；文件在但读不出来 = 先改名留证据再按空状态跑。
+        if (fs.existsSync(file)) {
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const bad = file + '.corrupt-' + stamp;
+          try {
+            fs.renameSync(file, bad);
+            log('❌ state/social-v2.json 解析失败，已改名保留：' + bad +
+              '（里面可能有 agentToken / 未读 / 唤醒配置，别删，等人工修；本次以空状态继续跑）');
+          } catch (error) {
+            log('❌ state/social-v2.json 解析失败，改名也失败（后续写入可能覆盖它）:',
+              error?.message ?? error);
+          }
+        }
+        return null;
+      }
       const parsed = parseSocialV2State(raw, { getWakeConfig, sanitizeForwardId, now: now() });
       // 元信息（paused / turbo / turboLast / level / mcMode）必须先就位：
       // 下面装配每个会话时会读 socialV2.paused 决定要不要起定时器。
