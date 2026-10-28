@@ -35,7 +35,7 @@ import { addGoalV2, appendLifeV2, closeGoalV2, formatGoalsLineV2, formatLifeLine
 import { createFactsStore } from './memory-facts.mjs';
 import { checkQuota, countQuota, reserveQuota, rollbackQuota } from './rate-limit.mjs';
 // Minecraft 陪伴：轮询 Numen 模组内置 MCP 服务端的游戏内消息（纯 I/O + 队列，不碰会话状态机）
-import { dropMcMessages, mcAlive, mcBusyMs, mcQueueSize, mcStatus, peekMcMessages, startMcWatcher } from './mc-companion.js';
+import { dropMcMessages, flushMcQueue, mcAlive, mcBusyMs, mcQueueSize, mcStatus, peekMcMessages, startMcWatcher } from './mc-companion.js';
 import {
   loadSlang,
   saveSlang,
@@ -12844,7 +12844,8 @@ process.on('uncaughtException', (error) => {
   process.exit(1);
 });
 // exit 钩子里只能做同步事：flush 是同步写（临时文件 + rename），可以在这儿补最后一笔。
-process.on('exit', () => { flushSocialV2State(); releaseLock(); });
+// 游戏内消息队列（mc-queue.json）也是防抖写的，退出时同样要补一次，否则最后 ≤200ms 的话会丢。
+process.on('exit', () => { flushSocialV2State(); flushMcQueue(); releaseLock(); });
 
 main().catch((error) => {
   console.error('[bridge] 启动失败:', error);

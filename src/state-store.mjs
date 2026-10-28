@@ -434,22 +434,44 @@ export function createSocialV2Store(deps) {
      */
     load({ onConversation, onMeta } = {}) {
       const stampBefore = statStamp();
-      const raw = readJsonSafe(file, null);
-      if (raw === null) {
-        // 2026-10-28 审计 A-P0：readJsonSafe 把「文件不存在」和「解析失败」都吞成 null。
-        // 解析失败如果就这么返回，下一次 save（400ms 防抖）会用 {conversations:{}} 原子覆盖整份文件 ——
-        // 所有 agentToken（模型侧立刻 401）、未读、唤醒配置、turbo/paused 全丢，而且一个字日志都没有。
-        // 这里把两种情况分开：文件真不存在 = 正常首启；文件在但读不出来 = 先改名留证据再按空状态跑。
-        if (fs.existsSync(file)) {
-          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-          const bad = file + '.corrupt-' + stamp;
+      // 2026-10-28 复审 R1（P1）：这一段原来用注入的 readJsonSafe(file, null) + fs.existsSync 反推
+      // 「文件坏了」。但 readJsonSafe 是 catch { return fallback }，readFileSync 的
+      // EACCES / EBUSY / EPERM（杀软扫描、同步工具持句柄、另一个实例正在 rename 的那一瞬）
+      // 与 JSON 语法错误被吞成同一个 null —— 一次**瞬时读失败**就会把整份状态改名成 .corrupt
+      // 并以空状态继续跑（agentToken 立刻 401、未读/唤醒配置/turbo 全丢，只能人工捞回）。
+      // 现在自己读，三种情况分开：
+      //   ENOENT        → 正常首启，静默返回；
+      //   其它错误码    → 只记日志，**保留原文件、本次不改名**（下一次写入仍会用内存态覆盖它，
+      //                   所以日志里明确要求人工看一眼）；
+      //   读到了但 parse 失败 → 才改名留证据（这是真正「文件坏了」的唯一判据）。
+      let text = null;
+      try {
+        text = fs.readFileSync(file, 'utf8');
+      } catch (error) {
+        if (error?.code === 'ENOENT') return null;
+        log('⚠️ 读不到 state/social-v2.json（' + (error?.code || error?.message || '未知错误') +
+          '），本次以空状态继续跑，原文件保持不动；若持续出现请检查是否有别的进程正占着它');
+        return null;
+      }
+      let raw;
+      try {
+        raw = JSON.parse(text.replace(/^\uFEFF/, ''));
+      } catch (error) {
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const bad = file + '.corrupt-' + stamp;
+        try {
+          fs.renameSync(file, bad);
+          log('❌ state/social-v2.json 解析失败（' + (error?.message ?? error) + '），已改名保留：' + bad +
+            '（里面可能有 agentToken / 未读 / 唤醒配置，别删，等人工修；本次以空状态继续跑）');
+        } catch (renameError) {
+          // 改名失败时至少复制一份：下面 return 之后 400ms 防抖的写会把原文件覆盖掉。
           try {
-            fs.renameSync(file, bad);
-            log('❌ state/social-v2.json 解析失败，已改名保留：' + bad +
-              '（里面可能有 agentToken / 未读 / 唤醒配置，别删，等人工修；本次以空状态继续跑）');
-          } catch (error) {
-            log('❌ state/social-v2.json 解析失败，改名也失败（后续写入可能覆盖它）:',
-              error?.message ?? error);
+            fs.copyFileSync(file, bad);
+            log('❌ state/social-v2.json 解析失败且改名失败（' + (renameError?.code || renameError?.message) +
+              '），已复制一份备份：' + bad + '（后续写入会覆盖原文件）');
+          } catch {
+            log('❌ state/social-v2.json 解析失败，改名和备份都失败（后续写入会覆盖它）:',
+              renameError?.message ?? renameError);
           }
         }
         return null;

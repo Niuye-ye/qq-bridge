@@ -2376,7 +2376,12 @@ function pidAlive(pid) {
   try { process.kill(n, 0); return true; } catch (e) { return e && e.code === 'EPERM'; }
 }
 
-/** 目录里她的产出（跳过 run.log / status.json / main.py），新的在前。 */
+/**
+ * 目录里她的产出（跳过 run.log / status.json / main.py），新的在前。
+ * 2026-10-28 复审 R7（P3）：writeCodeStatus 的临时文件是固定名 status.json.tmp，进程被强杀在
+ * write 与 rename 之间就会留下一个 —— 原来只按文件名跳过三个固定项，于是 .tmp 会出现在
+ * qq_run_status 的产出清单里，看起来像「她多产出了一个文件」。这里一并过滤掉临时产物。
+ */
 function listCodeOutputs(dir, limit = 40) {
   const out = [];
   const walk = (d, depth) => {
@@ -2386,6 +2391,7 @@ function listCodeOutputs(dir, limit = 40) {
     for (const e of ents) {
       if (out.length >= limit) return;
       if (depth === 0 && (e.name === 'run.log' || e.name === 'status.json' || e.name === 'main.py')) continue;
+      if (/\.tmp$/i.test(e.name)) continue;
       const p = path.join(d, e.name);
       if (e.isDirectory()) { walk(p, depth + 1); continue; }
       let bytes = 0;

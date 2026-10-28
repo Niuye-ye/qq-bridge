@@ -280,14 +280,26 @@ async function postJson(url, addresses, options) {
     // 第二次换到 IPv6（本机常无出口）快速失败，用户配的 35s 一秒都没生效过。
     // 现在按剩余时间均分；并且**超时不换地址**（超时后再试一次等于把预算对半砍），
     // 只有连接级失败（ECONNREFUSED/ENETUNREACH 之类）才换下一个地址。
-    const budget = attempts === 1
+    // 2026-10-28 复审 R2（P2）：上一条修复把 budget 写成 remaining/(attempts-i)，attempts===2 时
+    // 第一次仍然只有 ceil(35000/2) = 17.5s —— DeepSeek 联网搜索常要 20s+，首选地址（IPv4，几乎必然
+    // 能连上）又被自己的定时器杀掉，配置的 35s 一次都没生效。现在**首选地址拿全部剩余预算**，
+    // 只有它连接级失败、轮到后备地址时才按剩余时间均分。
+    const budget = i === 0
       ? remaining
       : Math.max(1000, Math.min(remaining, Math.ceil(remaining / (attempts - i))));
     try {
       return await postJsonOnce(url, list[i], { ...options, timeoutMs: budget });
     } catch (error) {
       lastError = error;
-      if (/联网搜索请求超时/.test(String(error?.message || ''))) break;
+      if (/联网搜索请求超时/.test(String(error?.message || ''))) {
+        // 超时不换地址（再试一次等于把预算对半砍），但要留痕：否则首选地址被防火墙黑洞丢包时，
+        // 线上只看到「联网搜索忽然总是失败」，看不出是地址链被放弃了。
+        if (i + 1 < attempts) {
+          console.warn('[web-search] 联网搜索超时，放弃其余 ' + (attempts - i - 1) + ' 个候选地址：' +
+            list.slice(i + 1).join(', '));
+        }
+        break;
+      }
     }
   }
   throw lastError ?? new Error('联网搜索请求失败');

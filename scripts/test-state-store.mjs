@@ -288,3 +288,29 @@ test('S7 deskMessages 写得出就读得回（B1 同族最后缺口）', () => {
   assert.equal(many.length, 20);
   assert.equal(many[19].text, 'm39');
 });
+test('S9 load()：只有「读到了但 parse 失败」才改名，文件不存在静默', () => {
+  // 2026-10-28 复审 R1（P1）：原来用 readJsonSafe(file,null) + fs.existsSync 反推「文件坏了」，
+  // 而 readJsonSafe 把 readFileSync 的 EACCES/EBUSY/EPERM（杀软扫描、另一实例持句柄）和
+  // JSON 语法错误吞成同一个 null —— 一次瞬时读失败就会把整份状态改名 .corrupt 并以空状态继续跑。
+  // 现在判据是错误码：ENOENT 才是首启，其它错误码只记日志不动文件，只有 parse 失败才改名。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'state-store-load-'));
+  const blank = () => ({ paused: false, turbo: null, level: null, turboLast: null, mcMode: null, conversations: new Map(), seenForwardIds: new Map() });
+
+  // ① 文件不存在 = 正常首启：返回 null，不留任何 .corrupt
+  const missing = path.join(dir, 'missing.json');
+  const store1 = makeStore(missing, blank());
+  assert.equal(store1.load({ onConversation: () => {} }), null);
+  assert.equal(fs.readdirSync(dir).filter((n) => n.includes('.corrupt-')).length, 0,
+    '文件不存在不该产生 .corrupt');
+
+  // ② 读到了但解析失败 = 真坏文件：改名保留证据，返回 null
+  const bad = path.join(dir, 'social-v2.json');
+  fs.writeFileSync(bad, '{ 这不是 JSON');
+  const store2 = makeStore(bad, blank());
+  assert.equal(store2.load({ onConversation: () => {} }), null);
+  const corrupts = fs.readdirSync(dir).filter((n) => n.startsWith('social-v2.json.corrupt-'));
+  assert.equal(corrupts.length, 1, '解析失败必须改名保留证据');
+  assert.equal(fs.readFileSync(path.join(dir, corrupts[0]), 'utf8'), '{ 这不是 JSON', '改名后的文件内容原封不动');
+  assert.equal(fs.existsSync(bad), false, '坏文件已被移走');
+  fs.rmSync(dir, { recursive: true, force: true });
+});

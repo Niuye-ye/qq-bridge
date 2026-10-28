@@ -759,11 +759,26 @@ export class NodeApiClient extends AbstractApiClient {
     // 现在设上限：先丢最旧的 session/event（快照/错误/end 这些必须送达的帧一条不丢），
     // 并且每丢一条就打一次日志（按 500 条聚合，别刷屏）。
     const MAX_INBOX = 2000;
+    // 2026-10-28 复审 R4（P2）：原来「可丢」= payload.type === 'session/event' 一刀切，
+    // 但 turn/start、assistant/message、turn/end 全都包在同一个 payload.type 里（见下面的 frame 分发）——
+    // 丢到 turn/end 就是「这一轮永远等不到收尾 → 主人的消息没人回」，bridge 的租约只能解忙、
+    // 补不回那条回复。现在只丢过程性事件（流式分片、工具调用起止），turn 边界永久保留。
+    const DROPPABLE_EVENTS = new Set(['assistant/chunk', 'tool/start', 'tool/end', 'tool/result', 'tool/output', 'tool/delta']);
+    const isDroppableFrame = (it) => it?.kind === 'frame'
+      && it.envelope?.payload?.type === 'session/event'
+      && DROPPABLE_EVENTS.has(it.envelope.payload.event?.type);
     let backpressureDropped = 0;
     const enqueue = (item) => {
       inbox.push(item);
       if (inbox.length > MAX_INBOX) {
-        const idx = inbox.findIndex((it) => it?.kind === 'frame' && it.envelope?.payload?.type === 'session/event');
+        let idx = inbox.findIndex(isDroppableFrame);
+        if (idx < 0) {
+          // 兜底：队列里全是「必须送达」的帧（快照 / turn 边界 / 错误）。此时只丢最旧的、
+          // 不是 turn/end 的那一帧，否则上限在最坏情况下形同虚设（inbox 依然无界增长）。
+          idx = inbox.findIndex((it) => it?.kind === 'frame'
+            && it.envelope?.payload?.type === 'session/event'
+            && it.envelope?.payload?.event?.type !== 'turn/end');
+        }
         if (idx >= 0) {
           inbox.splice(idx, 1);
           backpressureDropped += 1;

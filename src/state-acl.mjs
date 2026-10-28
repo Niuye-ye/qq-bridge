@@ -36,11 +36,21 @@ const PERMISSIVE_SIDS = ['*S-1-5-11', '*S-1-5-32-545', '*S-1-1-0'];
  */
 function decodeIcaclsOutput(buf) {
   if (!buf || !buf.length) return '';
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(buf);
-  } catch {
-    try { return new TextDecoder('gbk').decode(buf); } catch { return buf.toString('latin1'); }
+  // 2026-10-28 复审 R6a（P3）：原来先按 UTF-8 严格解码。GBK 中文的两字节序列**可能恰好**构成
+  // 合法 UTF-8（严格解码不抛错，但结果是乱码），这时 ACL_FAIL_RE 里的"拒绝访问"/"系统找不到指定的路径"
+  // 永远匹配不上 —— 「失败」又退化成「看着像成功」，而这段逻辑的全部意义就是可靠识别中文失败文本。
+  // 本机就是 936：win32 上直接优先 GBK，解不出来再按 UTF-8 严格 → latin1 兜底。
+  const tryDecode = (label) => {
+    try { return new TextDecoder(label, { fatal: true }).decode(buf); } catch { return null; }
+  };
+  if (process.platform === 'win32') {
+    const gbkFirst = tryDecode('gbk');
+    if (gbkFirst !== null) return gbkFirst;
   }
+  const utf8 = tryDecode('utf-8');
+  if (utf8 !== null) return utf8;
+  const gbk = tryDecode('gbk');
+  return gbk ?? buf.toString('latin1');
 }
 
 /**
@@ -154,7 +164,9 @@ export function hardenFile(file) {
   if (!user) return { ok: false, detail: '无法确定当前用户名（%USERNAME% 为空）' };
   // 2026-10-28 审计 A-P1：icacls 对**不存在的路径**返回的失败文本是中文（"系统找不到指定的路径"），
   // 以前只匹配英文 access denied，于是路径不存在也当成功返回 —— 调用方以为收紧过了。
-  if (!fs.existsSync(file)) return { ok: false, detail: '文件不存在：' + file };
+  // 2026-10-28 复审 R6b（P3）：File 不存在时的返回值带上 code，让调用方能把「还没创建（可忽略）」
+  // 与「收紧失败（必须处理）」分开 —— 否则「先收紧目录、再创建文件」的顺序会被统一判成失败。
+  if (!fs.existsSync(file)) return { ok: false, code: 'ENOENT', detail: '文件不存在（尚未创建，可忽略）：' + file };
   const res = icacls([file, '/inheritance:r',
     '/grant:r', `${user}:F`, '/grant:r', 'SYSTEM:F', '/grant:r', 'Administrators:F', '/C', '/Q']);
   const out = `${res.stdout ?? ''}${res.stderr ?? ''}`;

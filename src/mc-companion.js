@@ -79,8 +79,17 @@ function flushQueue() {
     fs.mkdirSync(path.dirname(QUEUE_FILE), { recursive: true });
     fs.writeFileSync(tmp, JSON.stringify(QUEUE.slice(-MAX_QUEUE)), 'utf8');
     fs.renameSync(tmp, QUEUE_FILE);
-  } catch {
+  } catch (error) {
     try { fs.unlinkSync(tmp); } catch { /* 临时文件可能没建出来 */ }
+    // 2026-10-28 复审 R3（P2）：原来这里既不复位 dirty 也不打日志 —— SAVE_DIRTY 早在 try 之前就被置
+    // false，落盘失败后**没有人再动队列就永远不会重试**，主人在游戏里说的话留在内存 QUEUE 里，
+    // 重启即彻底消失，全程零痕迹。现在复位 dirty、排一次延迟重试，并留日志。
+    SAVE_DIRTY = true;
+    WATCHER?.log?.('[mc] 队列落盘失败（' + (error?.code || error?.message || '未知错误') + '），200ms 后重试');
+    if (!SAVE_TIMER) {
+      SAVE_TIMER = setTimeout(() => { SAVE_TIMER = null; flushQueue(); }, 200);
+      if (typeof SAVE_TIMER.unref === 'function') SAVE_TIMER.unref();
+    }
   }
 }
 
@@ -138,6 +147,17 @@ export function dropMcMessages(ref) {
 /** 队列里还有多少条没交出去。 */
 export function mcQueueSize() {
   return QUEUE.length;
+}
+
+/**
+ * 强制把队列落盘（同步）。
+ * 2026-10-28 复审 R3 附带（P2）：saveQueue 是 200ms 合并写、定时器还是 unref 的，
+ * 进程正常退出时最后 ≤200ms 的变更会静默丢掉 —— bridge 的 exit 钩子原来只 flush 了 socialV2。
+ * 退出阶段只能做同步事，所以单独暴露一个入口给它。
+ */
+export function flushMcQueue() {
+  if (SAVE_TIMER) { clearTimeout(SAVE_TIMER); SAVE_TIMER = null; }
+  flushQueue();
 }
 
 /** 停掉轮询（重启/退出时用）。 */

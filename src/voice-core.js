@@ -211,8 +211,14 @@ export async function probeAudio(file, { ffprobePath = 'ffprobe', timeoutMs = 10
  * ffprobe.exe 其实一直和 ffmpeg.exe 并排躺在同一个 bin 目录里，从 ffmpeg 推导即可。
  */
 export function resolveFfprobe({ ffprobePath = null, ffmpegPath = null } = {}) {
+  // 2026-10-28 复审 R5（P3）：显式的 ffprobePath / FFPROBE_PATH 原来也被下面那道 statSync 卡着，
+  // 裸命令名（PATH 里的 'ffprobe'、某个包装脚本）stat 不到就被静默丢弃、最后回落 'ffprobe' ——
+  // 等于「显式传了等于没传」，还没有任何提示。显式值无条件优先，交给下游的 ENOENT 去报错；
+  // 只有从 ffmpeg 目录推导出来的候选才要求 stat 命中（推导值不校验就是瞎猜）。
+  const explicit = ffprobePath || process.env.FFPROBE_PATH;
+  if (explicit) return explicit;
   const ffmpegs = [ffmpegPath, process.env.FFMPEG_PATH, process.env.PET_FFMPEG].filter(Boolean);
-  const cands = [ffprobePath, process.env.FFPROBE_PATH].filter(Boolean);
+  const cands = [];
   for (const ff of ffmpegs) {
     const ext = path.extname(ff) || (process.platform === 'win32' ? '.exe' : '');
     cands.push(path.join(path.dirname(ff), 'ffprobe' + ext));
