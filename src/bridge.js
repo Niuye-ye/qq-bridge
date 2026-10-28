@@ -1691,7 +1691,9 @@ async function main() {
       allowAbsolutePath: v.allowAbsolutePath === true,
       defaultVolume: Number(v.defaultVolume) > 0 ? Number(v.defaultVolume) : 1,
       loudness: v.loudness || 'normal',
-      ffmpegPath: process.env.FFMPEG_PATH || v.ffmpegPath || null,
+      // 2026-10-28 审计 C-P2：voice.ffmpegPath 常年是空串，而 video.ffmpeg 已经配好了同一台机器上的
+      // ffmpeg.exe —— ffprobe.exe 就在它旁边。回落一下，语音时长校验（maxSeconds）才有得用。
+      ffmpegPath: process.env.FFMPEG_PATH || v.ffmpegPath || (cfg.video && cfg.video.ffmpeg) || null,
       autoReadback: v.autoReadback !== false
     };
   }
@@ -1856,7 +1858,7 @@ async function main() {
     if (audit) assertOutboundAuditOk(key, `[语音:${path.basename(filePath)}]`);
     let info;
     try {
-      info = await inspectAudio(filePath, { maxBytes: vc.maxBytes, maxSeconds: vc.maxSeconds });
+      info = await inspectAudio(filePath, { maxBytes: vc.maxBytes, maxSeconds: vc.maxSeconds, ffmpegPath: vc.ffmpegPath });
     } catch (error) {
       throw new Error(`音频检查失败：${error?.message ?? error}`);
     }
@@ -6161,7 +6163,7 @@ async function main() {
             sendJson({ ok: false, error: error.message }, 400);
             return;
           }
-          const probe = await inspectAudio(resolved.path, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds });
+          const probe = await inspectAudio(resolved.path, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds, ffmpegPath: voice.ffmpegPath });
           if (!probe.ok) { sendJson({ ok: false, error: probe.error }, 400); return; }
           const preview = {
             key,
@@ -6260,7 +6262,7 @@ async function main() {
           try {
             voiceBudgetCheck(key, voice);
             if (body.dryRun === true) {
-              const probe = await inspectAudio(resolved.path, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds });
+              const probe = await inspectAudio(resolved.path, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds, ffmpegPath: voice.ffmpegPath });
               if (!probe.ok) { sendJson({ ok: false, error: probe.error }, 400); return; }
               sendJson({ ok: true, dryRun: true, key, file: resolved.path, detail: describeAudio(probe) });
               return;
@@ -6759,7 +6761,7 @@ async function main() {
             for (const f of files.slice(0, 100)) {
               const entry = { name: path.relative(voice.dir, f).split(path.sep).join('/') };
               if (wantProbe) {
-                const info = await inspectAudio(f, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds });
+                const info = await inspectAudio(f, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds, ffmpegPath: voice.ffmpegPath });
                 entry.ok = info.ok;
                 entry.bytes = info.size;
                 entry.detail = info.ok ? describeAudio(info) : null;

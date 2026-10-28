@@ -25,6 +25,7 @@ export {
   LOUDNESS_TARGETS,
   resolveAudioProcessing,
   resolveFfmpeg,
+  resolveFfprobe,
   processAudioVolume,
   cleanupTemp
 } from './voice-core.js';

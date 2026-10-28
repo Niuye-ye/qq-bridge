@@ -43,8 +43,17 @@ function stripModeTags(heading) {
 export function parseRoleSections(text) {
   const sections = [];
   let current = null;
+  // 2026-10-28 审计 C-P3：原来不认 Markdown 围栏 —— 代码块（```）里的 `## 标题` 会被当成人格卡小节，
+  // 实测把带围栏的那一整节吃掉、还留下未闭合的围栏，注入给模型的文本是碎的。
+  let fence = null;
   for (const line of String(text ?? '').split('\n')) {
-    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    const fenceMatch = /^\s*(`{3,}|~{3,})/.exec(line);
+    if (fenceMatch) {
+      const mark = fenceMatch[1][0];
+      if (!fence) fence = mark;
+      else if (mark === fence) fence = null;
+    }
+    const heading = fence ? null : /^(#{1,6})\s+(.*)$/.exec(line);
     if (!heading) {
       if (!current) {
         current = { mode: 'all', heading: null, lines: [] };

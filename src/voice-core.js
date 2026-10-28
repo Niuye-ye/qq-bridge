@@ -200,11 +200,36 @@ export async function probeAudio(file, { ffprobePath = 'ffprobe', timeoutMs = 10
   }
 }
 
+/**
+ * 定位 ffprobe（2026-10-28 审计 C-P2）。
+ *
+ * 原来的 inspectAudio 只认 `process.env.FFPROBE_PATH || 'ffprobe'`，而这台机器上：
+ *   · ffprobe 不在 PATH；`where ffprobe` 空；
+ *   · config 的 socialV2.voice.ffmpegPath 是空串（只有 video.ffmpeg 指向 ffmpeg.exe）；
+ *   · 4 个调用点都不传 ffprobePath。
+ * 于是探测永远 ENOENT → 降级成 warning + ok:true → **maxSeconds 300 完全失效**，任意长语音都能发。
+ * ffprobe.exe 其实一直和 ffmpeg.exe 并排躺在同一个 bin 目录里，从 ffmpeg 推导即可。
+ */
+export function resolveFfprobe({ ffprobePath = null, ffmpegPath = null } = {}) {
+  const ffmpegs = [ffmpegPath, process.env.FFMPEG_PATH, process.env.PET_FFMPEG].filter(Boolean);
+  const cands = [ffprobePath, process.env.FFPROBE_PATH].filter(Boolean);
+  for (const ff of ffmpegs) {
+    const ext = path.extname(ff) || (process.platform === 'win32' ? '.exe' : '');
+    cands.push(path.join(path.dirname(ff), 'ffprobe' + ext));
+    cands.push(path.join(path.dirname(ff), 'ffprobe'));
+  }
+  for (const c of cands) {
+    try { if (fs.statSync(c).isFile()) return c; } catch { /* 继续 */ }
+  }
+  return 'ffprobe';
+}
+
 /** 校验音频是否适合当 QQ 语音发。返回 { ok, size, duration, codec, warnings[], error }。 */
 export async function inspectAudio(file, {
   maxBytes = DEFAULT_MAX_BYTES,
   maxSeconds = DEFAULT_MAX_SECONDS,
-  ffprobePath = process.env.FFPROBE_PATH || 'ffprobe'
+  ffprobePath = null,
+  ffmpegPath = null
 } = {}) {
   const warnings = [];
   let st;
@@ -217,7 +242,7 @@ export async function inspectAudio(file, {
   if (SILK_EXTS.has(path.extname(file).toLowerCase())) {
     return { ok: true, size: st.size, duration: null, codec: 'silk', formatName: 'silk', warnings };
   }
-  const p = await probeAudio(file, { ffprobePath });
+  const p = await probeAudio(file, { ffprobePath: resolveFfprobe({ ffprobePath, ffmpegPath }) });
   if (!p.ok) {
     warnings.push(`无法探测时长（${p.reason}）：将不做时长校验，直接交给网关`);
     return { ok: true, size: st.size, duration: null, codec: '', formatName: '', warnings };
