@@ -71,8 +71,16 @@ export function readGoalsV2() {
   return Array.isArray(o.goals) ? o.goals : [];
 }
 
+let goalsTruncWarned = false;
 export function writeGoalsV2(list) {
-  writeJsonFile(GOALS_PATH, { goals: list.slice(-GOALS_MAX), updatedAt: new Date().toISOString() });
+  const all = Array.isArray(list) ? list : [];
+  // 2026-10-28 审计 A-P3：超过 GOALS_MAX 时老目标是被**静默**丢掉的 —— 之后主人问「那件事怎么没了」，
+  // 日志里一个字都没有。这个函数每次写都会走，所以只提示一次。
+  if (all.length > GOALS_MAX && !goalsTruncWarned) {
+    goalsTruncWarned = true;
+    console.error('[goals-life] 「你自己想干的事」超过 ' + GOALS_MAX + ' 条，最早的 ' + (all.length - GOALS_MAX) + ' 条已被丢弃（只保留最近 ' + GOALS_MAX + ' 条）');
+  }
+  writeJsonFile(GOALS_PATH, { goals: all.slice(-GOALS_MAX), updatedAt: new Date().toISOString() });
   return list;
 }
 

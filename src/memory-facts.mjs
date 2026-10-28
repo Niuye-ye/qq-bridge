@@ -561,7 +561,9 @@ function formatFactsLineV2() {
     const rev = (Number(f.rev) || 0) + 1;
     f.rev = rev;
     f.reviewedAt = new Date(now).toISOString();
-    const days = FACT_REVIEW_DAYS[Math.min(rev, FACT_REVIEW_DAYS.length - 1)];
+    // 2026-10-28 审计 A-P3：rev 是「第几次复习」（第一次就是 1），而天数表从 1 天起 —— 
+    // 原来直接拿 rev 当下标，于是首次复习排到 2 天、表里的 1 天永远用不到。改成 rev-1。
+    const days = FACT_REVIEW_DAYS[Math.min(rev - 1, FACT_REVIEW_DAYS.length - 1)];
     f.dueAt = new Date(now + days * 86400000).toISOString();
     f.lifeMul = Math.min(FACT_REVIEW_LIFE_MUL_MAX, Math.round((Number(f.lifeMul) || 1) * FACT_REVIEW_LIFE_MUL * 100) / 100);
     touchFactV2(f, 0.06, now);
