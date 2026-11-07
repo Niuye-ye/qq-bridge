@@ -17,7 +17,7 @@ function makeEnv(overrides = {}) {
     submitTimes: new Map(),
     researching: new Set(),
   };
-  const calls = { sent: [], logs: [], saves: 0, queued: [], extracted: [], researched: [], invalidated: 0, atomic: [] };
+  const calls = { sent: [], logs: [], saves: 0, queued: [], extracted: [], researched: [], invalidated: 0, atomic: [], activities: [] };
   const cfg = { slang: { enabled: true, injectMax: 5, autoResearch: false, inferenceThresholds: [2, 4, 8] } };
   const ctx = {
     req: { method: 'GET' },
@@ -46,13 +46,22 @@ function makeEnv(overrides = {}) {
     runSlangExtraction: (key) => { calls.extracted.push(key); return Promise.resolve(); },
     runSlangResearch: (candidates) => { calls.researched.push(candidates); return Promise.resolve(); },
     invalidateSlangLearnerSession: () => { calls.invalidated += 1; },
+    // 二代黑话（/api/socialV2/slang/*）依赖
+    agentTokenOk: () => true,
+    v2SessionAllowed: () => true,
+    v2ToolEnabled: () => true,
+    confirmedSlangListV2: () => state.entries.filter((e) => e.status === 'confirmed'),
+    redactKnownTokensOnly: (s) => s,
+    allowSlangSubmit: () => true,
+    publicSlangEntry: (e) => ({ id: e.id, content: e.content, status: e.status }),
+    appendActivity: (line) => { calls.activities.push(line); },
     ...overrides,
   };
   return { root, state, calls, ctx };
 }
 
 function run(ctx, { method = 'GET', pathname = '/api/slang', body = {} } = {}) {
-  ctx.req = { method };
+  ctx.req = { method, headers: {} };
   ctx.url = new URL('http://127.0.0.1' + pathname);
   ctx.readBody = async () => body;
   return handleSlangRoutes(ctx);
@@ -221,4 +230,65 @@ test('POST /api/slang/config：写 config.json、同步 cfg.slang、preset 变�
   assert.equal(await run(ctx, { method: 'POST', pathname: '/api/slang/config', body: { learnerPreset: 'new-preset' } }), true);
   assert.equal(calls.invalidated, 1);
   assert.equal(ctx.cfg.slang.learnerPreset, 'new-preset');
+});
+
+test('GET /api/socialV2/slang/query：缺 key 400、按 q 过滤命中、附黑话块', async () => {
+  const { state, calls, ctx } = makeEnv();
+  state.entries = [
+    entry('a', 'confirmed', { meaning: '永远的神', usage: '夸人', example: 'yyds' }),
+    entry('b', 'confirmed', { content: '绝绝子', meaning: '太绝了', usage: '夸人', example: '绝绝子' }),
+  ];
+  assert.equal(await run(ctx, { pathname: '/api/socialV2/slang/query' }), true);
+  assert.equal(calls.sent.at(-1).status, 400);
+  assert.match(calls.sent.at(-1).body.error, /key 不能为空/);
+
+  ctx.url = new URL('http://127.0.0.1/api/socialV2/slang/query?key=group:1&q=神');
+  calls.sent.length = 0;
+  assert.equal(await handleSlangRoutes(ctx), true);
+  const body = calls.sent.at(-1).body;
+  assert.equal(body.ok, true);
+  assert.equal(body.total, 1);
+  assert.equal(body.entries[0].id, 'a');
+  assert.equal(typeof body.block, 'string');
+});
+
+test('POST /api/socialV2/slang/submit：关闭/空内容/过长/重复/新增分支', async () => {
+  const { state, calls, ctx } = makeEnv();
+  ctx.cfg.slang.enabled = false;
+  assert.equal(await run(ctx, { method: 'POST', pathname: '/api/socialV2/slang/submit', body: { key: 'group:1', content: 'yyds' } }), true);
+  assert.equal(calls.sent.at(-1).status, 403);
+  assert.match(calls.sent.at(-1).body.error, /黑话学习已关闭/);
+
+  ctx.cfg.slang.enabled = true;
+  assert.equal(await run(ctx, { method: 'POST', pathname: '/api/socialV2/slang/submit', body: { key: 'group:1' } }), true);
+  assert.equal(calls.sent.at(-1).status, 400);
+  assert.match(calls.sent.at(-1).body.error, /content 不能为空/);
+
+  assert.equal(await run(ctx, { method: 'POST', pathname: '/api/socialV2/slang/submit', body: { key: 'group:1', content: 'x'.repeat(51) } }), true);
+  assert.equal(calls.sent.at(-1).status, 400);
+  assert.match(calls.sent.at(-1).body.error, /过长/);
+
+  state.entries = [entry('a', 'confirmed', { content: 'yyds' })];
+  assert.equal(await run(ctx, { method: 'POST', pathname: '/api/socialV2/slang/submit', body: { key: 'group:1', content: 'yyds' } }), true);
+  assert.equal(calls.sent.at(-1).body.duplicate, true);
+  assert.equal(calls.sent.at(-1).body.status, 'confirmed');
+
+  calls.sent.length = 0;
+  assert.equal(await run(ctx, { method: 'POST', pathname: '/api/socialV2/slang/submit', body: { key: 'group:1', content: '真香', context: '他吃了' } }), true);
+  const added = calls.sent.at(-1).body;
+  assert.equal(added.ok, true);
+  assert.equal(state.entries.length, 2);
+  assert.equal(state.entries[1].content, '真香');
+  assert.equal(calls.saves, 1);
+  assert.equal(calls.activities.length, 1);
+});
+
+test('二代黑话：agent token 头 + 工具开关关闭时 403', async () => {
+  const { calls, ctx } = makeEnv();
+  ctx.v2ToolEnabled = () => false;
+  ctx.req = { method: 'GET', headers: { 'x-agent-token': 'tk' } };
+  ctx.url = new URL('http://127.0.0.1/api/socialV2/slang/query?key=group:1');
+  assert.equal(await handleSlangRoutes(ctx), true);
+  assert.equal(calls.sent.at(-1).status, 403);
+  assert.match(calls.sent.at(-1).body.error, /工具未启用/);
 });

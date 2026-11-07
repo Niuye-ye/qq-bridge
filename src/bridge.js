@@ -3984,7 +3984,9 @@ async function main() {
           getSlangEntries: () => slangEntries,
           setSlangEntries: (value) => { slangEntries = value; },
           slangWindows, slangExtractionCooldowns, slangSubmitTimes, slangResearchingIds,
-          saveSlangStore, queueSlangTask, runSlangExtraction, runSlangResearch, invalidateSlangLearnerSession
+          saveSlangStore, queueSlangTask, runSlangExtraction, runSlangResearch, invalidateSlangLearnerSession,
+          agentTokenOk, v2SessionAllowed, v2ToolEnabled, confirmedSlangListV2, redactKnownTokensOnly,
+          allowSlangSubmit, publicSlangEntry, appendActivity,
         };
         // ── 模型 API Key 自助录入页（GET /llm-key）─────────────────────────────
         // 纯静态表单：没令牌也能打开看说明，提交时才需要控制台令牌（?token=）。
@@ -7285,87 +7287,7 @@ async function main() {
           sendJson({ ok: true, key, category: category || 'all', memory: formatMemoryV2(st) });
           return;
         }
-        // ── 二代黑话学习（reserved2）：AI 查询/提交黑话候选 ─────────────────
-        if (req.method === 'GET' && url.pathname === '/api/socialV2/slang/query') {
-          const key = String(url.searchParams.get('key') ?? '').trim();
-          const q = String(url.searchParams.get('q') ?? '').trim().toLowerCase();
-          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('slangQuery')) { sendJson({ ok: false, error: '工具未启用：qq_slang_query' }, 403); return; }
-          const list = confirmedSlangListV2().filter((e) => {
-            if (!q) return true;
-            return e.content.toLowerCase().includes(q)
-              || e.meaning.toLowerCase().includes(q)
-              || e.usage.toLowerCase().includes(q)
-              || e.example.toLowerCase().includes(q);
-          });
-          sendJson({
-            ok: true,
-            key,
-            total: list.length,
-            entries: list,
-            block: buildSlangContext(slangEntries, cfg.slang?.injectMax ?? 8)
-          });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/slang/submit') {
-          const body = await readBody();
-          const key = String(body.key ?? '').trim();
-          const token = String(body.token ?? '').trim();
-          const content = redactKnownTokensOnly(String(body.content ?? '')).trim();
-          const context = redactKnownTokensOnly(String(body.context ?? '')).trim();
-          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('slangSubmit')) { sendJson({ ok: false, error: '工具未启用：qq_slang_submit' }, 403); return; }
-          if (cfg.slang?.enabled === false) { sendJson({ ok: false, error: '黑话学习已关闭（slang.enabled=false）' }, 403); return; }
-          if (!content) { sendJson({ ok: false, error: 'content 不能为空' }, 400); return; }
-          if (content.length > 50) { sendJson({ ok: false, error: '黑话词条过长（最多 50 字）' }, 400); return; }
-          if (!allowSlangSubmit(key)) { sendJson({ ok: false, error: '黑话提交过于频繁，请稍后再试' }, 429); return; }
-          const existing = slangEntries.find((e) => e.content === content);
-          if (existing) {
-            if (existing.status === SLANG_STATUS.CONFIRMED) {
-              sendJson({ ok: true, duplicate: true, status: 'confirmed', entry: publicSlangEntry(existing) });
-              return;
-            }
-            if (existing.status === SLANG_STATUS.REJECTED) {
-              sendJson({ ok: false, error: '该词已被管理员拒绝，如需重新收录请联系管理员' }, 403);
-              return;
-            }
-            // candidate：累计出现次数并追加语境证据
-            existing.count = (Number(existing.count) || 0) + 1;
-            if (context) {
-              existing.evidence = mergeEvidence(existing.evidence, [{ key, sender: 'AI提交', text: context.slice(0, 200), time: Date.now() }]);
-            }
-            existing.updatedAt = new Date().toISOString();
-            saveSlangStore();
-            if (cfg.slang?.autoResearch !== false) {
-              const thresholds = Array.isArray(cfg.slang?.inferenceThresholds) ? cfg.slang.inferenceThresholds.map(Number).filter(Boolean) : [2, 4, 8];
-              if (thresholds.includes(existing.count) && existing.count > (Number(existing.lastInferenceCount) || 0)) {
-                queueSlangTask(() => runSlangResearch([existing]));
-              }
-            }
-            log(`[reserved2] AI 再次提交黑话候选「${content}」(${key})，累计 ${existing.count} 次`);
-            sendJson({ ok: true, duplicate: true, status: 'candidate', entry: publicSlangEntry(existing) });
-            return;
-          }
-          const entry = createSlangEntry({
-            content,
-            source: 'ai',
-            status: SLANG_STATUS.CANDIDATE,
-            evidence: context ? [{ key, sender: 'AI提交', text: context.slice(0, 200), time: Date.now() }] : []
-          });
-          slangEntries.push(entry);
-          saveSlangStore();
-          if (cfg.slang?.autoResearch !== false) {
-            queueSlangTask(() => runSlangResearch([entry]));
-          }
-          log(`[reserved2] AI 提交黑话候选「${content}」(${key})`);
-          appendActivity(`${key} [reserved2] AI 提交黑话候选：${content}${context ? '（附语境）' : ''}`);
-          sendJson({ ok: true, entry: publicSlangEntry(entry) });
-          return;
-        }
+
         if (req.method === 'POST' && url.pathname === '/api/authorize/read') {
           const body = await readBody();
           const key = String(body.key ?? '').trim();
