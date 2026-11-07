@@ -279,6 +279,9 @@
     "timeoutMs": 35000
   },
   "oneClick": "",
+  "localOps": {
+    "killLink": ""
+  },
   "video": {
     "ffmpeg": "",
     "python": "",

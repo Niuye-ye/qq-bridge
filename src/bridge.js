@@ -10,7 +10,7 @@ import os from 'node:os';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import yaml from 'js-yaml';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
 import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
@@ -702,6 +702,11 @@ function loadConfig() {
     questionTimeoutMs: file.questionTimeoutMs ?? 5 * 60 * 1000,
     consolePort: file.consolePort ?? 3100,
     consoleToken: file.consoleToken ?? '',
+    // 本机运维脚本（config.json 不入库，可以写本机盘符；桥代码里不许写死路径）。
+    // 现在只有 killLink：qq_kill_link / POST /api/socialV2/kill-link 用它根除链路进程。
+    localOps: {
+      killLink: String(file.localOps?.killLink ?? '')
+    },
     // 价目表覆盖项（可选）。留空即用 src/model-prices.js 的官方默认价。
     pricing: file.pricing ?? null,
     security: {
@@ -794,7 +799,8 @@ function loadConfig() {
         remember: true,
         recall: true,
         forget: true,
-        getSelfImage: true
+        getSelfImage: true,
+        killLink: true
       },
       wake: {
         defaultMode: 'diving',
@@ -924,6 +930,7 @@ function loadConfig() {
     recall: true,
     forget: true,
     getSelfImage: true,
+    killLink: true,
     sendVoice: false,
     ...(cfg.socialV2.tools ?? {})
   };
@@ -6697,6 +6704,63 @@ async function main() {
             forgotten: readForgottenFactsV2().length,
             line: formatFactsLineV2(),
           });
+          return;
+        }
+
+        // ── 根除链路进程（qq_kill_link）──────────────────────────────────────
+        // 桌宠「一键修复 · 启动」的反面：先把整条链路杀干净，再让主人一键启动。
+        // 脚本路径来自 config.localOps.killLink（config.json 不入库，可写本机盘符）；
+        // 桥代码里不许写死路径，别人部署时留空即可（本接口会返回 501）。
+        // 默认不碰 QQ 本体与 MuMu 模拟器 —— 那两个要显式 includeQQ / includeMuMu。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/kill-link') {
+          const body = await readBody();
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('killLink')) {
+            sendJson({ ok: false, error: '工具未启用：qq_kill_link' }, 403);
+            return;
+          }
+          const script = String(cfg.localOps?.killLink ?? '').trim();
+          if (!script || !fs.existsSync(script)) {
+            sendJson({ ok: false, error: '未配置 localOps.killLink（config.json），或脚本不存在' }, 501);
+            return;
+          }
+          const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script];
+          if (body.includeQQ === true) args.push('-IncludeQQ');
+          if (body.includeMuMu === true) args.push('-IncludeMuMu');
+          if (body.dryRun === true) {
+            // 干跑：同步跑一次把清单原样回给模型。
+            // PowerShell 5.1 默认按控制台代码页（本机 936/GBK）往管道写，Node 按 UTF-8 读会全是乱码，
+            // 所以先把 [Console]::OutputEncoding 设成 UTF8 再执行脚本。
+            const flags = [];
+            if (body.includeQQ === true) flags.push('-IncludeQQ');
+            if (body.includeMuMu === true) flags.push('-IncludeMuMu');
+            const quoted = script.replace(/'/g, "''");
+            const command = `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; & '${quoted}' -DryRun ${flags.join(' ')}`;
+            const out = await new Promise((resolve) => {
+              execFile('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], { windowsHide: true, timeout: 120000, maxBuffer: 2 * 1024 * 1024 }, (err, stdout, stderr) => {
+                resolve(`${stdout ?? ''}${stderr ?? ''}${err ? `\n[exit] ${err.message}` : ''}`.trim());
+              });
+            });
+            log('[kill-link] 干跑预览（未杀任何进程）');
+            sendJson({ ok: true, dryRun: true, output: out });
+            return;
+          }
+          log(`[kill-link] 根除链路进程（includeQQ=${body.includeQQ === true} includeMuMu=${body.includeMuMu === true}）`);
+          sendJson({
+            ok: true,
+            dispatched: true,
+            note: '已在后台执行。桥会在 2~3 秒内断线（它自己也要被杀），属正常现象；之后用「一键修复 · 启动」或 一键启动.ps1 拉起来。'
+          });
+          // 先回包再动手：这个脚本会把当前桥进程杀掉。
+          // detached + unref 保证脚本活过桥的死亡；不能等回调（桥一死回调永远不会来）。
+          setTimeout(() => {
+            try {
+              const child = spawn('powershell.exe', args, { detached: true, stdio: 'ignore', windowsHide: true });
+              child.on('error', (err) => log(`[kill-link] 派发失败：${err?.message ?? err}`));
+              child.unref();
+            } catch (err) {
+              log(`[kill-link] 派发失败：${err?.message ?? err}`);
+            }
+          }, 300).unref?.();
           return;
         }
 

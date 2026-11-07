@@ -418,6 +418,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_send_mood: 'sendQzone',
   qq_list_moods: 'listQzone',
   qq_see_screen: 'seeScreen',
+  qq_kill_link: 'killLink',
 };
 const disabledTools = [];
 {
@@ -3040,5 +3041,34 @@ server.tool(
     isError: true,
   })
 );
+
+// ── 根除链路进程 ──────────────────────────────────────────────────────────────
+// 桌宠「一键修复 · 启动」的反面：把整条链路杀干净（守护/桌宠/8765/8790/3080/3000/3001/桥自己）。
+if (cfg.socialV2?.tools?.killLink !== false) {
+  server.tool(
+    'qq_kill_link',
+    '把整条 QQ 链路的进程全部杀干净：先杀守护（watchdog / bridge-guard / pet-guard / diary-guard，否则 3 分钟内会补回来），再杀桌宠、安卓 MCP(8765)、MuMu 管家(8790)、dsh web(3080)、SnowLuma(3000/3001)，最后杀桥自己(3100)。用在「链路卡死 / 反复重启 / 端口被占 / 改了代码要彻底重来」的时候 —— 杀完让主人点桌宠「一键修复 · 启动」或跑 一键启动.ps1 重新拉起。**注意：调用后 2~3 秒内桥会断线（它自己也被杀），所以这条消息可能发不出去 —— 需要说话时先发消息再调这个工具。默认不杀 QQ 本体和 MuMu 模拟器，要连它们一起停就显式传 includeQQ / includeMuMu。不确定会杀什么时先传 dryRun:true 看清单。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      includeQQ: z.boolean().optional().describe('是否连 QQ 主进程一起关（默认 false）'),
+      includeMuMu: z.boolean().optional().describe('是否连 MuMu 模拟器一起关（默认 false）'),
+      dryRun: z.boolean().optional().describe('true = 只列出会杀哪些进程，一个都不杀（建议先干跑一次）')
+    },
+    async ({ key, token, includeQQ, includeMuMu, dryRun }) => {
+      try {
+        const data = await agentApi('/api/socialV2/kill-link', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, includeQQ: includeQQ === true, includeMuMu: includeMuMu === true, dryRun: dryRun === true }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 120000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `根除链路失败：${error?.message ?? error}（如果报连接重置/超时，多半是已经杀到桥自己了，链路本来就在停）` }], isError: true };
+      }
+    }
+  );
+}
 
 await server.connect(new StdioServerTransport());
