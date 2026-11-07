@@ -32,6 +32,7 @@ import * as mcCompanion from '../src/mc-companion.js';  // 模块级只有队列
 import * as rateLimit from '../src/rate-limit.mjs';      // 纯函数（窗口计数/预占/回滚），无 I/O
 import * as memoryFacts from '../src/memory-facts.mjs';  // 纯数据层，路径由 bridge 传入（harness 里 root=临时目录）
 import * as consoleTelemetry from '../src/console/telemetry.mjs';
+import * as consoleDshModel from '../src/console/dsh-model.mjs';  // DSH 模型/思考强度域处理器，同上
 import * as consoleRoles from '../src/console/roles.mjs';   // 人格管理域处理器，同上  // 纯路由处理器，依赖全由 ctx 注入（VM 里 import 被剥掉，必须这里补）
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
@@ -183,7 +184,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...stateStore,
-    ...roleCard, ...mcCompanion, ...rateLimit, ...memoryFacts, ...consoleTelemetry, ...consoleRoles,
+    ...roleCard, ...mcCompanion, ...rateLimit, ...memoryFacts, ...consoleTelemetry, ...consoleRoles, ...consoleDshModel,
     // snowluma-conn 会写 config.json / 磁盘上的 token 文件 —— VM 里绝不能真写，桩掉。
     discoverSnowLumaConnection: async () => null,
     persistSnowLumaEndpoint: async () => ({ ok: true, detail: 'stub' }),

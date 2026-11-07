@@ -104,6 +104,8 @@ const LLM_KEY_PAGE_HTML = [
 
 // 控制台「人格管理」域路由（/api/role*），原 startConsoleServer 内联代码搬出
 import { handleRolesRoutes } from './console/roles.mjs';
+// 控制台「DSH 模型与思考强度」域路由（/api/dsh/model、/api/dsh/effort），原 startConsoleServer 内联代码搬出
+import { createDshModelRoutes } from './console/dsh-model.mjs';
 // Minecraft 陪伴：轮询 Numen 模组内置 MCP 服务端的游戏内消息（纯 I/O + 队列，不碰会话状态机）
 import { dropMcMessages, flushMcQueue, mcAlive, mcBusyMs, mcQueueSize, mcStatus, peekMcMessages, startMcWatcher } from './mc-companion.js';
 import {
@@ -643,9 +645,6 @@ function forgetAgentToken(key) {
   CONVERSATION_TOKENS.delete(key);
 }
 
-// 读取 DSH 模型能力的在途 Promise：withTimeout 只做 Promise.race，不会取消底层 RPC，
-// 因此并发刷新会各自留下一个不可取消的请求。这里做去重，同一时刻只发一个。
-let modelCatalogInFlight = null;
 // DSH 思考强度（reasoningEffort）热切换代号。
 // 控制台改强度后递增它，让已在运行的会话在下一条消息重新 selectModel；
 // 放在模块级是为了不依赖 main() 内部声明的执行顺序（避免 TDZ）。
@@ -2844,22 +2843,6 @@ async function main() {
     // 默认只允许把 launch token 交给回环地址；远程 DSH 需要显式 opt-in（见 dsh-client.ensureAuth）。
     allowRemote: cfg.dsh.allowRemote === true
   });
-  // DSH 的模型目录 RPC：0.1.5 是 `session/modelCatalog`。**不能走基类门面**
-  // `api.sessions.modelCatalog` —— 桥接钉住的 `@deepseek-ai/dsh-host-apiproxy@0.1.1-rc.2`
-  // 的 sessions 门面里根本没有这个方法（只有 `models` → 已下线的 `session/models`），
-  // 调用会抛 “api.sessions.modelCatalog is not a function”，让思考强度档位静默退回内置清单。
-  // 这里直接用桥接自己覆写的 callUnary（它本来就是为「不依赖旧版客户端域方法」而存在的），
-  // 并保留一次 `session/models` 回落以兼容更老的 DSH。
-  const modelCatalogErrorLogged = new Set();
-  async function fetchModelCatalog() {
-    try {
-      return await api.callUnary('session.modelCatalog', {});
-    } catch (error) {
-      const message = String(error?.message ?? error);
-      if (!/not.?found|unknown|unsupported|404|invalid server-response/i.test(message)) throw error;
-      return api.callUnary('session.models', {});
-    }
-  }
   const collectors = new Map(); // sessionId -> turn collector
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
@@ -3687,6 +3670,8 @@ async function main() {
   }
 
   function startConsoleServer() {
+    // DSH 模型与思考强度域的路由工厂：只建一次（模型目录单飞缓存、失败日志去重 Set 要跨请求复用）
+    const handleDshModelRoutes = createDshModelRoutes({ callUnary: (...args) => api.callUnary(...args) });
     const port = cfg.consolePort ?? 3100;
     // 控制台鉴权：优先用 config.consoleToken，未配置则自动生成并持久化，不再默认无鉴权。
     // 使用 let 以便控制台内手动修改令牌后热更新。
@@ -3979,6 +3964,10 @@ async function main() {
         const consoleCtx = {
           req, res, url, sendJson, readBody, log,
           fs, ROOT, path,
+          // DSH 模型与思考强度域（src/console/dsh-model.mjs）
+          withTimeout, unwrap, normalizeReasoningEffort,
+          REASONING_EFFORT_OPTIONS, REASONING_EFFORT_DEFAULT,
+          bumpModelSelectionEpoch: () => { modelSelectionEpoch += 1; },
           tokenLedger, priceTable,
           readToolLog, toolLogFile: TOOL_LOG_FILE,
           // 人格管理域（src/console/roles.mjs）
@@ -4543,71 +4532,8 @@ async function main() {
           return;
         }
 
-        // ── DSH 模型与思考强度 ───────────────────────────────────────────────
-        if (req.method === 'GET' && url.pathname === '/api/dsh/model') {
-          const provider = String(cfg.dsh?.provider || 'deepseek-official');
-          const model = String(cfg.dsh?.model || 'deepseek-flash');
-          // 档位优先取 DSH 实际公布的能力（DSH 换档位词汇或换 provider 时自动跟随），失败退回内置白名单。
-          let options = REASONING_EFFORT_OPTIONS.slice();
-          let labels = {};
-          let providerDefault = null;
-          let catalogSource = 'fallback';
-          try {
-            if (!modelCatalogInFlight) {
-              modelCatalogInFlight = withTimeout(fetchModelCatalog(), 3000, 'session/modelCatalog')
-                .finally(() => { modelCatalogInFlight = null; });
-            }
-            const catalog = unwrap(await modelCatalogInFlight, 'session.modelCatalog');
-            const group = (catalog?.groups ?? []).find((g) => g?.id === provider);
-            const entry = (group?.models ?? []).find((m) => m?.id === model);
-            const efforts = entry?.reasoning?.efforts ?? [];
-            const advertised = efforts.map((e) => String(e?.id ?? '')).filter((id) => REASONING_EFFORT_OPTIONS.includes(id));
-            if (advertised.length) {
-              options = advertised;
-              labels = Object.fromEntries(efforts.map((e) => [String(e.id), { name: e.name ?? '', description: e.description ?? '' }]));
-              providerDefault = entry.reasoning.defaultEffort ?? null;
-              catalogSource = 'dsh';
-            }
-          } catch (error) {
-            // 同一条失败原因只记一次：控制台每次刷新都会打这条接口，否则日志会被刷爆。
-            const reason = String(error?.message ?? error);
-            if (!modelCatalogErrorLogged.has(reason)) {
-              modelCatalogErrorLogged.add(reason);
-              log(`读取 DSH 模型能力失败，思考强度暂用内置清单：${reason}`);
-            }
-          }
-          sendJson({
-            provider,
-            model,
-            reasoningEffort: String(cfg.dsh?.reasoningEffort || REASONING_EFFORT_DEFAULT),
-            options,
-            labels,
-            default: REASONING_EFFORT_DEFAULT,
-            providerDefault,
-            catalogSource,
-            // selectModel 会同时写会话级与 DSH 全局默认（~/.dsh/settings.yaml 的 agent-default-model），
-            // 控制台要把这点明确告诉管理员，避免「只想调 QQ 助手却改了 Web GUI 新会话默认」的意外。
-            globalSideEffect: true,
-          });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/dsh/effort') {
-          const body = await readBody();
-          let effort;
-          try { effort = normalizeReasoningEffort(body.reasoningEffort); }
-          catch (error) { sendJson({ ok: false, error: error?.message ?? '思考强度无效' }, 400); return; }
-          const configFile = path.join(ROOT, 'config.json');
-          // fail-fast：配置损坏时直接 500，绝不回写（与白名单接口同语义）
-          const file = readConfigObject(configFile);
-          file.dsh = { ...(file.dsh ?? {}), reasoningEffort: effort };
-          atomicWriteJson(configFile, file);
-          cfg.dsh = { ...(cfg.dsh ?? {}), reasoningEffort: effort };
-          // 递增代号：已在运行的会话在下一条消息会重新 selectModel（无需重启桥接或 DSH）
-          modelSelectionEpoch += 1;
-          log(`控制台：DSH 思考强度已设为 ${effort}（对已有会话于下一条消息生效）`);
-          sendJson({ ok: true, reasoningEffort: effort });
-          return;
-        }
+        // ── DSH 模型与思考强度 → src/console/dsh-model.mjs ───────────────────
+        if (await handleDshModelRoutes(consoleCtx)) return;
 
         // ── 安全拦截通知设置 ─────────────────────────────────────────────────
         if (req.method === 'GET' && url.pathname === '/api/security') {
