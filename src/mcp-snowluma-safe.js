@@ -419,6 +419,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_list_moods: 'listQzone',
   qq_see_screen: 'seeScreen',
   qq_kill_link: 'killLink',
+  qq_set_llm_key: 'setLlmKey',
 };
 const disabledTools = [];
 {
@@ -3066,6 +3067,37 @@ if (cfg.socialV2?.tools?.killLink !== false) {
         return { content: [{ type: 'text', text: serializeModelData(data) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `根除链路失败：${error?.message ?? error}（如果报连接重置/超时，多半是已经杀到桥自己了，链路本来就在停）` }], isError: true };
+      }
+    }
+  );
+}
+
+// ── 模型 API Key 自助写入 ─────────────────────────────────────────────────────
+// 上游模型 key 失效时，主人可以把新 key 直接交给她，由她一次写好两个键名
+// （web 的 OPENCODEGO_API_KEY 与桌面端的 OPENCODE_GO_API_KEY），
+// 不用自己找文件、也不会只改一半（这正是 2026-11-07 那次 QQ 侧报 MISSING_CREDENTIAL 的根因）。
+// 安全约束：绝不在回复里复述完整 key，回包只给掩码；日志同样只记掩码。
+if (cfg.socialV2?.tools?.setLlmKey !== false) {
+  server.tool(
+    'qq_set_llm_key',
+    '把主人给的新模型 API Key 写进本机凭据文件（同时更新两个键名），并顺手验证它能不能用。只在主人明确把新 key 贴给你、或明确说「换 key」时调用 —— 不要自己编 key、也不要在普通对话里自动调用。调用后回复里绝对不能复述完整 key，只说「已写入（前6位…后3位）+ 验证结果」。返回 verified=valid 表示可用；invalid 表示上游拒绝（让主人确认抄没抄错、是不是过期）；unknown 表示网络/端点问题（key 可能没问题，稍后重试即可）。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      value: z.string().describe('主人给的新 API Key 原文（oc_sk_ 开头）。会写进本机凭据文件，不要拼空格或换行。'),
+      verify: z.boolean().optional().describe('是否顺便联网验证 key 可用性（默认 true；离线或不想发请求时传 false）')
+    },
+    async ({ key, token, value, verify }) => {
+      try {
+        const data = await agentApi('/api/socialV2/llm-key', {
+          method: 'POST',
+          body: JSON.stringify({ key, token, value, verify: verify !== false }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 60000
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: '写入模型 key 失败：' + String(error?.message ?? error) }], isError: true };
       }
     }
   );

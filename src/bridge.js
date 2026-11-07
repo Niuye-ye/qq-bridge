@@ -36,6 +36,74 @@ import { createFactsStore } from './memory-facts.mjs';
 import { checkQuota, countQuota, reserveQuota, rollbackQuota } from './rate-limit.mjs';
 // 控制台「诊断」域路由（Token 用量 / 工具调用日志），原 startConsoleServer 内联代码搬出
 import { handleTelemetryRoutes } from './console/telemetry.mjs';
+// 模型 API Key 自助写入（POST /api/socialV2/llm-key、/llm-key 页面、qq_set_llm_key）
+import { defaultCredentialsPath, maskLlmKey, normalizeLlmKey, verifyLlmKey, writeLlmKey } from './llm-key.mjs';
+
+// 模型 API Key 自助录入页（GET /llm-key）。纯静态表单，真正的写入走 POST /api/socialV2/llm-key。
+const LLM_KEY_PAGE_HTML = [
+  "<!doctype html>",
+  "<html lang=\"zh-CN\"><head><meta charset=\"utf-8\">",
+  "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+  "<title>设置模型 API Key</title>",
+  "<style>",
+  " body{font:15px/1.6 -apple-system,\"Segoe UI\",system-ui,sans-serif;max-width:600px;margin:56px auto;padding:0 20px;color:#1f2328}",
+  " h1{font-size:20px;margin:0 0 6px}",
+  " p{color:#57606a;font-size:13px;margin:0 0 18px}",
+  " input{width:100%;box-sizing:border-box;padding:10px 12px;font:14px/1.4 ui-monospace,Consolas,monospace;border:1px solid #d0d7de;border-radius:8px}",
+  " button{margin-top:12px;padding:9px 18px;font-size:14px;border:0;border-radius:8px;background:#1f6feb;color:#fff;cursor:pointer}",
+  " button:disabled{opacity:.55;cursor:default}",
+  " #r{margin-top:16px;font-size:13px;white-space:pre-wrap;word-break:break-all}",
+  " .ok{color:#1a7f37}.bad{color:#cf222e}.warn{color:#9a6700}",
+  " code{background:#f6f8fa;padding:1px 5px;border-radius:4px;font-size:12px}",
+  "</style></head>",
+  "<body>",
+  "<h1>设置模型 API Key</h1>",
+  "<p>写进本机的 <code>.credentials.yaml</code>，同时更新 web（<code>OPENCODEGO_API_KEY</code>）与桌面端（<code>OPENCODE_GO_API_KEY</code>）两个键名。保存后通常立即生效，QQ 侧不用重启。</p>",
+  "<input id=\"k\" placeholder=\"oc_sk_...\" autocomplete=\"off\" spellcheck=\"false\" autofocus>",
+  "<button id=\"go\">保存并验证</button>",
+  "<div id=\"r\"></div>",
+  "<script>",
+  "(function () {",
+  "  var token = new URLSearchParams(location.search).get('token') || '';",
+  "  var box = document.getElementById('r');",
+  "  var btn = document.getElementById('go');",
+  "  var input = document.getElementById('k');",
+  "  function say(cls, text) { box.className = cls; box.textContent = text; }",
+  "  if (!token) say('warn', '没拿到控制台令牌：地址后面加 ?token=…（控制台地址里就有）。');",
+  "  btn.onclick = function () {",
+  "    var key = (input.value || '').trim();",
+  "    if (!key) { say('bad', '先粘贴 key。'); return; }",
+  "    btn.disabled = true;",
+  "    say('', '正在写入并验证…');",
+  "    fetch('/api/socialV2/llm-key', {",
+  "      method: 'POST',",
+  "      headers: { 'content-type': 'application/json', 'x-console-token': token },",
+  "      body: JSON.stringify({ key: key, verify: true })",
+  "    }).then(function (r) {",
+  "      return r.json().then(function (j) { return { status: r.status, body: j }; });",
+  "    }).then(function (o) {",
+  "      btn.disabled = false;",
+  "      var j = o.body;",
+  "      if (!j || j.ok !== true) { say('bad', '失败：' + ((j && j.error) || ('HTTP ' + o.status))); return; }",
+  "      var v = j.verified;",
+  "      var line = '已写入 ' + (j.keys || []).join(' / ')",
+  "        + '\\n文件：' + j.path",
+  "        + '\\n验证：' + v + (j.status ? ('（HTTP ' + j.status + '）') : '');",
+  "      say(v === 'valid' ? 'ok' : (v === 'invalid' ? 'bad' : 'warn'), line + '\\n\\n' + (j.note || ''));",
+  "      if (v === 'valid') input.value = '';",
+  "    }).catch(function (e) {",
+  "      btn.disabled = false;",
+  "      say('bad', '请求失败：' + e.message);",
+  "    });",
+  "  };",
+  "  input.addEventListener('keydown', function (e) { if (e.key === 'Enter') btn.click(); });",
+  "})();",
+  "</script>",
+  "</body></html>",
+].join('\n');
+
+// 控制台「人格管理」域路由（/api/role*），原 startConsoleServer 内联代码搬出
+import { handleRolesRoutes } from './console/roles.mjs';
 // Minecraft 陪伴：轮询 Numen 模组内置 MCP 服务端的游戏内消息（纯 I/O + 队列，不碰会话状态机）
 import { dropMcMessages, flushMcQueue, mcAlive, mcBusyMs, mcQueueSize, mcStatus, peekMcMessages, startMcWatcher } from './mc-companion.js';
 import {
@@ -707,7 +775,10 @@ function loadConfig() {
     // 本机运维脚本（config.json 不入库，可以写本机盘符；桥代码里不许写死路径）。
     // 现在只有 killLink：qq_kill_link / POST /api/socialV2/kill-link 用它根除链路进程。
     localOps: {
-      killLink: String(file.localOps?.killLink ?? '')
+      killLink: String(file.localOps?.killLink ?? ''),
+      // 凭据文件路径：留空 = ~/.dsh/.credentials.yaml（credentials-local 的默认 path）。
+      // 只有改了 DSH_HOME 的部署才需要显式填。
+      credentialsPath: String(file.localOps?.credentialsPath ?? '')
     },
     // 价目表覆盖项（可选）。留空即用 src/model-prices.js 的官方默认价。
     pricing: file.pricing ?? null,
@@ -802,7 +873,8 @@ function loadConfig() {
         recall: true,
         forget: true,
         getSelfImage: true,
-        killLink: true
+        killLink: true,
+        setLlmKey: true
       },
       wake: {
         defaultMode: 'diving',
@@ -933,6 +1005,7 @@ function loadConfig() {
     forget: true,
     getSelfImage: true,
     killLink: true,
+    setLlmKey: true,
     sendVoice: false,
     ...(cfg.socialV2.tools ?? {})
   };
@@ -3907,8 +3980,23 @@ async function main() {
           req, res, url, sendJson, readBody, log,
           fs, ROOT, path,
           tokenLedger, priceTable,
-          readToolLog, toolLogFile: TOOL_LOG_FILE
+          readToolLog, toolLogFile: TOOL_LOG_FILE,
+          // 人格管理域（src/console/roles.mjs）
+          readRoleState, writeRoleState, sanitizeRoleName, roleSummaries,
+          validateRoleName, validateRoleContent, roleFilePath, readRoleContent, writeRoleContent,
+          roleWarnings, applyRoleInjectLimit, readConfigObject, atomicWriteJson,
+          ROLE_NAME_MAX, ROLE_CONTENT_MAX_BYTES, cfg,
+          getRoleInjectMaxChars: () => roleInjectMaxChars,
+          setRoleInjectMaxChars: (value) => { roleInjectMaxChars = value; }
         };
+        // ── 模型 API Key 自助录入页（GET /llm-key）─────────────────────────────
+        // 纯静态表单：没令牌也能打开看说明，提交时才需要控制台令牌（?token=）。
+        // 只回 HTML，不读 state、不碰凭据文件。
+        if (req.method === 'GET' && url.pathname === '/llm-key') {
+          res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
+          res.end(LLM_KEY_PAGE_HTML);
+          return;
+        }
         if (req.method === 'GET' && url.pathname === '/') {
           res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
           try {
@@ -4017,131 +4105,8 @@ async function main() {
           sendJson({ ok: true, mode: requestedMode, closedAgentPreset: next.closedAgentPreset, dshSynced });
           return;
         }
-        if (req.method === 'POST' && url.pathname === '/api/role') {
-          const body = await readBody();
-          const rs = readRoleState();
-          if (body.role && typeof body.role === 'string') {
-            const name = sanitizeRoleName(body.role);
-            if (!fs.existsSync(path.join(ROOT, 'roles', name + '.md'))) {
-              sendJson({ ok: false, error: `角色「${name}」不存在（roles/${name}.md）` }, 400);
-              return;
-            }
-            writeRoleState(name, rs.mode);
-            log(`控制台：角色已设置为 ${name}`);
-            sendJson({ ok: true, role: name });
-          } else {
-            writeRoleState(null, rs.mode);
-            log('控制台：角色已清除');
-            sendJson({ ok: true, role: null });
-          }
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/role-mode') {
-          const body = await readBody();
-          const rs = readRoleState();
-          const mode = body.mode === 'silent' ? 'silent' : 'active';
-          writeRoleState(rs.role, mode);
-          log(`控制台：静默模式 ${mode === 'silent' ? '开启' : '关闭'}`);
-          sendJson({ ok: true, roleMode: mode });
-          return;
-        }
-        // ── 人格管理 ──────────────────────────────────────────────────────────
-        if (req.method === 'GET' && url.pathname === '/api/roles') {
-          const rs = readRoleState();
-          const summaries = roleSummaries();
-          sendJson({
-            // roles 保持「人格名字符串数组」的既有契约（scripts/test-console.mjs 等调用方依赖它）；
-            // 富信息放在 summaries 里，新老调用方互不影响。
-            roles: summaries.map((role) => role.name),
-            summaries,
-            current: rs.role ?? null,
-            limits: { nameMax: ROLE_NAME_MAX, contentMaxBytes: ROLE_CONTENT_MAX_BYTES, injectMaxChars: roleInjectMaxChars },
-          });
-          return;
-        }
-        if (req.method === 'GET' && url.pathname === '/api/roles/content') {
-          let name;
-          try { name = validateRoleName(url.searchParams.get('name')); } catch (error) { sendJson({ ok: false, error: error.message }, 400); return; }
-          if (!fs.existsSync(roleFilePath(name))) { sendJson({ ok: false, error: `人格「${name}」不存在` }, 404); return; }
-          const content = readRoleContent(name);
-          sendJson({
-            ok: true,
-            name,
-            content,
-            chars: content.length,
-            bytes: Buffer.byteLength(content, 'utf8'),
-            warnings: roleWarnings(content),
-            limits: { injectMaxChars: roleInjectMaxChars },
-            stats: roleCharStats(content),
-            // 每个小节在各模式下是否会被注入，供控制台预览「这条规则到底生不生效」
-            sections: { v1: roleSectionReport(content, 'v1'), v2: roleSectionReport(content, 'v2') },
-          });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/roles/limit') {
-          const body = await readBody();
-          const next = applyRoleInjectLimit(body.maxInjectChars);
-          const configFile = path.join(ROOT, 'config.json');
-          const file = readConfigObject(configFile);
-          file.role = { ...(file.role ?? {}), maxInjectChars: next };
-          atomicWriteJson(configFile, file);
-          cfg.role = { ...(cfg.role ?? {}), maxInjectChars: next };
-          roleInjectMaxChars = next;
-          log(`控制台：人格注入上限已设为 ${next} 字符（下一条消息生效）`);
-          sendJson({ ok: true, maxInjectChars: next, limits: { injectMaxChars: next } });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/roles/create') {
-          const body = await readBody();
-          let name; let content;
-          try { name = validateRoleName(body.name); content = validateRoleContent(body.content); }
-          catch (error) { sendJson({ ok: false, error: error.message }, 400); return; }
-          if (fs.existsSync(roleFilePath(name))) { sendJson({ ok: false, error: `人格「${name}」已存在` }, 400); return; }
-          writeRoleContent(name, content);
-          log(`控制台：创建人格「${name}」（${content.length} 字符）`);
-          sendJson({ ok: true, role: name, warnings: roleWarnings(content) });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/roles/update') {
-          const body = await readBody();
-          let name; let content;
-          try { name = validateRoleName(body.name); content = validateRoleContent(body.content); }
-          catch (error) { sendJson({ ok: false, error: error.message }, 400); return; }
-          if (!fs.existsSync(roleFilePath(name))) { sendJson({ ok: false, error: `人格「${name}」不存在` }, 404); return; }
-          writeRoleContent(name, content);
-          log(`控制台：更新人格「${name}」（${content.length} 字符）`);
-          sendJson({ ok: true, role: name, chars: content.length, warnings: roleWarnings(content) });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/roles/rename') {
-          const body = await readBody();
-          let from; let to;
-          try { from = validateRoleName(body.from); to = validateRoleName(body.to); }
-          catch (error) { sendJson({ ok: false, error: error.message }, 400); return; }
-          if (from === to) { sendJson({ ok: true, role: to, renamed: false }); return; }
-          if (!fs.existsSync(roleFilePath(from))) { sendJson({ ok: false, error: `人格「${from}」不存在` }, 404); return; }
-          if (fs.existsSync(roleFilePath(to))) { sendJson({ ok: false, error: `人格「${to}」已存在` }, 400); return; }
-          fs.renameSync(roleFilePath(from), roleFilePath(to));
-          const rs = readRoleState();
-          const switched = rs.role === from;
-          if (switched) writeRoleState(to, rs.mode);
-          log(`控制台：人格重命名「${from}」→「${to}」${switched ? '（当前启用中，已跟随切换）' : ''}`);
-          sendJson({ ok: true, role: to, renamed: true, currentFollowed: switched });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/roles/delete') {
-          const body = await readBody();
-          let name;
-          try { name = validateRoleName(body.name); } catch (error) { sendJson({ ok: false, error: error.message }, 400); return; }
-          if (!fs.existsSync(roleFilePath(name))) { sendJson({ ok: false, error: `人格「${name}」不存在` }, 404); return; }
-          fs.rmSync(roleFilePath(name));
-          const rs = readRoleState();
-          const cleared = rs.role === name;
-          if (cleared) writeRoleState(null, rs.mode);
-          log(`控制台：删除人格「${name}」${cleared ? '（该人格正在启用，已同时清除当前人格）' : ''}`);
-          sendJson({ ok: true, deleted: name, clearedCurrent: cleared });
-          return;
-        }
+        // ── 人格管理（/api/role、/api/role-mode、/api/roles*）→ src/console/roles.mjs
+        if (await handleRolesRoutes(consoleCtx)) return;
 
         // ── 仿真提示词（一代 / 二代各自的预设内置提示词）──────────────────────
         if (req.method === 'GET' && url.pathname === '/api/preset/sim-prompt') {
@@ -6787,6 +6752,55 @@ async function main() {
           return;
         }
 
+        // ── 模型 API Key 自助录入（POST /api/socialV2/llm-key）────────────────
+        // 起因：主人换上游 key 时要同时改两个名字 —— web profile 读 OPENCODEGO_API_KEY、
+        // desktop profile 读 OPENCODE_GO_API_KEY（差一个下划线）。人工改文件很容易只改一个，
+        // 然后 QQ 侧报 MISSING_CREDENTIAL 而桌面端一切正常，极难查。这里一次写两个键。
+        // 凭据文件路径：config.localOps.credentialsPath（留空 = ~/.dsh/.credentials.yaml）。
+        // 安全：只回 maskLlmKey（前 6 后 3），日志同样只记掩码，不落明文 key。
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/llm-key') {
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('setLlmKey')) {
+            sendJson({ ok: false, error: '工具未启用：qq_set_llm_key' }, 403);
+            return;
+          }
+          const body = await readBody();
+          const norm = normalizeLlmKey(body.key);
+          if (!norm.ok) {
+            sendJson({ ok: false, error: norm.error }, 400);
+            return;
+          }
+          const configured = String(cfg.localOps?.credentialsPath ?? '').trim();
+          const target = configured ? path.resolve(configured) : defaultCredentialsPath();
+          let written;
+          try {
+            written = writeLlmKey(target, norm.key);
+          } catch (err) {
+            log('[llm-key] 写入凭据失败：' + String(err?.message ?? err));
+            sendJson({ ok: false, error: '写入凭据文件失败：' + String(err?.message ?? err) }, 500);
+            return;
+          }
+          // 顺手验一次：200=可用，401/403=无效，其它（网络/端点变更）=未知。
+          // 验证失败**不**回滚 —— key 已经落盘，结论留给调用方判断。
+          let verified = 'skipped';
+          let status = null;
+          if (body.verify !== false) {
+            const verdict = await verifyLlmKey(norm.key);
+            verified = verdict.verdict;
+            status = verdict.status ?? null;
+          }
+          log('[llm-key] 已写入 ' + maskLlmKey(norm.key) + '（' + written.keys.join(' / ') + '），verify=' + verified);
+          sendJson({
+            ok: true,
+            path: written.path,
+            keys: written.keys,
+            updated: written.updated,
+            added: written.added,
+            verified,
+            status,
+            note: '凭据是每次请求重新读取的（credentials-local watch），通常立即生效；若 QQ 侧仍报 MISSING_CREDENTIAL，重启 dsh web 即可。'
+          });
+          return;
+        }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/collect-sticker') {
           if (!stickerEnabled()) { sendJson({ ok: false, error: '表情包体系已关闭' }, 403); return; }
           const body = await readBody();

@@ -280,7 +280,8 @@
   },
   "oneClick": "",
   "localOps": {
-    "killLink": ""
+    "killLink": "",
+    "credentialsPath": ""
   },
   "video": {
     "ffmpeg": "",
