@@ -34,6 +34,8 @@ import { addGoalV2, appendLifeV2, closeGoalV2, formatGoalsLineV2, formatLifeLine
 // 长期记忆（facts）数据层：读写/衰减/归档/查重/注入行（原 bridge.js:10591-11142）
 import { createFactsStore } from './memory-facts.mjs';
 import { checkQuota, countQuota, reserveQuota, rollbackQuota } from './rate-limit.mjs';
+// 控制台「诊断」域路由（Token 用量 / 工具调用日志），原 startConsoleServer 内联代码搬出
+import { handleTelemetryRoutes } from './console/telemetry.mjs';
 // Minecraft 陪伴：轮询 Numen 模组内置 MCP 服务端的游戏内消息（纯 I/O + 队列，不碰会话状态机）
 import { dropMcMessages, flushMcQueue, mcAlive, mcBusyMs, mcQueueSize, mcStatus, peekMcMessages, startMcWatcher } from './mc-companion.js';
 import {
@@ -3899,6 +3901,14 @@ async function main() {
             return;
           }
         }
+        // 控制台分域路由的公共上下文：每请求构造一次，只带上各域真正用到的东西。
+        // 域模块不 import bridge.js（避免循环依赖），依赖一律从这里注入。
+        const consoleCtx = {
+          req, res, url, sendJson, readBody, log,
+          fs, ROOT, path,
+          tokenLedger, priceTable,
+          readToolLog, toolLogFile: TOOL_LOG_FILE
+        };
         if (req.method === 'GET' && url.pathname === '/') {
           res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
           try {
@@ -7177,58 +7187,8 @@ async function main() {
           sendJson({ ok: true, key, tool });
           return;
         }
-        // ── Token 用量 / 花费（控制台专用） ──────────────────────────────────
-        // 路径刻意不放在 /api/socialV2/ 下：那一整个前缀对持有 x-agent-token 的
-        // QQ 侧 AI 是放行的（见上方 agentAllowed 白名单），而跨群花费属于管理信息，
-        // 不应让某个群里的 AI 读到别的群烧了多少钱。这里再显式拒绝一次做双保险。
-        if (url.pathname === '/api/tokens/summary' || url.pathname.startsWith('/api/tokens/')) {
-          if (req.headers['x-agent-token']) { sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return; }
-          if (req.method === 'GET' && url.pathname === '/api/tokens/summary') {
-            const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 200));
-            sendJson({ ...tokenLedger.summary({ limit }), ledger: tokenLedger.stats() });
-            return;
-          }
-          if (req.method === 'GET' && url.pathname === '/api/tokens/series') {
-            const hours = Math.min(24 * 90, Math.max(1, Number(url.searchParams.get('hours')) || 24));
-            const maxBuckets = Math.min(120, Math.max(6, Number(url.searchParams.get('buckets')) || 48));
-            sendJson(tokenLedger.series({ hours, maxBuckets }));
-            return;
-          }
-          if (req.method === 'GET' && url.pathname === '/api/tokens/turns') {
-            const key = String(url.searchParams.get('key') ?? '').trim();
-            const limit = Math.min(1000, Math.max(1, Number(url.searchParams.get('limit')) || 200));
-            const detail = tokenLedger.conversation(key, { turnLimit: limit });
-            if (!detail) { sendJson({ ok: false, error: '未找到该会话的用量记录' }, 404); return; }
-            sendJson(detail);
-            return;
-          }
-          if (req.method === 'GET' && url.pathname === '/api/tokens/recent') {
-            const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 50));
-            sendJson({ ok: true, symbol: priceTable.symbol, entries: tokenLedger.recent(limit) });
-            return;
-          }
-          if (req.method === 'POST' && url.pathname === '/api/tokens/reset') {
-            tokenLedger.reset();
-            log('控制台：token 用量账本已重置');
-            sendJson({ ok: true });
-            return;
-          }
-          sendJson({ ok: false, error: 'not found' }, 404);
-          return;
-        }
-        // ── 工具调用日志 ─────────────────────────────────────────────────────
-        if (req.method === 'GET' && url.pathname === '/api/socialV2/tool-log') {
-          const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 200));
-          sendJson({ ok: true, entries: readToolLog(limit) });
-          return;
-        }
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/tool-log/clear') {
-          if (req.headers['x-agent-token']) { sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return; }
-          try { fs.writeFileSync(TOOL_LOG_FILE, '', 'utf8'); } catch {}
-          log('控制台：工具调用日志已清空');
-          sendJson({ ok: true });
-          return;
-        }
+        // ── 控制台诊断接口（Token 用量 / 花费、工具调用日志）→ src/console/telemetry.mjs ──
+        if (handleTelemetryRoutes(consoleCtx)) return;
         // ── 反馈 / 自己消息 / 消息详情 / 活跃成员 ────────────────────────────
         if (req.method === 'GET' && url.pathname === '/api/socialV2/feedback') {
           sendJson({ ok: true, entries: readFeedbackEntries() });
