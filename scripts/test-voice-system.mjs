@@ -117,20 +117,25 @@ console.log('## 各入口 import 的符号都真实存在');
 
 console.log('## qq-bridge 语音系统：路由与开关');
 {
+  // 2026-11-07：控制台按域切分后，/api/voice/*、/api/socialV2/send-voice|voices 已搬到
+  // src/console/voice.mjs。符号与路由存在性断言扫「桥 + 语音域模块」两处；
+  // 两段切片（操作者通道 / AI 通道）直接取语音域模块，否则切片边界会跨越文件。
   const bridge = read('src/bridge.js');
+  const voiceDomain = read('src/console/voice.mjs');
+  const bridgeSrc = bridge + '\n' + voiceDomain;
   for (const route of ["'/api/voice/send'", "'/api/send/voice'", "'/api/socialV2/send-voice'", "'/api/voice/list'", "'/api/socialV2/voices'"]) {
-    ok(bridge.includes(route), `路由 ${route}`);
+    ok(bridgeSrc.includes(route), `路由 ${route}`);
   }
-  ok(/v2ToolEnabled\('sendVoice'\)/.test(bridge), 'AI 路由受 tools.sendVoice 开关控制');
-  ok(/voiceBudgetCheck/.test(bridge) && /voiceBudgetCommit/.test(bridge), '语音额度：检查与记账分离');
-  ok(/assertOutboundAuditOk/.test(bridge), '语音文件名审计存在');
-  ok(/verifyVoiceMessageSent/.test(bridge), '发送后回读校验存在');
-  ok(/shouldBlockSilentReply\(key\)/.test(bridge), 'AI 语音尊重静默模式');
-  ok(/allowAbsolutePath/.test(bridge), 'AI 绝对路径受配置约束');
+  ok(/v2ToolEnabled\('sendVoice'\)/.test(bridgeSrc), 'AI 路由受 tools.sendVoice 开关控制');
+  ok(/voiceBudgetCheck/.test(bridgeSrc) && /voiceBudgetCommit/.test(bridgeSrc), '语音额度：检查与记账分离');
+  ok(/assertOutboundAuditOk/.test(bridgeSrc), '语音文件名审计存在');
+  ok(/verifyVoiceMessageSent/.test(bridgeSrc), '发送后回读校验存在');
+  ok(/shouldBlockSilentReply\(key\)/.test(bridgeSrc), 'AI 语音尊重静默模式');
+  ok(/allowAbsolutePath/.test(bridgeSrc), 'AI 绝对路径受配置约束');
   // 操作者通道不应被 AI 开关挡住（否则默认关闭时你自己也发不了）
-  const opSection = bridge.slice(bridge.indexOf("url.pathname === '/api/voice/send' || url.pathname === '/api/send/voice'"), bridge.indexOf("'/api/socialV2/send-voice'"));
+  const opSection = voiceDomain.slice(voiceDomain.indexOf("url.pathname === '/api/voice/send' || url.pathname === '/api/send/voice'"), voiceDomain.indexOf("'/api/socialV2/send-voice'"));
   ok(!/if \(!voice\.enabled\)/.test(opSection), '操作者通道不被 voice.enabled 挡住（默认关闭时仍可手动试发）');
-  const agentSection = bridge.slice(bridge.indexOf("url.pathname === '/api/socialV2/send-voice'"), bridge.indexOf("'/api/socialV2/send-sticker'"));
+  const agentSection = voiceDomain.slice(voiceDomain.indexOf("url.pathname === '/api/socialV2/send-voice'"));
   ok(/if \(!voice\.enabled\)/.test(agentSection), 'AI 通道受 voice.enabled 挡住');
 }
 
