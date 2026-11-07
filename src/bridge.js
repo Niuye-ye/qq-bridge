@@ -6718,7 +6718,10 @@ async function main() {
             sendJson({ ok: false, error: '工具未启用：qq_kill_link' }, 403);
             return;
           }
-          const script = String(cfg.localOps?.killLink ?? '').trim();
+          // 必须规范化成 Windows 反斜杠绝对路径：PowerShell 的 `-File` 不认 "C:/dsh/xxx.ps1"
+          // 这种写法（会静默退出、退出码还是 0，看起来像成功却没做任何事）。
+          const rawScript = String(cfg.localOps?.killLink ?? '').trim();
+          const script = rawScript ? path.resolve(rawScript) : '';
           if (!script || !fs.existsSync(script)) {
             sendJson({ ok: false, error: '未配置 localOps.killLink（config.json），或脚本不存在' }, 501);
             return;
@@ -6751,13 +6754,23 @@ async function main() {
             note: '已在后台执行。桥会在 2~3 秒内断线（它自己也要被杀），属正常现象；之后用「一键修复 · 启动」或 一键启动.ps1 拉起来。'
           });
           // 先回包再动手：这个脚本会把当前桥进程杀掉。
-          // detached + unref 保证脚本活过桥的死亡；不能等回调（桥一死回调永远不会来）。
+          // 不能等回调（桥一死回调永远不会来）。
+          // ⚠️ 绝不能用 { detached: true }：本机实测 detached 起的 powershell.exe 会在 70~140ms 内
+          // exit 0、脚本一行都不执行（看着像成功，其实是空转；stdio 换成 pipe / 文件也一样）。
+          // 用普通子进程 + stdio:'ignore'，桥被杀时 Windows 不会连带杀子进程（脚本第 [4/5] 步才杀桥）。
           setTimeout(() => {
+            // 桥的 stdout 常被重定向到不可写/被锁的文件，log() 靠不住；
+            // 派发失败必须留下**同步落盘**的痕迹，否则只会看到「接口说有杀、实际没动」。
+            const tracePath = path.join(ROOT, 'logs', 'local-ops.log');
+            const trace = (m) => { try { fs.appendFileSync(tracePath, `[${new Date().toISOString()}] ${m}\n`); } catch {} };
             try {
-              const child = spawn('powershell.exe', args, { detached: true, stdio: 'ignore', windowsHide: true });
-              child.on('error', (err) => log(`[kill-link] 派发失败：${err?.message ?? err}`));
+              trace(`[kill-link] spawn ${JSON.stringify(args)}`);
+              const child = spawn('powershell.exe', args, { stdio: 'ignore', windowsHide: true });
+              child.on('error', (err) => trace(`[kill-link] spawn error: ${err?.message ?? err}`));
+              child.on('exit', (code, signal) => trace(`[kill-link] exited code=${code} signal=${signal}`));
               child.unref();
             } catch (err) {
+              trace(`[kill-link] throw: ${err?.message ?? err}`);
               log(`[kill-link] 派发失败：${err?.message ?? err}`);
             }
           }, 300).unref?.();
