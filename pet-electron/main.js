@@ -713,6 +713,12 @@ function hideForGood() {
 }
 function openChat() { showPet(); win?.webContents.send('pet:ui', { t: 'chat' }); }
 function openPath(p) { try { shell.openPath(p); } catch (e) { log('openPath 失败', p, e.message); } }
+// shell.openPath 只认本地文件路径，http(s) URL 会失败（2026-11-07：菜单里「打开桥控制台」
+// 因此一直点不开）。凡是打开网页一律走这个。
+function openUrl(u) {
+  try { shell.openExternal(u).catch((e) => log('openUrl 失败', u, e && e.message)); }
+  catch (e) { log('openUrl 失败', u, e.message); }
+}
 
 // 「看一件东西」走内置窗口，不交给系统文件关联（这台机器 .md/.json 默认被 Visual Studio 抢走了）
 let previewWin = null;
@@ -894,6 +900,7 @@ const menu = createMenu({
   get oneClick() { return oneClick; },
   get runOneClick() { return runOneClick; },
   openPath,
+  openUrl,
   BRIDGE,
   bridge,
   APP_LOG,

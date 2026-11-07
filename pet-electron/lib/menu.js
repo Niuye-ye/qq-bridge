@@ -18,7 +18,7 @@ const REQUIRED_DEPS = [
   'todayDiary', 'openPreview', 'FACTS_JSON', 'PLAY_FOCUS', 'PLAY_PRESETS', 'playFor', 'toggleTurbo',
   'clock', 'lastPlayLine', 'levelNow', 'LEVEL_PRESETS', 'setLevel', 'togglePause', 'readPetState',
   'toggleAnim', 'SKINS', 'writePetState', 'send', 'log', 'MOTIONS', 'FACES', 'hideForGood',
-  'showLinkStatus', 'ONECLICK', 'oneClick', 'runOneClick', 'openPath', 'BRIDGE', 'bridge', 'APP_LOG',
+  'showLinkStatus', 'ONECLICK', 'oneClick', 'runOneClick', 'openPath', 'openUrl', 'BRIDGE', 'bridge', 'APP_LOG',
   'onQuit', 'SIZE', 'SIZE_STEP', 'applySize',
 ];
 
@@ -38,7 +38,7 @@ function createMenu(deps) {
       PLAY_FOCUS, PLAY_PRESETS, playFor, toggleTurbo, clock, lastPlayLine, levelNow, LEVEL_PRESETS,
       setLevel, togglePause, readPetState, toggleAnim, SKINS, writePetState, send, log,
       SIZE, SIZE_STEP, applySize, MOTIONS, FACES, hideForGood, showLinkStatus, // applySize 2026-10-27 补回（曾漏传 → 更大/更小必炸）
-      ONECLICK, oneClick, runOneClick, openPath, BRIDGE, bridge, APP_LOG, onQuit,
+      ONECLICK, oneClick, runOneClick, openPath, openUrl, BRIDGE, bridge, APP_LOG, onQuit,
     } = deps;
     return [
       { label: '跟她说句话…', click: () => openChatRef() },
@@ -142,7 +142,8 @@ function createMenu(deps) {
         submenu: [
           { label: '看链路状态', click: showLinkStatus },
           ...(ONECLICK ? [{ label: oneClick.busy ? '一键修复 · 启动（运行中…）' : '一键修复 · 启动', click: runOneClick }] : []),
-          { label: '打开桥控制台', click: () => openPath(`${BRIDGE}/?token=${encodeURIComponent(bridge.token)}`) },
+          { label: '换模型 API Key…', click: () => openUrl(`${BRIDGE}/llm-key?token=${encodeURIComponent(bridge.token)}`) },
+          { label: '打开桥控制台', click: () => openUrl(`${BRIDGE}/?token=${encodeURIComponent(bridge.token)}`) },
           { type: 'separator' },
           { label: '打开桌宠日志', click: () => openPath(APP_LOG) },
         ],
