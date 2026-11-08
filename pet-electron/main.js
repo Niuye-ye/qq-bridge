@@ -828,7 +828,8 @@ async function pollBridge() {
       const mc = await getJson('/api/socialV2/mc-mode');
       if (mc && mc.ok) {
         s.mcMode = mc;
-        s.mcSelf = { minutes: Number(mc.selfPlayMinutes) || 6, selfPlay: mc.selfPlay !== false };
+        // selfPlayMinutes / selfPlay 已随「游戏里她自己过日子」整条删除，桥上不再返回；
+        // 这里原来算出来的 s.mcSelf 没有任何消费方（纯死计算），一并删掉。
       }
     } catch (_) {}
   }
