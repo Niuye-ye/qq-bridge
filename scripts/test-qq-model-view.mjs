@@ -155,6 +155,12 @@ test('MCP validates/forwards read watermarks and wait purposes against an isolat
     await fs.mkdir(path.join(fixture, 'src'));
     await Promise.all(['mcp-snowluma-safe.js', 'qq-model-view.js', 'sensitive.js'].map((name) =>
       fs.copyFile(path.join(ROOT, 'src', name), path.join(fixture, 'src', name))));
+    // 2026-11-08：MCP 入口按工具族拆成 src/mcp/tools/*.mjs，夹具必须整棵搬过去，
+    // 否则子进程 require 失败、stdio 连接被直接关掉（MCP error -32000 Connection closed）。
+    await fs.mkdir(path.join(fixture, 'src', 'mcp', 'tools'), { recursive: true });
+    await fs.copyFile(path.join(ROOT, 'src', 'mcp', 'safe-spawn.mjs'), path.join(fixture, 'src', 'mcp', 'safe-spawn.mjs'));
+    await Promise.all((await fs.readdir(path.join(ROOT, 'src', 'mcp', 'tools'))).map((name) =>
+      fs.copyFile(path.join(ROOT, 'src', 'mcp', 'tools', name), path.join(fixture, 'src', 'mcp', 'tools', name))));
     await fs.writeFile(path.join(fixture, 'config.json'), JSON.stringify({ consolePort: api.address().port }));
     // 2026-10-27：会话令牌已从工具 schema 里摘掉（省 token、免得模型抄错），改由 MCP 侧
     // 按 key 从 state/social-v2.json 的 conversations[key].agentToken 现查。夹具必须把这份

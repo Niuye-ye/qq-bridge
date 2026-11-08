@@ -149,7 +149,7 @@ console.log('## 配置项（AI 发语音默认关闭，等语音库准备好再�
 
 console.log('## MCP 工具与 bridge 路由');
 {
-  const mcp = fs.readFileSync(path.join(ROOT, 'src', 'mcp-snowluma-safe.js'), 'utf8');
+  const mcp = ['src/mcp-snowluma-safe.js', 'src/mcp/tools/basic-tools.mjs', 'src/mcp/tools/chat-tools.mjs', 'src/mcp/tools/social-tools.mjs', 'src/mcp/tools/file-tools.mjs', 'src/mcp/tools/media-tools.mjs', 'src/mcp/tools/ops-tools.mjs'].map((f) => fs.readFileSync(path.join(ROOT, f), 'utf8')).join('\n');
   ok(mcp.includes("'qq_send_voice'"), 'MCP 注册 qq_send_voice');
   ok(mcp.includes("'qq_list_voices'"), 'MCP 注册 qq_list_voices');
   ok(mcp.includes("qq_send_voice: 'sendVoice'"), 'qq_send_voice 受 sendVoice 开关控制');

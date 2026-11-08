@@ -105,7 +105,7 @@ console.log('## 配置文件');
 
 console.log('## 表情单气泡约束');
 {
-  const mcp = fs.readFileSync(path.join(ROOT, 'src', 'mcp-snowluma-safe.js'), 'utf8');
+  const mcp = ['src/mcp-snowluma-safe.js', 'src/mcp/tools/basic-tools.mjs', 'src/mcp/tools/chat-tools.mjs', 'src/mcp/tools/social-tools.mjs', 'src/mcp/tools/file-tools.mjs', 'src/mcp/tools/media-tools.mjs', 'src/mcp/tools/ops-tools.mjs'].map((f) => fs.readFileSync(path.join(ROOT, f), 'utf8')).join('\n');
   const sendStickerBlock = mcp.slice(mcp.indexOf("'qq_send_sticker'"), mcp.indexOf("'qq_sticker_note'"));
   ok(!sendStickerBlock.includes('message: z.string()'), 'qq_send_sticker MCP 不再接受 message 参数');
   ok(sendStickerBlock.includes('不能在同一气泡里附带文字'), 'qq_send_sticker 描述强调单气泡');
@@ -116,7 +116,7 @@ console.log('## 表情单气泡约束');
 
 console.log('## MCP 工具描述存在性');
 {
-  const mcp = fs.readFileSync(path.join(ROOT, 'src', 'mcp-snowluma-safe.js'), 'utf8');
+  const mcp = ['src/mcp-snowluma-safe.js', 'src/mcp/tools/basic-tools.mjs', 'src/mcp/tools/chat-tools.mjs', 'src/mcp/tools/social-tools.mjs', 'src/mcp/tools/file-tools.mjs', 'src/mcp/tools/media-tools.mjs', 'src/mcp/tools/ops-tools.mjs'].map((f) => fs.readFileSync(path.join(ROOT, f), 'utf8')).join('\n');
   for (const name of ['qq_list_stickers', 'qq_get_sticker_image', 'qq_send_sticker', 'qq_sticker_note', 'qq_set_sticker_remark']) {
     ok(mcp.includes(`'${name}'`) || mcp.includes(`"${name}"`), `MCP 工具 ${name} 已注册`);
   }

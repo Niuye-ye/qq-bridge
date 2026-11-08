@@ -5,6 +5,15 @@ import path from 'node:path';
 import vm from 'node:vm';
 import { test } from 'node:test';
 import { z } from 'zod';
+// 2026-11-08：MCP 入口按工具族拆成 src/mcp/tools/*.mjs，vm 里没有 ESM import，
+// 所以直接把真实的注册函数注入沙箱（它们内部只依赖注入的 ctx 与自身 import）。
+import { registerBasicTools } from '../src/mcp/tools/basic-tools.mjs';
+import { registerChatTools } from '../src/mcp/tools/chat-tools.mjs';
+import { registerSocialTools } from '../src/mcp/tools/social-tools.mjs';
+import { registerFileTools } from '../src/mcp/tools/file-tools.mjs';
+import { registerMediaTools } from '../src/mcp/tools/media-tools.mjs';
+import { registerOpsTools } from '../src/mcp/tools/ops-tools.mjs';
+import { mcLog, spawnSafe } from '../src/mcp/safe-spawn.mjs';
 
 /**
  * ESM 源码 → 能塞进 vm.runInNewContext 的脚本。
@@ -136,6 +145,14 @@ function loadSnowlumaTools(fetchImpl, fixtureConfig = null, httpImpl = null) {
     fs: fixtureFs,
     SENSITIVE_RE: { test: () => false },
     serializeModelData: (value) => JSON.stringify(value),
+    registerBasicTools,
+    registerChatTools,
+    registerSocialTools,
+    registerFileTools,
+    registerMediaTools,
+    registerOpsTools,
+    mcLog,
+    spawnSafe,
   });
   return async (name, arguments_ = {}) => {
     const tool = tools.get(name);
