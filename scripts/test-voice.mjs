@@ -222,7 +222,9 @@ console.log('## 控制台契约');
   const html = fs.readFileSync(path.join(ROOT, 'public', 'console.html'), 'utf8');
   const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
   ok(html.includes('data-v2-tool="sendVoice"'), '控制台有 sendVoice 工具开关');
-  ok(bridgeSrc.includes("'sendVoice']"), 'config API 的 toolFlags 含 sendVoice');
+  // config 路由已切到 console 域模块（会话状态域），toolFlags 跟着搬走；两处拼起来查。
+  const configApiSrc = bridgeSrc + fs.readFileSync(path.join(ROOT, 'src', 'console', 'social-state.mjs'), 'utf8');
+  ok(configApiSrc.includes("'sendVoice']"), 'config API 的 toolFlags 含 sendVoice');
   const uniq = (a) => [...new Set(a)].sort();
   const views = uniq([...html.matchAll(/data-view="([a-z0-9-]+)"/g)].map((m) => m[1]));
   const pages = uniq([...html.matchAll(/data-page="([a-z0-9-]+)"/g)].map((m) => m[1]));

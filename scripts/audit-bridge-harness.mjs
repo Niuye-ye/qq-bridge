@@ -37,6 +37,7 @@ import * as consoleDshModel from '../src/console/dsh-model.mjs';
 import * as consoleSlang from '../src/console/slang.mjs';
 import * as consoleMemory from '../src/console/memory.mjs';
 import * as consoleVoice from '../src/console/voice.mjs';
+import * as consoleSocialState from '../src/console/social-state.mjs';
 import * as consoleRoles from '../src/console/roles.mjs';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
@@ -188,7 +189,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...stateStore,
-    ...roleCard, ...mcCompanion, ...rateLimit, ...memoryFacts, ...consoleTelemetry, ...consoleRoles, ...consoleDshModel, ...consoleSlang, ...consoleMemory, ...consoleVoice,
+    ...roleCard, ...mcCompanion, ...rateLimit, ...memoryFacts, ...consoleTelemetry, ...consoleRoles, ...consoleDshModel, ...consoleSlang, ...consoleMemory, ...consoleVoice, ...consoleSocialState,
     // snowluma-conn 会写 config.json / 磁盘上的 token 文件 —— VM 里绝不能真写，桩掉。
     discoverSnowLumaConnection: async () => null,
     persistSnowLumaEndpoint: async () => ({ ok: true, detail: 'stub' }),
