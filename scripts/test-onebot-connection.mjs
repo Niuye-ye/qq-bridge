@@ -4,10 +4,27 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SnowLumaWebSocketClient } from '@snowluma/sdk';
+import { discoverSnowLumaConnection } from '../src/snowluma-conn.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const cfg = JSON.parse(fs.readFileSync(path.resolve(__dirname, '..', 'config.json'), 'utf8'));
-const { wsUrl, accessToken } = cfg.snowluma;
+// SnowLuma 的 WS token 与 HTTP token 是两个不同的值（config.json 里只存 HTTP 那个，
+// 见 bridge.js applyHealedTokens 的注释）。直接拿 cfg 的 token 连 3001 会被拒成 1006，
+// 所以这里按当前登录账号的 onebot_<uin>.json 现发现一次；发现不到才退回配置值。
+let wsUrl = cfg.snowluma.wsUrl;
+let accessToken = cfg.snowluma.accessToken;
+try {
+  const found = await discoverSnowLumaConnection({ cfg });
+  if (found?.ok) {
+    const followEndpoint = cfg.snowluma?.followDiscoveredEndpoint !== false;
+    if (followEndpoint && found.wsUrl) wsUrl = found.wsUrl;
+    if (found.wsToken) accessToken = found.wsToken;
+    else if (followEndpoint && found.token) accessToken = found.token;
+    console.log(`已按当前账号校正：${wsUrl}（token ${accessToken ? accessToken.slice(0, 4) + '…' : '未配置'}）`);
+  }
+} catch (error) {
+  console.log('端点发现失败，继续用配置值：' + (error?.message ?? error));
+}
 
 console.log(`测试连接 ${wsUrl}（token ${accessToken ? '已配置' : '未配置'}）…`);
 

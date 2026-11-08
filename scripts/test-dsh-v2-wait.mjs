@@ -30,12 +30,20 @@ async function main() {
   console.log('SESSION_CREATED', sessionId);
 
   const stream = api.events.mux({});
+  // 开流会先收到一份 snapshot（含 follow 之前的历史事件）。如果 prompt 抢在 follow 生效前发出，
+  // turn/start 只出现在 snapshot 里、live 只收到 turn/end —— collector 找不到回合，这一轮永远等不到收尾
+  // （本测试曾因此稳定 120s 超时）。所以先等 snapshot 到手再 prompt。
+  let markStreamReady;
+  const streamReady = new Promise((resolve) => { markStreamReady = resolve; });
   const collector = createTurnCollector();
   const done = new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('等待回复超时（120s）')), 120_000);
     (async () => {
       for await (const envelope of stream) {
         const frame = envelope.payload;
+        if (frame.type === 'session/snapshot' && frame.sessionId === sessionId) {
+          markStreamReady();
+        }
         if (frame.type === 'session/event' && frame.sessionId === sessionId) {
           const ended = collector.push(frame.event);
           if (ended) {
@@ -54,6 +62,8 @@ async function main() {
   });
 
   stream.follow(sessionId);
+  // 等订阅真正生效（snapshot 到手）；10s 兜底，避免服务端不推 snapshot 时卡死。
+  await Promise.race([streamReady, new Promise((resolve) => setTimeout(resolve, 10_000))]);
   const accepted = unwrap(await api.sessions.prompt({ sessionId, mode: 'queue', content: [{ type: 'text', text: '请只输出你当前可用的工具名列表（JSON 数组），不要调用任何工具，不要发送消息。只输出 JSON。' }] }), 'session.prompt');
   console.log('PROMPT_ACCEPTED', JSON.stringify(accepted).slice(0, 120));
   const ended = await done;
