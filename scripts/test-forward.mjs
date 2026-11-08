@@ -113,14 +113,20 @@ if (fs.existsSync(consoleTokenFile) && fs.existsSync(socialV2File)) {
         // 未带 agent token 应被拒绝（reserved2）
         const resNoToken = await fetch(`${urlBase}?key=${encodeURIComponent(key)}&id=abc`, { headers: authHeaders, signal: AbortSignal.timeout(5000) });
         const bodyNoToken = await resNoToken.json().catch(() => ({}));
-        check('桥接端点：无 agent token 被拒绝', resNoToken.status === 403 && /agent token/.test(bodyNoToken.error || ''), `HTTP ${resNoToken.status} ${bodyNoToken.error || ''}`);
-        // 携带 token 但 id 不在当前会话可见范围，应被拒绝
-        const resUnknown = await fetch(`${urlBase}?key=${encodeURIComponent(key)}&id=not_seen_in_session`, {
-          headers: { ...authHeaders, 'x-agent-token': agentToken },
-          signal: AbortSignal.timeout(5000)
-        });
-        const bodyUnknown = await resUnknown.json().catch(() => ({}));
-        check('桥接端点：未见过的 forward id 被拒绝', resUnknown.status === 404 && /不在当前会话可见范围/.test(bodyUnknown.error || ''), `HTTP ${resUnknown.status} ${bodyUnknown.error || ''}`);
+        // 桥当前不在 reserved2 模式时，模式闸会先返回 403「该接口仅 reserved2 模式可用」，
+        // 这时测不到 forward 的 agent-token / 可见范围逻辑（不是回归），跳过而不是判红。
+        if (resNoToken.status === 403 && /仅 reserved2 模式可用/.test(bodyNoToken.error || '')) {
+          console.log(`⚠️ 跳过桥接端点检查：桥当前模式不是 reserved2（${bodyNoToken.error}）`);
+        } else {
+          check('桥接端点：无 agent token 被拒绝', resNoToken.status === 403 && /agent token/.test(bodyNoToken.error || ''), `HTTP ${resNoToken.status} ${bodyNoToken.error || ''}`);
+          // 携带 token 但 id 不在当前会话可见范围，应被拒绝
+          const resUnknown = await fetch(`${urlBase}?key=${encodeURIComponent(key)}&id=not_seen_in_session`, {
+            headers: { ...authHeaders, 'x-agent-token': agentToken },
+            signal: AbortSignal.timeout(5000)
+          });
+          const bodyUnknown = await resUnknown.json().catch(() => ({}));
+          check('桥接端点：未见过的 forward id 被拒绝', resUnknown.status === 404 && /不在当前会话可见范围/.test(bodyUnknown.error || ''), `HTTP ${resUnknown.status} ${bodyUnknown.error || ''}`);
+        }
       } else {
         console.log('⚠️ 跳过桥接端点检查：没有可用 agentToken');
       }
