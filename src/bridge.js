@@ -118,6 +118,7 @@ import { handleStickerRoutes } from './console/stickers.mjs';
 import { handleInboxRoutes } from './console/inbox.mjs';
 import { handleSendRoutes } from './console/send.mjs';
 import { handleHistoryRoutes } from './console/history.mjs';
+import { handleToolsRoutes } from './console/tools.mjs';
 // Minecraft 陪伴：轮询 Numen 模组内置 MCP 服务端的游戏内消息（纯 I/O + 队列，不碰会话状态机）
 import { dropMcMessages, flushMcQueue, mcAlive, mcBusyMs, mcQueueSize, mcStatus, peekMcMessages, startMcWatcher } from './mc-companion.js';
 import {
@@ -4075,6 +4076,9 @@ async function main() {
           sendStickerV2, pickStickerByQuery,
           // 查询历史域（src/console/history.mjs）
           resolveReplyInfo, fetchMediaData, findMessageMedia, seenForwardIds,
+          // AI 工具域（src/console/tools.mjs）
+          writeActivityV2, formatActivityLineV2, addGoalV2, closeGoalV2, appendLifeV2, formatGoalsLineV2, readGoalsV2, readLifeV2,
+          addFactV2, removeFactV2, readFactsV2, readForgottenFactsV2, searchFactsV2, formatFactsLineV2,
         };
         // ── 模型 API Key 自助录入页（GET /llm-key）─────────────────────────────
         // 纯静态表单：没令牌也能打开看说明，提交时才需要控制台令牌（?token=）。
@@ -4888,202 +4892,8 @@ async function main() {
           return;
         }
 
-        // ── 「我现在在干嘛」：AI 自己记活动状态，定时自醒时能续上 ────────────────
-        // 不带 doing/note/plan 就是读；带了就是写（只写传了的字段）。
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/now') {
-          const body = await readBody();
-          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
-          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          if (!token) { sendJson({ ok: false, error: 'reserved2 模式必须携带 agent token' }, 403); return; }
-          const hasWrite = ['doing', 'note', 'plan'].some((k) => body[k] !== undefined);
-          if (hasWrite) {
-            const next = writeActivityV2({ doing: body.doing, note: body.note, plan: body.plan });
-            log(`[activity] 记为「${next.doing || '空'}」`);
-            sendJson({ ok: true, activity: next, line: formatActivityLineV2() });
-          } else {
-            sendJson({ ok: true, activity: readActivityV2(), line: formatActivityLineV2() });
-          }
-          return;
-        }
-
-        // ── 想干的事（goals）+ 生活时间线（life）─────────────────────────────
-        // action: add(text,want) / list / done(id|text) / drop(id|text) / life(text)
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/goals') {
-          const body = await readBody();
-          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
-          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          if (!token) { sendJson({ ok: false, error: 'reserved2 模式必须携带 agent token' }, 403); return; }
-          const action = String(body.action ?? (body.text ? 'add' : 'list')).trim();
-          if (action === 'add') {
-            const g = addGoalV2(body.text, { want: body.want });
-            if (!g) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
-            log(`[goals] 记下想做的事：${g.text}`);
-            sendJson({ ok: true, goal: g, open: readGoalsV2().filter((x) => x.status === 'open').length });
-            return;
-          }
-          if (action === 'done' || action === 'drop') {
-            const n = closeGoalV2(body.id ?? body.remove ?? body.text, action === 'done' ? 'done' : 'dropped');
-            sendJson({ ok: true, changed: n, open: readGoalsV2().filter((x) => x.status === 'open').length });
-            return;
-          }
-          if (action === 'life') {
-            const e = appendLifeV2(body.text);
-            if (!e) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
-            sendJson({ ok: true, entry: e });
-            return;
-          }
-          sendJson({ ok: true, goals: readGoalsV2(), line: formatGoalsLineV2(), life: readLifeV2().slice(-10) });
-          return;
-        }
-
-        // ── 长期记忆（facts）：会淡忘的「记得的事」─────────────────────────────
-        // action: add（带 text）/ remove（带 remove 或 id）/ list（可带 query）
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/facts') {
-          const body = await readBody();
-          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
-          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          if (!token) { sendJson({ ok: false, error: 'reserved2 模式必须携带 agent token' }, 403); return; }
-          const action = String(body.action ?? (body.remove !== undefined ? 'remove' : body.text ? 'add' : 'list')).trim();
-          if (action === 'add') {
-            const entry = addFactV2(body.text, { kind: body.kind, tier: body.tier, expiresAt: body.expiresAt });
-            log(`[facts] 记下：${entry.text.slice(0, 40)}（${entry.tier}/${entry.kind}）`);
-            sendJson({ ok: true, entry, total: readFactsV2().length });
-            return;
-          }
-          if (action === 'remove') {
-            const res = removeFactV2(body.remove ?? body.id ?? body.text);
-            sendJson({ ok: true, ...res, total: readFactsV2().length, forgotten: readForgottenFactsV2().length });
-            return;
-          }
-          sendJson({
-            ok: true,
-            facts: searchFactsV2(body.query, body.limit, body.includeForgotten !== false),
-            total: readFactsV2().length,
-            forgotten: readForgottenFactsV2().length,
-            line: formatFactsLineV2(),
-          });
-          return;
-        }
-
-        // ── 根除链路进程（qq_kill_link）──────────────────────────────────────
-        // 桌宠「一键修复 · 启动」的反面：先把整条链路杀干净，再让主人一键启动。
-        // 脚本路径来自 config.localOps.killLink（config.json 不入库，可写本机盘符）；
-        // 桥代码里不许写死路径，别人部署时留空即可（本接口会返回 501）。
-        // 默认不碰 QQ 本体与 MuMu 模拟器 —— 那两个要显式 includeQQ / includeMuMu。
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/kill-link') {
-          const body = await readBody();
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('killLink')) {
-            sendJson({ ok: false, error: '工具未启用：qq_kill_link' }, 403);
-            return;
-          }
-          // 必须规范化成 Windows 反斜杠绝对路径：PowerShell 的 `-File` 不认 "C:/dsh/xxx.ps1"
-          // 这种写法（会静默退出、退出码还是 0，看起来像成功却没做任何事）。
-          const rawScript = String(cfg.localOps?.killLink ?? '').trim();
-          const script = rawScript ? path.resolve(rawScript) : '';
-          if (!script || !fs.existsSync(script)) {
-            sendJson({ ok: false, error: '未配置 localOps.killLink（config.json），或脚本不存在' }, 501);
-            return;
-          }
-          const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script];
-          if (body.includeQQ === true) args.push('-IncludeQQ');
-          if (body.includeMuMu === true) args.push('-IncludeMuMu');
-          if (body.dryRun === true) {
-            // 干跑：同步跑一次把清单原样回给模型。
-            // PowerShell 5.1 默认按控制台代码页（本机 936/GBK）往管道写，Node 按 UTF-8 读会全是乱码，
-            // 所以先把 [Console]::OutputEncoding 设成 UTF8 再执行脚本。
-            const flags = [];
-            if (body.includeQQ === true) flags.push('-IncludeQQ');
-            if (body.includeMuMu === true) flags.push('-IncludeMuMu');
-            const quoted = script.replace(/'/g, "''");
-            const command = `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; & '${quoted}' -DryRun ${flags.join(' ')}`;
-            const out = await new Promise((resolve) => {
-              execFile('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], { windowsHide: true, timeout: 120000, maxBuffer: 2 * 1024 * 1024 }, (err, stdout, stderr) => {
-                resolve(`${stdout ?? ''}${stderr ?? ''}${err ? `\n[exit] ${err.message}` : ''}`.trim());
-              });
-            });
-            log('[kill-link] 干跑预览（未杀任何进程）');
-            sendJson({ ok: true, dryRun: true, output: out });
-            return;
-          }
-          log(`[kill-link] 根除链路进程（includeQQ=${body.includeQQ === true} includeMuMu=${body.includeMuMu === true}）`);
-          sendJson({
-            ok: true,
-            dispatched: true,
-            note: '已在后台执行。桥会在 2~3 秒内断线（它自己也要被杀），属正常现象；之后用「一键修复 · 启动」或 一键启动.ps1 拉起来。'
-          });
-          // 先回包再动手：这个脚本会把当前桥进程杀掉。
-          // 不能等回调（桥一死回调永远不会来）。
-          // ⚠️ 绝不能用 { detached: true }：本机实测 detached 起的 powershell.exe 会在 70~140ms 内
-          // exit 0、脚本一行都不执行（看着像成功，其实是空转；stdio 换成 pipe / 文件也一样）。
-          // 用普通子进程 + stdio:'ignore'，桥被杀时 Windows 不会连带杀子进程（脚本第 [4/5] 步才杀桥）。
-          setTimeout(() => {
-            // 桥的 stdout 常被重定向到不可写/被锁的文件，log() 靠不住；
-            // 派发失败必须留下**同步落盘**的痕迹，否则只会看到「接口说有杀、实际没动」。
-            const tracePath = path.join(ROOT, 'logs', 'local-ops.log');
-            const trace = (m) => { try { fs.appendFileSync(tracePath, `[${new Date().toISOString()}] ${m}\n`); } catch {} };
-            try {
-              trace(`[kill-link] spawn ${JSON.stringify(args)}`);
-              const child = spawn('powershell.exe', args, { stdio: 'ignore', windowsHide: true });
-              child.on('error', (err) => trace(`[kill-link] spawn error: ${err?.message ?? err}`));
-              child.on('exit', (code, signal) => trace(`[kill-link] exited code=${code} signal=${signal}`));
-              child.unref();
-            } catch (err) {
-              trace(`[kill-link] throw: ${err?.message ?? err}`);
-              log(`[kill-link] 派发失败：${err?.message ?? err}`);
-            }
-          }, 300).unref?.();
-          return;
-        }
-
-        // ── 模型 API Key 自助录入（POST /api/socialV2/llm-key）────────────────
-        // 起因：主人换上游 key 时要同时改两个名字 —— web profile 读 OPENCODEGO_API_KEY、
-        // desktop profile 读 OPENCODE_GO_API_KEY（差一个下划线）。人工改文件很容易只改一个，
-        // 然后 QQ 侧报 MISSING_CREDENTIAL 而桌面端一切正常，极难查。这里一次写两个键。
-        // 凭据文件路径：config.localOps.credentialsPath（留空 = ~/.dsh/.credentials.yaml）。
-        // 安全：只回 maskLlmKey（前 6 后 3），日志同样只记掩码，不落明文 key。
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/llm-key') {
-          if (req.headers['x-agent-token'] && !v2ToolEnabled('setLlmKey')) {
-            sendJson({ ok: false, error: '工具未启用：qq_set_llm_key' }, 403);
-            return;
-          }
-          const body = await readBody();
-          const norm = normalizeLlmKey(body.key);
-          if (!norm.ok) {
-            sendJson({ ok: false, error: norm.error }, 400);
-            return;
-          }
-          const configured = String(cfg.localOps?.credentialsPath ?? '').trim();
-          const target = configured ? path.resolve(configured) : defaultCredentialsPath();
-          let written;
-          try {
-            written = writeLlmKey(target, norm.key);
-          } catch (err) {
-            log('[llm-key] 写入凭据失败：' + String(err?.message ?? err));
-            sendJson({ ok: false, error: '写入凭据文件失败：' + String(err?.message ?? err) }, 500);
-            return;
-          }
-          // 顺手验一次：200=可用，401/403=无效，其它（网络/端点变更）=未知。
-          // 验证失败**不**回滚 —— key 已经落盘，结论留给调用方判断。
-          let verified = 'skipped';
-          let status = null;
-          if (body.verify !== false) {
-            const verdict = await verifyLlmKey(norm.key);
-            verified = verdict.verdict;
-            status = verdict.status ?? null;
-          }
-          log('[llm-key] 已写入 ' + maskLlmKey(norm.key) + '（' + written.keys.join(' / ') + '），verify=' + verified);
-          sendJson({
-            ok: true,
-            path: written.path,
-            keys: written.keys,
-            updated: written.updated,
-            added: written.added,
-            verified,
-            status,
-            note: '凭据是每次请求重新读取的（credentials-local watch），通常立即生效；若 QQ 侧仍报 MISSING_CREDENTIAL，重启 dsh web 即可。'
-          });
-          return;
-        }
+        // ── AI 工具域（now / goals / facts / kill-link / llm-key） ──────────────
+        if (await handleToolsRoutes(consoleCtx)) return;
         // 表情包域（续）：收藏 / 列表 / 管理端接口（同属 src/console/stickers.mjs）
         if (await handleStickerRoutes(consoleCtx)) return;
         if (await handleVoiceRoutes(consoleCtx)) return;
