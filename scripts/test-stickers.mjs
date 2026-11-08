@@ -124,12 +124,14 @@ console.log('## MCP 工具描述存在性');
 
 console.log('## bridge 路由/函数存在性');
 {
-  // 2026-11-07：控制台按域切分后，表情包 10 条路由已搬到 src/console/stickers.mjs
-  // （bridge.js 只留 if (await handleStickerRoutes(consoleCtx)) return;）。源码断言改成扫合并源，
+  // 2026-11-07/08：控制台按域切分后，表情包 10 条路由已搬到 src/console/stickers.mjs，
+  // send-sticker 又在 2026-11-08 随「发送域」搬到 src/console/send.mjs
+  // （bridge.js 只留 if (await handleStickerRoutes/ handleSendRoutes) return;）。源码断言改成扫合并源，
   // 否则路由搬走就等于不再测。
   const bridge = [
     fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8'),
-    fs.readFileSync(path.join(ROOT, 'src', 'console', 'stickers.mjs'), 'utf8')
+    fs.readFileSync(path.join(ROOT, 'src', 'console', 'stickers.mjs'), 'utf8'),
+    fs.readFileSync(path.join(ROOT, 'src', 'console', 'send.mjs'), 'utf8')
   ].join('\n');
   for (const s of ['/api/socialV2/sticker-list', '/api/socialV2/sticker-image', '/api/socialV2/sticker-note', '/api/socialV2/send-sticker', '/api/socialV2/sticker-remark', '/api/stickers', 'syncStickerLibrary', 'sendStickerV2']) {
     ok(bridge.includes(s), `bridge 包含 ${s}`);
