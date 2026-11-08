@@ -43,6 +43,7 @@ import * as consoleInbox from '../src/console/inbox.mjs';
 import * as consoleSend from '../src/console/send.mjs';
 import * as consoleHistory from '../src/console/history.mjs';
 import * as consoleTools from '../src/console/tools.mjs';
+import * as consoleAdmin from '../src/console/admin.mjs';
 import * as consoleRoles from '../src/console/roles.mjs';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
@@ -194,7 +195,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...stateStore,
-    ...roleCard, ...mcCompanion, ...rateLimit, ...memoryFacts, ...consoleTelemetry, ...consoleRoles, ...consoleDshModel, ...consoleSlang, ...consoleMemory, ...consoleVoice, ...consoleSocialState, ...consoleStickers, ...consoleInbox, ...consoleSend, ...consoleHistory, ...consoleTools,
+    ...roleCard, ...mcCompanion, ...rateLimit, ...memoryFacts, ...consoleTelemetry, ...consoleRoles, ...consoleDshModel, ...consoleSlang, ...consoleMemory, ...consoleVoice, ...consoleSocialState, ...consoleStickers, ...consoleInbox, ...consoleSend, ...consoleHistory, ...consoleTools, ...consoleAdmin,
     // snowluma-conn 会写 config.json / 磁盘上的 token 文件 —— VM 里绝不能真写，桩掉。
     discoverSnowLumaConnection: async () => null,
     persistSnowLumaEndpoint: async () => ({ ok: true, detail: 'stub' }),

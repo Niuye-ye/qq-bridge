@@ -16,6 +16,9 @@ const ok = (cond, name, extra = '') => {
   else { fail += 1; console.error(`  ❌ ${name}${extra ? ' — ' + extra : ''}`); }
 };
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
+// 控制台路由 2026-11-08 起按域搬进 src/console/*.mjs；结构断言要扫「桥 + 路由模块」合并源
+const adminSrc = fs.readFileSync(path.join(ROOT, 'src', 'console', 'admin.mjs'), 'utf8');
+const bridgeSrc = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
 const exists = (rel) => fs.existsSync(path.join(ROOT, rel));
 // 工具不在本仓库里时这两个返回 null —— 调用方必须先 hasVoiceTool() 守一道，
 // 免得"文件不存在"被误当成断言失败（那是跳过，不是失败）。
@@ -147,7 +150,7 @@ console.log('## qq-bridge 语音系统：MCP 工具与开关映射');
   ok(/qq_send_voice: 'sendVoice'/.test(mcp) && /qq_list_voices: 'sendVoice'/.test(mcp), '两个工具都受 sendVoice 开关控制');
   ok(/voice\?\.enabled !== false/.test(mcp), '注册期也检查 voice.enabled（关闭时不注册，省 token）');
   const bridge = read('src/bridge.js');
-  ok(/sendVoice: 'qq_send_voice \/ qq_list_voices'/.test(bridge), 'qq_get_prompt 的 toolMap 含语音工具');
+  ok(/sendVoice: 'qq_send_voice \/ qq_list_voices'/.test(bridgeSrc + '\n' + adminSrc), 'qq_get_prompt 的 toolMap 含语音工具');
   // config 路由已切到 console 域模块（会话状态域），toolFlags 跟着搬走；两处拼起来查，别只盯 bridge.js。
   ok(/'sendVoice'\]/.test(bridge + read('src/console/social-state.mjs')), 'config API 的 toolFlags 含 sendVoice');
   const ex = JSON.parse(read('config.example.json'));

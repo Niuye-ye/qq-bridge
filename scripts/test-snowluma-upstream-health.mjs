@@ -24,6 +24,8 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const bridge = fs.readFileSync(path.join(ROOT, 'src', 'bridge.js'), 'utf8');
+// status 路由 2026-11-08 搬进 src/console/admin.mjs，源码断言要扫合并源
+const adminSrc = fs.readFileSync(path.join(ROOT, 'src', 'console', 'admin.mjs'), 'utf8');
 const consoleHtml = fs.readFileSync(path.join(ROOT, 'public', 'console.html'), 'utf8');
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
 const example = JSON.parse(fs.readFileSync(path.join(ROOT, 'config.example.json'), 'utf8'));
@@ -35,7 +37,8 @@ const codeOf = (src) => src
   // 二十多万字符的代码，让本文件的断言对着"不存在的源码"误报。
   .split(/\r?\n/).map((l) => l.replace(/\/\/.*$/, '')).join('\n')
   .replace(/\/\*[\s\S]*?\*\//g, '');
-const bridgeCode = codeOf(bridge);
+const bridgeCode = codeOf(bridge) + '\n' + codeOf(adminSrc);
+const statusCode = codeOf(adminSrc);
 
 test('SnowLuma 客户端库不低于 bot_status 出现的版本（1.14.17）', () => {
   // 低于这个版本订阅不到 bot_status：账号掉线/被顶号将没有任何信号。
@@ -150,7 +153,7 @@ test('静默检测不得声称能判断 hook 死活（心跳是本地生成的�
 });
 
 test('/api/status 暴露 snowluma 健康快照，且只给操作者', () => {
-  assert.match(bridgeCode, /snowluma: snowlumaHealthSnapshot\(\)/, '/api/status 必须带 snowluma 字段');
+  assert.match(statusCode, /snowluma: snowlumaHealthSnapshot\(\)/, '/api/status 必须带 snowluma 字段');
   // 智能体视图（带 x-agent-token 的那支）不得包含它
   const agentBranch = bridgeCode.slice(
     bridgeCode.indexOf("req.headers['x-agent-token'] || req.headers['x-agent-call'] !== undefined"),
