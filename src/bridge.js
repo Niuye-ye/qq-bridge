@@ -2544,7 +2544,11 @@ async function main() {
     const cleanRemark = String(remark ?? '').trim().slice(0, 50);
     const response = await bot.request('modify_custom_face', { emoji_id: entry.id, desc: cleanRemark });
     if (!response || response.status !== 'ok' || response.retcode !== 0) {
-      throw new Error(`modify_custom_face 失败: ${response?.wording || response?.retcode || 'unknown'}`);
+      const why = String(response?.wording || response?.message || response?.retcode || 'unknown');
+      if (/不支持|unsupported/i.test(why)) {
+        throw new Error('当前 QQ 网关不支持改收藏表情的官方备注（NapCat 没有 modify_custom_face 接口）；本地备注请用 qq_sticker_note');
+      }
+      throw new Error(`modify_custom_face 失败: ${why}`);
     }
     const updated = applyStickerNote(stickerEntries, entry.id, {});
     // 直接改 desc（保留本地认知）
@@ -2557,6 +2561,30 @@ async function main() {
     return stickerEntries.find((e) => e.id === entry.id) || null;
   }
 
+  // 收藏表情（add_custom_face）的两种网关差异：
+  //   SnowLuma 收 base64://（不吃本地路径也没关系），NapCat 只收本地文件路径
+  //   （它 add_custom_face 的实现是 fs.stat(file)，传 base64:// 会 ENOENT）。
+  // 先按 base64 试一次；网关明确报"没有这个文件/不支持"时落个临时文件重试，最后清掉。
+  async function addCustomFaceV2(buffer) {
+    const first = await bot.request('add_custom_face', { file: 'base64://' + buffer.toString('base64') });
+    if (first && first.status === 'ok' && first.retcode === 0) return first;
+    const why = String(first?.wording || first?.message || '');
+    if (!/ENOENT|no such file|stat|不支持|unsupported|invalid (file|path)/i.test(why)) return first;
+    const ext = buffer[0] === 0xff && buffer[1] === 0xd8 ? '.jpg' : buffer[0] === 0x47 && buffer[1] === 0x49 ? '.gif' : '.png';
+    // 落盘位置必须两边都能看见：桥跑在 Termux，QQ 跑在 proot 里。
+    // 用 state/tmp（= <repo>/state/tmp），手机侧 start-nap.sh 把 $HOME 同时绑到
+    // /hosthome 和 /data/data/com.termux/files/home，所以这个绝对路径在 proot 里同样成立。
+    const dir = path.join(STATE_DIR, 'tmp');
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = path.join(dir, 'sticker-' + Date.now().toString(36) + ext);
+    try {
+      await fs.promises.writeFile(tmp, buffer);
+      return await bot.request('add_custom_face', { file: tmp });
+    } finally {
+      fs.promises.rm(tmp, { force: true }).catch(() => {});
+    }
+  }
+
   // 收藏聊天里的一张表情（add_custom_face），并按 AI 看到的含义写简短备注（modify_custom_face）。
   async function collectStickerV2(key, messageRef, remark) {
     const assertSendAllowed = captureSendGuard(key);
@@ -2567,40 +2595,52 @@ async function main() {
     const mediaList = Array.isArray(found.media) ? found.media : [];
     if (!mediaList.length) throw new Error('这条消息没有可收藏的图片/表情');
     const media = mediaList[0];
-    let file = '';
+    let buffer = null;
     if (media?.kind === 'image') {
-      // 优先取图片字节转 base64，避免 SnowLuma 直接下载聊天图片 URL 失败（带签名/防盗链）。
+      // 优先取图片字节，避免网关直接下载聊天图片 URL 失败（带签名/防盗链）。
       // 严禁把消息里的原始 media.url / media.file 直接交给 OneBot 去下载：那会绕过 SSRF/本地文件防护。
       const img = await fetchOneBotImage(media);
-      if (img?.buffer) {
-        file = 'base64://' + img.buffer.toString('base64');
-      } else {
-        throw new Error('无法安全获取该图片字节，已拒绝收藏');
-      }
+      if (!img?.buffer) throw new Error('无法安全获取该图片字节，已拒绝收藏');
+      buffer = img.buffer;
     } else if (media?.kind === 'face') {
       const face = await fetchFaceMedia(media);
-      if (face?.buffer) file = 'base64://' + face.buffer.toString('base64');
+      if (face?.buffer) buffer = face.buffer;
     }
-    if (!file) throw new Error('无法获取该表情的图片源');
+    if (!buffer) {
+      if (media?.kind === 'face') {
+        throw new Error('这条是系统小表情：当前网关（NapCat）没有 fetch_face_entity，拿不到它的图片，收藏不了。收藏别人发的自定义表情或图片才行。');
+      }
+      throw new Error('无法获取该表情的图片源');
+    }
     assertSendAllowed();
-    const addRes = await bot.request('add_custom_face', { file });
+    // SnowLuma 的 add_custom_face 会回 emoji_id；NapCat 只回 {result:0}，所以先记下收藏前的 id 集合，
+    // 加完再刷一次库，用差集反推刚加进去的那个（"收藏成功但不知道 id" 会让后面发这条表情直接失败）。
+    const beforeIds = new Set((Array.isArray(stickerEntries) ? stickerEntries : []).map((e) => String(e.id || '')));
+    const addRes = await addCustomFaceV2(buffer);
     if (!addRes || addRes.status !== 'ok' || addRes.retcode !== 0) {
       throw new Error(`add_custom_face 失败: ${addRes?.wording || addRes?.retcode || 'unknown'}`);
     }
-    const emojiId = String(addRes.data?.emoji_id || '');
-    if (!emojiId) throw new Error('add_custom_face 未返回 emoji_id');
+    // 强制刷新本地库，让刚收藏的表情立即可用。
+    const synced = await syncStickerLibrary(true);
+    const syncedEntries = synced?.entries ?? stickerEntries;
+    let emojiId = String(addRes.data?.emoji_id || '');
+    if (!emojiId) {
+      const fresh = (Array.isArray(syncedEntries) ? syncedEntries : []).filter((e) => e && e.id && !beforeIds.has(String(e.id)));
+      if (fresh.length === 1) emojiId = String(fresh[0].id);
+      else if (fresh.length > 1) emojiId = String(fresh[fresh.length - 1].id);
+    }
+    if (!emojiId) throw new Error('收藏表情失败：网关没回 emoji_id，刷新收藏库也没看到新的一条（可能被 QQ 端吞了）');
     const maxRemarkChars = Math.max(1, Number(cfg.socialV2?.sticker?.collect?.maxRemarkChars) || 20);
     const cleanRemark = String(remark ?? '').trim().slice(0, maxRemarkChars);
     if (cleanRemark) {
       assertSendAllowed();
       const modRes = await bot.request('modify_custom_face', { emoji_id: emojiId, desc: cleanRemark });
       if (!modRes || modRes.status !== 'ok' || modRes.retcode !== 0) {
-        log(`[sticker] 收藏成功但备注失败 ${emojiId}: ${modRes?.wording || modRes?.retcode || 'unknown'}`);
+        const why = String(modRes?.wording || modRes?.message || modRes?.retcode || 'unknown');
+        log(`[sticker] 收藏成功但QQ侧备注失败 ${emojiId}: ${why}${/不支持|unsupported/i.test(why) ? '（当前网关没有 modify_custom_face，NapCat 就是这样；本地备注改用 qq_sticker_note）' : ''}`);
       }
     }
-    // 强制刷新本地库，让刚收藏的表情立即可用。
-    const synced = await syncStickerLibrary(true);
-    const entry = findSticker(synced?.entries ?? stickerEntries, emojiId);
+    const entry = findSticker(syncedEntries, emojiId);
     return { emojiId, entry: entry || null, remark: cleanRemark };
   }
 
@@ -5005,11 +5045,15 @@ async function main() {
     return null;
   }
 
+  let faceEntityUnsupported = false;
+
   async function fetchFaceMedia(media) {
     const faceId = Number(media.faceId);
     // 系统小表情（face 段）：只有数字 id 才有对应实体；拿不到时至少保留 summary 文案。
     const fallbackText = media.summary ? `[表情:${media.summary}]` : `[表情#${media.faceId}]`;
     if (!Number.isInteger(faceId)) return { text: fallbackText };
+    // NapCat 没有 fetch_face_entity：探到一次不支持就别每条表情都去撞一遍（会刷日志）。
+    if (faceEntityUnsupported) return { text: fallbackText };
     try {
       const face = await bot.fetchFaceEntity(faceId);
       if (face && typeof face === 'object') {
@@ -5026,7 +5070,13 @@ async function main() {
         return { text: desc ? `[表情:${desc}]` : fallbackText };
       }
     } catch (error) {
-      log(`fetchFaceEntity 失败: ${error?.message ?? error}`);
+      const why = String(error?.message ?? error);
+      if (/不支持|unsupported/i.test(why)) {
+        faceEntityUnsupported = true;
+        log('[media] 当前网关没有 fetch_face_entity（NapCat 就是这样）：系统表情只保留文字标记，不再逐条重试');
+      } else {
+        log(`fetchFaceEntity 失败: ${why}`);
+      }
     }
     return { text: fallbackText };
   }

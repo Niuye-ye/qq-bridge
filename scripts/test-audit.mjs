@@ -70,13 +70,16 @@ const tests = [
 let failed = 0;
 for (const test of tests) {
   console.log(`\nRunning ${test}`);
+  // 单测 180s：test-preset-local-tools 里有一条要起一次 dsh 收集真实工具名，
+  // 机器慢的时候要 60~70s（2026-11-09 实测 69s），原来 60s 会 ETIMEDOUT 被误判成失败。
   const result = spawnSync(process.execPath, [path.join(root, 'scripts', test)], {
-    cwd: root, stdio: 'inherit', timeout: 60000,
+    cwd: root, stdio: 'inherit', timeout: 180000,
     env: { ...process.env, QQ_BRIDGE_TEST_LIVE: '0' },
   });
   if (result.status !== 0 || result.error) {
     failed++;
-    console.error(`FAILED ${test}: ${result.error?.message || `exit ${result.status}`}`);
+    const why = result.error?.message || `exit ${result.status}`;
+    console.error(`FAILED ${test}: ${why}${result.signal ? ` (signal ${result.signal})` : ''}`);
   }
 }
 console.log(`\nAudit suite: ${tests.length - failed}/${tests.length} scripts passed.`);
