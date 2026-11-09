@@ -41,7 +41,7 @@ export async function handleSendRoutes(ctx) {
     computeGapsV2, sendMessagesV2, recordSentMessagesV2, scheduleReplyCheckV2,
     findCjkSpaceWarning, findSplitBoundaryWarning, resolveReplyTargetV2,
     captureSendGuard, assertGroupMember,
-    captureDeviceScreenshotV2, resolveImageSourcePath, sendImageV2,
+    captureDeviceScreenshotV2, shrinkScreenshotV2, resolveImageSourcePath, sendImageV2,
     stickerEnabled, syncStickerLibrary, pickStickerByQuery, getStickerEntries, sendStickerV2
   } = ctx;
 
@@ -463,8 +463,13 @@ export async function handleSendRoutes(ctx) {
         buffer = fetched.buffer;
         sourceLabel = String(rawUrl).slice(0, 120);
       } else if (wantShot) {
-        buffer = await captureDeviceScreenshotV2();
-        sourceLabel = '模拟器截图';
+        const shot = await captureDeviceScreenshotV2();
+        // 手机上原图 1220x2712 / 1.2~3MB，发 QQ 前缩到 1080 宽 JPEG（约 200~400KB）：
+        // 字仍看得清，少传几 MB 流量；缩图失败会原样返回 PNG。
+        const shown = await shrinkScreenshotV2(shot, { width: 1080, qscale: 4, force: true });
+        buffer = shown.buffer || shot;
+        sourceLabel = (process.platform === 'android' ? '手机截图' : '模拟器截图')
+          + (buffer.length < shot.length ? `（已压缩 ${formatBytes(shot.length)} → ${formatBytes(buffer.length)}）` : '');
       }
     } catch (error) {
       sendJson({ ok: false, error: `图片读取失败：${error?.message ?? error}` }, 400);

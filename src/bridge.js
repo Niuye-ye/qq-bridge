@@ -2429,13 +2429,18 @@ async function main() {
   // 走 /api/socialV2/screen → qq_see_screen 时会整块塞进模型上下文，太贵也读不出更多信息。
   // 这里只给「模型看屏幕」这条路缩图（默认 >600KB 才缩到 800 宽 JPEG，约 60~100KB）；
   // 发到 QQ 的图仍走原 PNG（QQ 客户端自己会压）。ffmpeg 缺失/失败一律原样返回，不能因为缩图挂掉看屏幕。
-  async function shrinkScreenshotV2(buf) {
+  // opts 可覆盖：{ width, qscale, force }。force=true 时不看体积阈值（发 QQ 的截图用它）。
+  async function shrinkScreenshotV2(buf, opts = {}) {
     const ic = cfg.socialV2?.image ?? {};
     if (ic.shrink === false) return { buffer: buf, mimeType: 'image/png' };
     const above = Number(ic.shrinkAboveBytes) > 0 ? Number(ic.shrinkAboveBytes) : 600 * 1024;
-    if (!buf || buf.length <= above) return { buffer: buf, mimeType: 'image/png' };
-    const width = Number(ic.shrinkWidth) > 0 ? Math.min(Math.max(Math.round(Number(ic.shrinkWidth)), 240), 1440) : 720;
-    const qscale = Number(ic.shrinkQscale) > 0 ? Math.min(Math.max(Math.round(Number(ic.shrinkQscale)), 2), 31) : 8;
+    const force = opts.force === true;
+    if (!force && (!buf || buf.length <= above)) return { buffer: buf, mimeType: 'image/png' };
+    if (!buf || !buf.length) return { buffer: buf, mimeType: 'image/png' };
+    const wantWidth = Number(opts.width) > 0 ? Number(opts.width) : (Number(ic.shrinkWidth) > 0 ? Number(ic.shrinkWidth) : 720);
+    const width = Math.min(Math.max(Math.round(wantWidth), 240), 1440);
+    const wantQ = Number(opts.qscale) > 0 ? Number(opts.qscale) : (Number(ic.shrinkQscale) > 0 ? Number(ic.shrinkQscale) : 8);
+    const qscale = Math.min(Math.max(Math.round(wantQ), 2), 31);
     const ffmpeg = String(ic.ffmpeg || process.env.FFMPEG_PATH || cfg.video?.ffmpeg || 'ffmpeg');
     try {
       const out = await new Promise((resolve, reject) => {
