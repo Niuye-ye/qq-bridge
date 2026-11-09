@@ -139,23 +139,56 @@ export async function handleToolsRoutes(ctx) {
       sendJson({ ok: false, error: '未配置 localOps.killLink（config.json），或脚本不存在' }, 501);
       return true;
     }
-    const args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script];
-    if (body.includeQQ === true) args.push('-IncludeQQ');
-    if (body.includeMuMu === true) args.push('-IncludeMuMu');
+    // 解释器按脚本后缀选：PC 部署是 .ps1，手机（Android/Termux）是 .sh。
+    // 2026-11-09 迁移：原来写死 powershell.exe，手机上直接 spawn ENOENT、干跑回空清单。
+    const ext = path.extname(script).toLowerCase();
+    const isPs1 = ext === '.ps1';
+    const isSh = ext === '.sh';
+    const isCmd = ext === '.bat' || ext === '.cmd';
+    const runnerOf = (dryRun) => {
+      if (isSh) {
+        const a = [script];
+        if (dryRun) a.push('--dry-run');
+        return { bin: 'bash', args: a };
+      }
+      if (isCmd) {
+        const a = ['/c', script];
+        if (body.includeQQ === true) a.push('/IncludeQQ');
+        if (body.includeMuMu === true) a.push('/IncludeMuMu');
+        if (dryRun) a.push('/DryRun');
+        return { bin: 'cmd.exe', args: a };
+      }
+      // 默认 PowerShell（.ps1）；必须 -NoProfile 且 -File 只认已 resolve 的绝对路径。
+      const a = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script];
+      if (body.includeQQ === true) a.push('-IncludeQQ');
+      if (body.includeMuMu === true) a.push('-IncludeMuMu');
+      if (dryRun) a.push('-DryRun');
+      return { bin: 'powershell.exe', args: a };
+    };
     if (body.dryRun === true) {
       // 干跑：同步跑一次把清单原样回给模型。
       // PowerShell 5.1 默认按控制台代码页（本机 936/GBK）往管道写，Node 按 UTF-8 读会全是乱码，
-      // 所以先把 [Console]::OutputEncoding 设成 UTF8 再执行脚本。
-      const flags = [];
-      if (body.includeQQ === true) flags.push('-IncludeQQ');
-      if (body.includeMuMu === true) flags.push('-IncludeMuMu');
-      const quoted = script.replace(/'/g, "''");
-      const command = `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; & '${quoted}' -DryRun ${flags.join(' ')}`;
-      const out = await new Promise((resolve) => {
-        runExecFile('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], { windowsHide: true, timeout: 120000, maxBuffer: 2 * 1024 * 1024 }, (err, stdout, stderr) => {
-          resolve(`${stdout ?? ''}${stderr ?? ''}${err ? `\n[exit] ${err.message}` : ''}`.trim());
+      // 所以先把 [Console]::OutputEncoding 设成 UTF8 再执行脚本（.sh 本来就是 UTF-8，直接跑）。
+      let out;
+      if (isPs1) {
+        const flags = [];
+        if (body.includeQQ === true) flags.push('-IncludeQQ');
+        if (body.includeMuMu === true) flags.push('-IncludeMuMu');
+        const quoted = script.replace(/'/g, "''");
+        const command = `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; & '${quoted}' -DryRun ${flags.join(' ')}`;
+        out = await new Promise((resolve) => {
+          runExecFile('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], { windowsHide: true, timeout: 120000, maxBuffer: 2 * 1024 * 1024 }, (err, stdout, stderr) => {
+            resolve(`${stdout ?? ''}${stderr ?? ''}${err ? `\n[exit] ${err.message}` : ''}`.trim());
+          });
         });
-      });
+      } else {
+        const runner = runnerOf(true);
+        out = await new Promise((resolve) => {
+          runExecFile(runner.bin, runner.args, { timeout: 120000, maxBuffer: 2 * 1024 * 1024 }, (err, stdout, stderr) => {
+            resolve(`${stdout ?? ''}${stderr ?? ''}${err ? `\n[exit] ${err.message}` : ''}`.trim());
+          });
+        });
+      }
       log('[kill-link] 干跑预览（未杀任何进程）');
       sendJson({ ok: true, dryRun: true, output: out });
       return true;
@@ -177,8 +210,9 @@ export async function handleToolsRoutes(ctx) {
       const tracePath = path.join(ROOT, 'logs', 'local-ops.log');
       const trace = (m) => { try { fs.appendFileSync(tracePath, `[${new Date().toISOString()}] ${m}\n`); } catch {} };
       try {
-        trace(`[kill-link] spawn ${JSON.stringify(args)}`);
-        const child = runSpawn('powershell.exe', args, { stdio: 'ignore', windowsHide: true });
+        const runner = runnerOf(false);
+        trace(`[kill-link] spawn ${runner.bin} ${JSON.stringify(runner.args)}`);
+        const child = runSpawn(runner.bin, runner.args, { stdio: 'ignore', windowsHide: true });
         child.on('error', (err) => trace(`[kill-link] spawn error: ${err?.message ?? err}`));
         child.on('exit', (code, signal) => trace(`[kill-link] exited code=${code} signal=${signal}`));
         child.unref();
