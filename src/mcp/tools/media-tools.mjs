@@ -22,6 +22,8 @@ import { z } from 'zod';
 import { spawnSafe } from '../safe-spawn.mjs';
 
 const __dirname = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
+// Termux 里的 node 是 android 构建（process.platform === 'android'），文案要说「手机」而不是「模拟器」。
+const ON_ANDROID = process.platform === 'android';
 
 export function registerMediaTools(server, ctx) {
   const { cfg, ROOT } = ctx;
@@ -363,7 +365,7 @@ function pickSerial(adb) {
 
 server.tool(
   'qq_push_video',
-  '把做好的视频推进 MuMu 模拟器（/sdcard/Movies/qq/），推完系统相册就会索引到，B 站「上传」能翻到。传 id（qq_make_video / qq_video_status 给的）或 path（桥的 videos 目录里的文件）；都不传就推最新的那个。',
+  '把做好的视频推进手机 / MuMu 模拟器（/sdcard/Movies/qq/），推完系统相册就会索引到，B 站「上传」能翻到。传 id（qq_make_video / qq_video_status 给的）或 path（桥的 videos 目录里的文件）；都不传就推最新的那个。',
   {
     id: z.string().optional().describe('视频任务 id，例如 vk3f9a'),
     path: z.string().optional().describe('或者给视频文件路径（在桥的 videos 目录里）'),
@@ -400,7 +402,7 @@ server.tool(
       const serial = pickSerial(adb);
       if (!serial) {
         const hint = wake?.ok ? '' : `（按需唤醒未成功：${wake?.error || wake?.skipped ? '管家没应答' : '状态不明'}）`;
-        return { content: [{ type: 'text', text: `模拟器没连上（adb devices 是空的）${hint}。再试一次，或者让主人跑一次一键启动。` }], isError: true };
+        return { content: [{ type: 'text', text: `${ON_ANDROID ? '手机自连的 adb 掉了' : '模拟器没连上'}（adb devices 是空的）${hint}。再试一次${ON_ANDROID ? '，或者让主人跑一次 boot.sh' : '，或者让主人跑一次一键启动'}。` }], isError: true };
       }
 
       const remoteDir = '/sdcard/Movies/qq/';
@@ -426,7 +428,7 @@ server.tool(
         content: [{
           type: 'text',
           text: [
-            '✅ 视频已经放进模拟器了',
+            '✅ 视频已经放进' + (ON_ANDROID ? '手机' : '模拟器') + '了',
             '本机：' + localPath + '（' + sizeMb + ' MB）',
             '手机：' + remotePath,
             '设备：' + serial,
@@ -499,7 +501,7 @@ function listCodeOutputs(dir, limit = 40) {
     try { ents = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
     for (const e of ents) {
       if (out.length >= limit) return;
-      if (depth === 0 && (e.name === 'run.log' || e.name === 'status.json' || e.name === 'main.py')) continue;
+      if (depth === 0 && (e.name === 'run.log' || e.name === 'status.json' || e.name === 'main.py' || e.name === '_runner.py' || e.name === '.exit-code')) continue;
       if (/\.tmp$/i.test(e.name)) continue;
       const p = path.join(d, e.name);
       if (e.isDirectory()) { walk(p, depth + 1); continue; }
@@ -596,7 +598,26 @@ server.tool(
         childEnv.PET_FFMPEG = ffmpeg;
         childEnv.PATH = path.dirname(ffmpeg) + path.delimiter + (process.env.PATH || '');
       }
-      const child = spawnSafe(pickPython(), ['-u', mainPy], {
+      // 2026-11-09：MCP 自己重启过（dsh 重启 / 手机 boot）就收不到 child 的 exit 事件，
+      // status.json 会永远停在 running。用一个包装器把退出码写进 .exit-code，
+      // 这样即使 MCP 已经不在了，后一次 qq_run_status 也能判定真实结果。
+      const runnerPy = path.join(dir, '_runner.py');
+      fs.writeFileSync(runnerPy, [
+        'import pathlib, runpy, sys, traceback',
+        'code = 0',
+        'try:',
+        "    runpy.run_path('main.py', run_name='__main__')",
+        'except SystemExit as exc:',
+        '    code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)',
+        'except BaseException:',
+        '    traceback.print_exc()',
+        '    code = 1',
+        'finally:',
+        "    pathlib.Path('.exit-code').write_text(str(code), encoding='utf-8')",
+        'sys.exit(code)',
+        '',
+      ].join('\n'), 'utf8');
+      const child = spawnSafe(pickPython(), ['-u', runnerPy], {
         cwd: dir,
         detached: true,
         stdio: ['ignore', fd, fd],
@@ -689,7 +710,25 @@ server.tool(
       let st = readCodeStatus(dir) || { id, status: 'running' };
       if (st.status === 'running') {
         if (!pidAlive(st.pid)) {
-          st = { ...st, status: 'failed', note: '进程已经不在了（被杀或崩了），看日志尾巴' };
+          // 2026-11-09：MCP 进程自己重启（dsh 重启 / 手机 boot）时，退出回调不会执行，
+          // status.json 会永远停在 running，pid 已经没了就被误判成「失败」——实际可能早跑完了。
+          // 先看 run.log 里退出回调写的那行再下结论。
+          let exitOk = null;
+          try {
+            const raw = fs.readFileSync(path.join(dir, '.exit-code'), 'utf8').trim();
+            if (/^\d+$/.test(raw)) exitOk = Number(raw) === 0;
+          } catch { /* 没有退出码文件 */ }
+          if (exitOk === null) {
+            try {
+              const m = /\[task\] 结束 exit=(\d+)/.exec(fs.readFileSync(path.join(dir, 'run.log'), 'utf8'));
+              if (m) exitOk = Number(m[1]) === 0;
+            } catch { /* 日志读不到就按老逻辑 */ }
+          }
+          if (exitOk === true) {
+            st = { ...st, status: 'done', note: 'MCP 重启前就跑完了（按 .exit-code 判定 exit=0）' };
+          } else {
+            st = { ...st, status: 'failed', note: '进程已经不在了（被杀或崩了），看日志尾巴' };
+          }
           writeCodeStatus(dir, st);
         } else if (st.startedAt && Date.now() - st.startedAt > (Number(st.timeoutSec) || CODE_TIMEOUT_DEFAULT) * 1000) {
           try { process.kill(Number(st.pid)); } catch { /* ignore */ }
