@@ -310,7 +310,7 @@ server.tool(
         return { content: [{ type: 'text', text: `没有 id=${r.vid} 这个任务。现有的：${allIds.slice(0, 5).join(', ') || '（无）'}` }], isError: true };
       }
       if (r.done) {
-        return { content: [{ type: 'text', text: `✅ 《${r.title}》做好了\n路径：${r.out}\n大小：${r.mb} MB\n想在手机上发就先调 qq_push_video 推到模拟器（相册/文件选择器才翻得到），再跟主人说一声。` }] };
+        return { content: [{ type: 'text', text: `✅ 《${r.title}》做好了\n路径：${r.out}\n大小：${r.mb} MB\n想在手机上发就先调 qq_push_video 推到${ON_ANDROID ? '手机相册' : '模拟器相册'}（相册/文件选择器才翻得到），再跟主人说一声。` }] };
       }
       if (r.failed) {
         return { content: [{ type: 'text', text: `❌ 《${r.title}》失败了\n最后的输出：\n${r.last}\n\n要重做就再调一次 qq_make_video（改改分段）。` }], isError: true };

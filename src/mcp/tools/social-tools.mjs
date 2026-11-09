@@ -18,7 +18,11 @@ import { z } from 'zod';
 export function registerSocialTools(server, ctx) {
   const { cfg, agentApi, errorText, serializeModelData } = ctx;
   // 2026-11-09：链路也能跑在 Android 手机上（Termux + proot），文案别一直说「模拟器」
-  const DEVICE_WORD = process.platform === 'android' ? '手机' : '模拟器';
+  const ON_ANDROID = process.platform === 'android';
+  const DEVICE_WORD = ON_ANDROID ? '手机' : '模拟器';
+  // 截图类工具的对照物：PC 是 mcp__android__*，手机上换成了 mcp__phone__*
+  const MCP_SCREEN_TOOL = ON_ANDROID ? 'mcp__phone__phone_screenshot' : 'mcp__android__screenshot';
+  const MCP_TREE_TOOL = ON_ANDROID ? 'mcp__phone__phone_dump' : 'mcp__android__dump_hierarchy';
 // ── 图片/表情查看工具（一代/二代仿真共用） ─────────────────────────────────
 if (cfg.socialV2?.tools?.getImages !== false) {
   server.tool(
@@ -151,13 +155,13 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.sendSticker
 if (cfg.socialV2?.image?.enabled !== false && cfg.socialV2?.tools?.sendImage !== false) {
   server.tool(
     'qq_send_image',
-    '在指定会话发一张普通图片（照片、截图、你自己的形象图），跟表情包不是一回事（表情包用 qq_send_sticker）。三种来源任选：① path 传 qq-bridge 目录下的图片相对路径，例如 assets/deepseek娘.png、diary/x.png；② url 传网络图片地址；③ screenshot: true 现拍一张模拟器当前屏幕发过去。图片本身不带文字；想说的话先单独发一条。真人发图前会说一句、发完可能补一句，别连着甩好几张。',
+    `在指定会话发一张普通图片（照片、截图、你自己的形象图），跟表情包不是一回事（表情包用 qq_send_sticker）。三种来源任选：① path 传 qq-bridge 目录下的图片相对路径，例如 assets/deepseek娘.png、diary/x.png；② url 传网络图片地址；③ screenshot: true 现拍一张${DEVICE_WORD}当前屏幕发过去。图片本身不带文字；想说的话先单独发一条。真人发图前会说一句、发完可能补一句，别连着甩好几张。`,
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
       path: z.string().optional().describe('qq-bridge 下的图片路径，如 assets/deepseek娘.png（只允许 assets/ diary/ state/ memory/ 里的 png/jpg/jpeg/gif/webp/bmp）'),
       url: z.string().optional().describe('网络图片地址（http/https）'),
-      screenshot: z.boolean().optional().describe('传 true 就现拍一张模拟器（MuMu）当前屏幕发过去，不用给 path/url'),
+      screenshot: z.boolean().optional().describe(`传 true 就现拍一张${DEVICE_WORD}当前屏幕发过去，不用给 path/url`),
       replyToMessageId: z.union([z.number(), z.string()]).optional().describe('要引用/回复的消息 id（非零整数，可为负数，可选）'),
       atUserId: z.union([z.number(), z.string()]).optional().describe('要 @ 的群成员 QQ 号（群聊中可选，私聊不可用）')
     },
@@ -547,7 +551,7 @@ if (cfg.socialV2?.tools?.getSelfImage !== false) {
 if (cfg.socialV2?.tools?.seeScreen !== false) {
 server.tool(
   'qq_see_screen',
-  '看一眼手机/模拟器现在的屏幕，返回真正的画面（图片会直接进入你的视觉上下文，你能看见）。刷 feed、看视频、玩游戏、任何需要知道「屏幕现在长什么样」的时候都用它。**看画面一律用它**。mcp__android__screenshot 也能看图，但它是 adb 抓屏，**网页类页面（WebView，比如小黑盒帖子详情、B站部分页）会截成白屏**，而且抓的是独立图层、不保证和你眼睛看到的一致。只有在需要精确像素坐标时才用 android 那个，判断白屏或卡住一律以 qq_see_screen 为准。',
+  `看一眼${DEVICE_WORD}现在的屏幕，返回真正的画面（图片会直接进入你的视觉上下文，你能看见）。刷 feed、看视频、玩游戏、任何需要知道「屏幕现在长什么样」的时候都用它。**看画面一律用它**。${MCP_SCREEN_TOOL} 也能看图，但它是 adb 抓屏，**网页类页面（WebView，比如小黑盒帖子详情、B站部分页）会截成白屏**，而且抓的是独立图层、不保证和你眼睛看到的一致。只有在需要精确像素坐标时才用 ${MCP_SCREEN_TOOL}，判断白屏或卡住一律以 qq_see_screen 为准。`,
   {
     key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号')
   },

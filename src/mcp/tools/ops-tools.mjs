@@ -10,6 +10,12 @@
 // 接口约定：registerOpsTools(server, ctx) —— 注册期同步调用一次；ctx = { cfg, agentApi, serializeModelData }。
 import { z } from 'zod';
 
+// Termux 里的 node 是 android 构建（process.platform === 'android'），文案要说「手机」而不是「桌宠/模拟器」。
+const ON_ANDROID = process.platform === 'android';
+const RELAUNCH_HINT = ON_ANDROID
+  ? '杀完让主人跑 bash ~/boot.sh 重新拉起（guard 最多两分钟也会自己补）'
+  : '杀完让主人点桌宠「一键修复 · 启动」或跑 一键启动.ps1 重新拉起';
+
 export function registerOpsTools(server, ctx) {
   const { cfg, agentApi, serializeModelData } = ctx;
 // ── 根除链路进程 ──────────────────────────────────────────────────────────────
@@ -17,12 +23,12 @@ export function registerOpsTools(server, ctx) {
 if (cfg.socialV2?.tools?.killLink !== false) {
   server.tool(
     'qq_kill_link',
-    '把整条 QQ 链路的进程全部杀干净：先杀守护（watchdog / bridge-guard / pet-guard / diary-guard，否则 3 分钟内会补回来），再杀桌宠、安卓 MCP(8765)、MuMu 管家(8790)、dsh web(3080)、SnowLuma(3000/3001)，最后杀桥自己(3100)。用在「链路卡死 / 反复重启 / 端口被占 / 改了代码要彻底重来」的时候 —— 杀完让主人点桌宠「一键修复 · 启动」或跑 一键启动.ps1 重新拉起。**注意：调用后 2~3 秒内桥会断线（它自己也被杀），所以这条消息可能发不出去 —— 需要说话时先发消息再调这个工具。默认不杀 QQ 本体和 MuMu 模拟器，要连它们一起停就显式传 includeQQ / includeMuMu。不确定会杀什么时先传 dryRun:true 看清单。',
+    `把整条 QQ 链路的进程全部杀干净：先杀守护（quick check 会补回来的那些），再杀桌宠、安卓 MCP(8765)、MuMu 管家(8790)、dsh web(3080)、SnowLuma(3000/3001)，最后杀桥自己(3100)。用在「链路卡死 / 反复重启 / 端口被占 / 改了代码要彻底重来」的时候 —— ${RELAUNCH_HINT}。**注意：调用后 2~3 秒内桥会断线（它自己也被杀），所以这条消息可能发不出去 —— 需要说话时先发消息再调这个工具。默认不杀 QQ 本体${ON_ANDROID ? '' : '和 MuMu 模拟器'}，要连它们一起停就显式传 includeQQ${ON_ANDROID ? '' : ' / includeMuMu'}。不确定会杀什么时先传 dryRun:true 看清单。`,
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
       includeQQ: z.boolean().optional().describe('是否连 QQ 主进程一起关（默认 false）'),
-      includeMuMu: z.boolean().optional().describe('是否连 MuMu 模拟器一起关（默认 false）'),
+      includeMuMu: z.boolean().optional().describe(ON_ANDROID ? '手机上没有 MuMu 模拟器，这个参数会被忽略' : '是否连 MuMu 模拟器一起关（默认 false）'),
       dryRun: z.boolean().optional().describe('true = 只列出会杀哪些进程，一个都不杀（建议先干跑一次）')
     },
     async ({ key, token, includeQQ, includeMuMu, dryRun }) => {
