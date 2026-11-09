@@ -8,7 +8,9 @@
 //
 // 状态归属：无模块级可变状态；任务目录在 state/video-jobs、state/code-jobs、state/draw。
 // 本文件用到的 __dirname 特意指回 src/（原始语义：VIDEO_SCRIPT = <repo>/scripts/make-video.py），
-// 不是本文件所在的 src/mcp/tools/。
+// 不是本文件所在的 src/mcp/tools/ —— 所以要从 src/mcp/tools 往上退两级（2026-11-09 修：
+// MCP 按族切分时这个文件从 src/mcp/ 挪进 src/mcp/tools/，只退一级就落到 src/mcp，
+// 表现为 qq_make_video 报「找不到渲染脚本：<repo>/src/mcp/scripts/make-video.py」）。
 //
 // 接口约定：registerMediaTools(server, ctx) —— 注册期同步调用一次；ctx = { cfg, ROOT }。
 import fs from 'node:fs';
@@ -19,7 +21,7 @@ import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { spawnSafe } from '../safe-spawn.mjs';
 
-const __dirname = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const __dirname = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 export function registerMediaTools(server, ctx) {
   const { cfg, ROOT } = ctx;
