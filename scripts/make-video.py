@@ -52,6 +52,11 @@ FONT_PATHS = [
     r"C:\Windows\Fonts\msyhbd.ttc",
     r"C:\Windows\Fonts\msyh.ttc",
     r"C:\Windows\Fonts\simhei.ttf",
+    # 2026-11-09：Android / Linux（手机版）—— 系统自带思源黑体，Termux 能直接读 /system/fonts
+    "/system/fonts/NotoSansCJK-Bold.ttc",
+    "/system/fonts/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
 ]
 
 # 配色（跟桌宠一套）

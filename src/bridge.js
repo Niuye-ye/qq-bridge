@@ -7620,6 +7620,10 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
   // 与「未读消息」无关的唤醒原因（定时器/引导）。这些原因在会话繁忙时被暂存后，
   // 不能用「unread 里还有没有对应 seq」来判断是否还要补发 —— 那一轮很可能已经把
   // 未读全部标读了，结果就是 timeout 定时器被静默丢掉、会话停在无定时器的静默态。
+  // 瞬时上游错误（重启 bridge / dsh 刚拉起时常见）：自动重试，不打扰主人。
+  const V2_TRANSIENT_ERR_RE = /connection error|econnrefused|econnreset|fetch failed|socket hang up|network error|HTTP 50[234]|temporarily unavailable/i;
+  const v2TransientRetry = new Map();
+
   const TIMER_WAKE_REASONS = new Set(['timeout', 'replyCheck', 'proactiveCheck', 'bootstrap', 'admin', 'interval']);
   function isTimerWakeReason(reason) {
     return TIMER_WAKE_REASONS.has(String(reason ?? '').split(':')[0]);
@@ -8846,8 +8850,32 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
               } else if (ended.reason.kind === 'error') {
                 const msg = ended.reason.error?.message ?? '未知错误';
                 const safeMsg = shouldAuditKey(key) && SENSITIVE_RE.test(msg) ? '（含敏感信息，已隐藏）' : msg.slice(0, 500);
-                // 以前这里只发 QQ、不写日志：出问题时 bridge.log 里什么都没有，排查只能靠猜（PR #24）。
-                log(`⚠️ agent 处理出错 (${key})：${safeMsg}`);
+                // 2026-11-09：手机侧重启 bridge / dsh 刚起来时，上游偶发 "Connection error."，这一轮直接报废
+                // 还会给主人发一条报错。这类瞬时错误自动重发唤醒（最多 2 次、10 分钟窗口），别惊动主人。
+                if (key && V2_TRANSIENT_ERR_RE.test(msg)) {
+                  const rec = v2TransientRetry.get(frame.sessionId) ?? { n: 0, at: 0 };
+                  if (Date.now() - rec.at > 10 * 60 * 1000) rec.n = 0;
+                  if (rec.n < 2) {
+                    rec.n += 1;
+                    rec.at = Date.now();
+                    v2TransientRetry.set(frame.sessionId, rec);
+                    log(`⚠️ agent 处理出错（瞬时，自动重试第 ${rec.n} 次）(${key})：${safeMsg.slice(0, 120)}`);
+                    appendActivity(`${key} agent 处理出错（瞬时）：${safeMsg.slice(0, 60)}`);
+                    setTimeout(() => {
+                      try {
+                        if (!socialV2.paused) scheduleWakeV2(key, 'admin');
+                      } catch (error) {
+                        log(`[reserved2] 自动重试唤醒失败 ${key}: ${error?.message ?? error}`);
+                      }
+                    }, 5000).unref?.();
+                    continue;
+                  }
+                  v2TransientRetry.delete(frame.sessionId);
+                  log(`⚠️ agent 处理出错（瞬时，已重试 ${rec.n} 次仍失败，放弃）(${key})：${safeMsg}`);
+                } else {
+                  // 以前这里只发 QQ、不写日志：出问题时 bridge.log 里什么都没有，排查只能靠猜（PR #24）。
+                  log(`⚠️ agent 处理出错 (${key})：${safeMsg}`);
+                }
                 appendActivity(`${key} agent 处理出错：${safeMsg.slice(0, 80)}`);
                 await sendToQQ(key, `⚠️ agent 处理出错：${safeMsg}`);
 

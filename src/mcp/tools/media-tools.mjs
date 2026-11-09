@@ -1049,6 +1049,11 @@ server.tool(
     timeoutSec: z.number().optional().describe('最多等多少秒，默认 180，上限 600'),
   },
   async ({ prompt, model, negative, width, height, steps, cfg, seed, count, checkpoint, sampler, scheduler, timeoutSec }) => {
+    // 2026-11-09：手机版（Android）没有 ComfyUI，也跑不动扩散模型。别让她以为"喊主人开一下"就能画。
+    const cc = (() => { try { return readBridgeConfig()?.comfyui || {}; } catch { return {}; } })();
+    if (!String(cc.url || '').trim() && !String(cc.dir || '').trim() && !String(cc.zimage?.dir || '').trim()) {
+      return { content: [{ type: 'text', text: '这台机器没配 ComfyUI，画不了图（手机版没有生图能力）。要画面就用 qq_make_video 的 image 段，或者别自己做图，直接跟主人说。' }], isError: true };
+    }
     const guard = await startMemGuard(memMinGB('draw', 1.0), '画图');
     try {
       const text = String(prompt ?? '').trim();
