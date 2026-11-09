@@ -2412,6 +2412,50 @@ async function main() {
     throw new Error(`截图失败（${lastSerial}）：${lastError.slice(0, 300)}`);
   }
 
+  // 2026-11-09：手机上 screencap 出来的 PNG 是 1220x2712 / 约 1.2MB（base64 后 1.6MB），
+  // 走 /api/socialV2/screen → qq_see_screen 时会整块塞进模型上下文，太贵也读不出更多信息。
+  // 这里只给「模型看屏幕」这条路缩图（默认 >600KB 才缩到 800 宽 JPEG，约 60~100KB）；
+  // 发到 QQ 的图仍走原 PNG（QQ 客户端自己会压）。ffmpeg 缺失/失败一律原样返回，不能因为缩图挂掉看屏幕。
+  async function shrinkScreenshotV2(buf) {
+    const ic = cfg.socialV2?.image ?? {};
+    if (ic.shrink === false) return { buffer: buf, mimeType: 'image/png' };
+    const above = Number(ic.shrinkAboveBytes) > 0 ? Number(ic.shrinkAboveBytes) : 600 * 1024;
+    if (!buf || buf.length <= above) return { buffer: buf, mimeType: 'image/png' };
+    const width = Number(ic.shrinkWidth) > 0 ? Math.min(Math.max(Math.round(Number(ic.shrinkWidth)), 240), 1440) : 720;
+    const qscale = Number(ic.shrinkQscale) > 0 ? Math.min(Math.max(Math.round(Number(ic.shrinkQscale)), 2), 31) : 8;
+    const ffmpeg = String(ic.ffmpeg || process.env.FFMPEG_PATH || cfg.video?.ffmpeg || 'ffmpeg');
+    try {
+      const out = await new Promise((resolve, reject) => {
+        const child = spawn(ffmpeg, [
+          '-hide_banner', '-loglevel', 'error',
+          '-f', 'image2pipe', '-i', 'pipe:0',
+          '-vf', 'scale=' + width + ':-2',
+          '-c:v', 'mjpeg', '-q:v', String(qscale),
+          '-f', 'image2pipe', 'pipe:1',
+        ], { stdio: ['pipe', 'pipe', 'pipe'] });
+        const chunks = [];
+        let errText = '';
+        const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* 已退出 */ } reject(new Error('缩图超时')); }, 20000);
+        child.stdout.on('data', (c) => chunks.push(c));
+        child.stderr.on('data', (c) => { errText = (errText + c.toString()).slice(-400); });
+        child.on('error', (e) => { clearTimeout(timer); reject(e); });
+        child.on('close', (code) => {
+          clearTimeout(timer);
+          if (code !== 0) return reject(new Error('ffmpeg exit ' + code + ' ' + errText.trim()));
+          const out = Buffer.concat(chunks);
+          if (!out.length || !looksLikeImageBuffer(out)) return reject(new Error('缩图输出不是图片'));
+          resolve(out);
+        });
+        child.stdin.on('error', () => { /* 提前退出时会 EPIPE，忽略 */ });
+        child.stdin.end(buf);
+      });
+      return { buffer: out, mimeType: 'image/jpeg' };
+    } catch (error) {
+      log('[screen] 缩图失败，按原图返回：' + String(error?.message || error).slice(0, 200));
+      return { buffer: buf, mimeType: 'image/png' };
+    }
+  }
+
   async function sendImageV2(key, buffer, options = {}) {
     const assertSendAllowed = captureSendGuard(key);
     const [kind, id] = key.split(':');
@@ -4078,7 +4122,7 @@ async function main() {
           computeGapsV2, sendMessagesV2, recordSentMessagesV2, scheduleReplyCheckV2,
           findCjkSpaceWarning, findSplitBoundaryWarning, resolveReplyTargetV2,
           captureSendGuard, assertGroupMember,
-          captureDeviceScreenshotV2, resolveImageSourcePath, sendImageV2,
+          captureDeviceScreenshotV2, shrinkScreenshotV2, resolveImageSourcePath, sendImageV2,
           sendStickerV2, pickStickerByQuery,
           // 查询历史域（src/console/history.mjs）
           resolveReplyInfo, fetchMediaData, findMessageMedia, seenForwardIds,

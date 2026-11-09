@@ -47,7 +47,7 @@ export async function handleAdminRoutes(ctx) {
     req, res, ACTIVE_WAIT_LEASE_MS, FEEDBACK_FILE, PRESET_BACKUP_DIR, PRESET_NAMES,
     ROOT, STATE_DIR, activeWaits, agentTokenOk, allowed, api,
     appendActivity, appendFeedbackEntry, atomicWriteJson, atomicWriteText, backupPresetFile, bot,
-    cancelReplyCheckV2, canonicalV2Key, captureDeviceScreenshotV2, cfg, closedAgentPreset, computeWakeSafetyV2,
+    cancelReplyCheckV2, canonicalV2Key, captureDeviceScreenshotV2, shrinkScreenshotV2, cfg, closedAgentPreset, computeWakeSafetyV2,
     confirmedSlangListV2, currentMode, currentRoleHint, currentRoleHintV2, deliverPrompt, dshReady,
     ensureSession, escapeCqText, feedbackTimes, formatMemoryV2, formatParticipationV2, getSocialV2State,
     hardenStateDirAcl, setStateDirHardened, getStateDirHardened, initialPromptMaxChars, initialPrompts, initialPromptsWritable, installedPresetYaml, knownPresetName,
@@ -695,7 +695,9 @@ export async function handleAdminRoutes(ctx) {
     if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return true; }
     try {
       const shot = await captureDeviceScreenshotV2();
-      sendJson({ ok: true, key, bytes: shot.length, mimeType: 'image/png', data: shot.toString('base64') });
+      // 2026-11-09：给模型看的截图先缩图（默认 800 宽 JPEG），否则 1.2MB 原图 base64 后整块进上下文
+      const shown = await shrinkScreenshotV2(shot);
+      sendJson({ ok: true, key, bytes: shown.buffer.length, rawBytes: shot.length, mimeType: shown.mimeType, data: shown.buffer.toString('base64') });
     } catch (error) {
       sendJson({ ok: false, error: String(error?.message ?? error) }, 500);
     }
