@@ -1728,19 +1728,32 @@ async function main() {
 
   async function listQzonePostsV2(pageNum = 1, count = 10) {
     const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-    const res = await fetch(`${httpUrl}/get_qzone_msg_list`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
-      },
-      body: JSON.stringify({
-        page_num: Number(pageNum) > 0 ? Number(pageNum) : 1,
-        count: Number(count) > 0 ? Math.min(50, Number(count)) : 10
-      }),
-      signal: AbortSignal.timeout(20000)
-    });
-    const json = await res.json().catch(() => ({}));
+    const page = Number(pageNum) > 0 ? Number(pageNum) : 1;
+    const size = Number(count) > 0 ? Math.min(50, Number(count)) : 10;
+    const post = async (extra) => {
+      const res = await fetch(`${httpUrl}/get_qzone_msg_list`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+        },
+        body: JSON.stringify(extra),
+        signal: AbortSignal.timeout(20000)
+      });
+      return res.json().catch(() => ({}));
+    };
+    let json = await post({ page_num: page, count: size });
+    // 2026-11-09：手机链路用 NapCat（不是 SnowLuma），它的 get_qzone_msg_list 不接受 page_num/count，
+    // 会回 400「不支持 page_num 参数」。这时退化成无参调用，本地分页切片；
+    // 手机上拿不到前 N 条以后的历史，但「最近发过哪些说说」够用，总比整个工具报错强。
+    if (json?.status !== 'ok' && /不支持|unsupported/i.test(String(json?.message || json?.wording || ''))) {
+      json = await post({});
+      if (json?.status === 'ok' && Array.isArray(json?.data?.msglist)) {
+        const all = json.data.msglist;
+        const sliced = all.slice((page - 1) * size, page * size);
+        return { ...json.data, total: all.length, msglist: sliced, total_known: false, pagedLocally: true };
+      }
+    }
     if (json?.status !== 'ok') {
       throw new Error(`网关返回失败：${json?.message || json?.wording || JSON.stringify(json).slice(0, 200)}`);
     }
