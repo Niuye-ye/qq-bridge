@@ -444,6 +444,38 @@ await test('R16 appendSocialV2Message 保留 kind/emojiId/summary/subType', asyn
   } finally { await h.close(); }
 });
 
+
+// ── R17. 新回合必须作废上一回合残留的长轮询租约 ──────────────────────────────
+// 现实故障（2026-11-09 手机版）：上一回合的 qq_wait_for_messages 在后台没结束，
+// 新回合一开始调「沉睡前观察」就吃 429「该会话已有一个等待中的等待」，
+// 于是 qq_mark_read / qq_set_wake_config 全被拦，她只能报「收尾卡住」——收尾死锁。
+// 修法：新回合真正开始时（sendWakePromptV2 投递前）主动作废旧租约并让旧等待立刻返回。
+await test('R17 新回合作废残留等待租约，不再把沉睡前观察卡成 429', async () => {
+  const h = await bridgeHarness({ config: { socialV2: { wait: { minMs: 300, maxMs: 8000, defaultQuietMs: 0, minQuietAfterNewMs: 0 } } } });
+  try {
+    h.setMode('reserved2');
+    const token = h.getSocialV2State('group:456').agentToken;
+    await withServer(h, async (port) => {
+      const t0 = Date.now();
+      const pending = call(port, '/api/socialV2/wait', {
+        method: 'POST', token, body: { key: 'group:456', purpose: 'messages', timeoutMs: 8000 }
+      });
+      await sleep(80);
+      // 模拟「上一回合的 wait 还挂着，这时来了一次新唤醒」。
+      await h.sendWakePromptV2('group:456', 'timeout');
+      const first = await pending;
+      assert.equal(first.status, 409, `残留等待应被作废（实得 ${first.status} ${first.body}）`);
+      assert.match(String(first.json?.error ?? ''), /接管|作废/, '错误信息要说明被新回合作废，模型才不会再重试等待');
+      assert.ok(Date.now() - t0 < 3000, '作废必须立刻生效，不能等满 8 秒预算');
+      // 租约已释放：新回合紧接着的沉睡前观察必须能拿到租约，而不是 429。
+      const next = await call(port, '/api/socialV2/wait', {
+        method: 'POST', token, body: { key: 'group:456', purpose: 'messages', timeoutMs: 300 }
+      });
+      assert.equal(next.status, 200, `新回合的等待必须能拿到租约（实得 ${next.status} ${next.body}）`);
+    });
+  } finally { await h.close(); }
+});
+
 if (failures) {
   console.error(`\n${failures} 项失败`);
   process.exitCode = 1;

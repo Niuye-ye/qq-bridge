@@ -45,7 +45,7 @@ import { checkQuota, reserveQuota, rollbackQuota } from '../rate-limit.mjs';
 export async function handleAdminRoutes(ctx) {
   const {
     req, res, ACTIVE_WAIT_LEASE_MS, FEEDBACK_FILE, PRESET_BACKUP_DIR, PRESET_NAMES,
-    ROOT, STATE_DIR, activeWaits, agentTokenOk, allowed, api,
+    ROOT, STATE_DIR, activeWaits, activeWaitCancels, agentTokenOk, allowed, api,
     appendActivity, appendFeedbackEntry, atomicWriteJson, atomicWriteText, backupPresetFile, bot,
     cancelReplyCheckV2, canonicalV2Key, captureDeviceScreenshotV2, shrinkScreenshotV2, cfg, closedAgentPreset, computeWakeSafetyV2,
     confirmedSlangListV2, currentMode, currentRoleHint, currentRoleHintV2, deliverPrompt, dshReady,
@@ -787,14 +787,26 @@ export async function handleAdminRoutes(ctx) {
     // 用原始 key 会给出两个租约槽（同一会话并发多个 5~10 分钟等待、互相踩水位）。
     // 租约过期则视为残留（handler 异常退出没清干净），允许接管而不是永久 429。
     const leaseKey = canonicalV2Key(key) ?? key;
+    // 残留租约由**新回合起点**处理：bridge 的 cancelActiveWaitV2 会在新回合真正开始时
+    // 作废上一回合遗留的长轮询（否则新回合的「沉睡前观察」永远 429，收尾死锁）。
+    // 这里只拦「同一回合内真的并发两次」——那是模型用法错误，必须报错而不是放行。
     if (activeWaits.has(leaseKey) && Date.now() - activeWaits.get(leaseKey) < ACTIVE_WAIT_LEASE_MS) {
       sendJson({ ok: false, error: '该会话已有一个等待中的 qq_wait_for_messages，请等待它结束' }, 429);
       return true;
     }
     const leaseStamp = Date.now();
     activeWaits.set(leaseKey, leaseStamp);
+    let aborted = false;
+    let canceled = false;
+    // 新回合开始时桥会调它，让本 handler 立刻跳出轮询返回。
+    const cancelLease = () => { canceled = true; aborted = true; };
     // 只由「自己那一份租约」负责删除：超时接管后，旧等待结束时不能把新租约删掉。
-    const finishWait = () => { if (activeWaits.get(leaseKey) === leaseStamp) activeWaits.delete(leaseKey); };
+    const finishWait = () => {
+      if (activeWaits.get(leaseKey) !== leaseStamp) return;
+      activeWaits.delete(leaseKey);
+      if (activeWaitCancels.get(leaseKey) === cancelLease) activeWaitCancels.delete(leaseKey);
+    };
+    activeWaitCancels.set(leaseKey, cancelLease);
     req.on('close', finishWait);
     // 响应关闭也兜底清租约：handler 中途抛错时由外层 catch 回一个 JSON，
     // 那条路径不会经过下面的 finishWait()，会留下 15 分钟的假 429。
@@ -819,7 +831,6 @@ export async function handleAdminRoutes(ctx) {
     const start = Date.now();
     let arrived = false;
     let lastNewAt = 0;
-    let aborted = false;
     req.on('close', () => { aborted = true; });
     if (replyWait) {
       const incomingAt = () => {
@@ -867,6 +878,13 @@ export async function handleAdminRoutes(ctx) {
           || !agentTokenOk(key, req.headers['x-agent-token']) || !v2SessionAllowed(key) || !v2ToolEnabled('waitMessages')))) {
       finishWait();
       sendJson({ ok: false, error: '等待期间会话已重置或权限已变化，请重新读取会话' }, 403);
+      return true;
+    }
+    // 被新回合作废（会话本身还在）：明确告诉模型别重试等待，直接继续。
+    // 放在权限/重置检查之后——那种情况要报 403，不能被这里的 409 覆盖。
+    if (canceled) {
+      finishWait();
+      sendJson({ ok: false, error: '这个等待已被新的回合接管并作废，请直接继续当前回合，不要重试等待' }, 409);
       return true;
     }
     const preSleepWaitMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);

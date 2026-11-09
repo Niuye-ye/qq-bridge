@@ -2970,6 +2970,10 @@ async function main() {
   // 存时间戳而不是单纯放进 Set，是因为 handler 中间任何异常都会跳过 finishWait ——
   // 那样这个 key 会被永远 429 掉（DSH 的 fetch 不会主动断开连接，req 'close' 也不会触发）。
   const activeWaits = new Map();
+// key -> 取消函数：正在挂起的 qq_wait_for_messages 如何提前结束。
+// 新回合开始时用它作废上一回合残留的等待（见 cancelActiveWaitV2），
+// 否则 15 分钟租约会让新回合的「沉睡前观察」直接吃 429，收尾死锁。
+const activeWaitCancels = new Map();
   /**
    * 单次等待的租约上限：正常等待最长 = timeout 预算 + 静默窗口 + 5s 余量，
    * 这里给足余量；超过就认为上一次是异常退出留下的残留，允许新的等待接管。
@@ -3383,13 +3387,44 @@ async function main() {
    */
   function forgetConversationCaches(key) {
     lastSendFailed.delete(key);
-    activeWaits.delete(key);
+    cancelActiveWaitV2(key);
     queuedHintAt.delete(key);
     slangSubmitTimes.delete(key);
     feedbackTimes.delete(key);
     wakeConfigMissCount.delete(key);
     wakeConfigUpdatedKeys.delete(key);
     markReadCalledKeys.delete(key);
+  }
+
+  /**
+   * 作废某个会话仍在挂起的 qq_wait_for_messages。
+   *
+   * 为什么要主动作废：长轮询按会话 key 记账，租约 15 分钟。上一回合被中断/超时后，
+   * 它的 HTTP 请求常常还挂在后台（最长 10 分钟），新回合一开始调「沉睡前观察」就收到
+   * 429「该会话已有一个等待中的等待」，于是 qq_mark_read / qq_set_wake_config 全被拦，
+   * 她只能报「收尾卡住」（2026-11-09 手机迁移实测）。
+   *
+   * 这里删租约并调用取消函数，让旧 handler 立刻跳出循环返回，新回合就能正常等待。
+   * 返回 true 表示确实作废了一个残留等待。
+   */
+  function cancelActiveWaitV2(key) {
+    const leaseKey = canonicalV2Key(key) ?? key;
+    const cancel = activeWaitCancels.get(leaseKey);
+    activeWaitCancels.delete(leaseKey);
+    activeWaits.delete(leaseKey);
+    if (!cancel) return false;
+    try { cancel(); } catch (error) { log(`[wait] 作废旧等待失败 ${leaseKey}: ${error?.message ?? error}`); }
+    log(`[wait] 已作废残留的长轮询 ${leaseKey}（新回合接管）`);
+    return true;
+  }
+
+  /** 清空所有会话的长轮询租约（重置/事件流断开时用，同时让挂起的请求立刻返回）。 */
+  function cancelAllActiveWaitsV2() {
+    for (const cancel of [...activeWaitCancels.values()]) {
+      try { cancel(); } catch { /* 旧 handler 已结束 */ }
+    }
+    activeWaitCancels.clear();
+    activeWaits.clear();
   }
 
   // 把「按 session id 存配置」的外部插件指到新会话上。
@@ -3821,6 +3856,8 @@ async function main() {
     saveState();
     pendingWakeKeys.clear();
     clearAllPendingWakeLeases();
+    // 重置时也把挂着的长轮询作废：否则旧请求会一直睡到预算耗尽，还会在返回时读到新状态。
+    cancelAllActiveWaitsV2();
     wakeConfigUpdatedKeys.clear();
     markReadCalledKeys.clear();
     wakeConfigMissCount.clear();
@@ -4189,7 +4226,7 @@ async function main() {
           addFactV2, removeFactV2, readFactsV2, readForgottenFactsV2, searchFactsV2, formatFactsLineV2,
           // 管理端与杂项域（src/console/admin.mjs）
           ACTIVE_WAIT_LEASE_MS, FEEDBACK_FILE, PRESET_BACKUP_DIR, PRESET_NAMES, STATE_DIR,
-          activeWaits, allowed, api, appendFeedbackEntry, atomicWriteText,
+          activeWaits, activeWaitCancels, allowed, api, appendFeedbackEntry, atomicWriteText,
           backupPresetFile, canonicalV2Key, closedAgentPreset, currentRoleHint, currentRoleHintV2,
           deliverPrompt, dshReady, ensureSession, escapeCqText, feedbackTimes,
           formatParticipationV2, hardenStateDirAcl, initialPromptMaxChars, initialPrompts, initialPromptsWritable,
@@ -7564,6 +7601,10 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
     st.preSleepWaitObservedAt = 0;
     st.preSleepWaitAccumMs = 0;
     cancelReplyCheckV2(key); // 本次唤醒已接管，清理仍在排队的回复检查
+    // 新回合真正开始：上一回合若还挂着长轮询（qq_wait_for_messages），
+    // 它的租约会让本回合的沉睡前观察直接 429，导致 mark_read / set_wake_config 被拦、
+    // 收尾死锁（2026-11-09 手机迁移实测）。这里主动作废它。
+    cancelActiveWaitV2(key);
     const wakeTime = now;
     st.wakeTimes.push(wakeTime);
     if (st.wakeTimes.length > 200) st.wakeTimes = st.wakeTimes.slice(-200);
@@ -9085,7 +9126,9 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
         wakeConfigMissCount.clear();
         // 长轮询（qq_wait_for_messages）的租约也要清：它的 req.on('close') 在事件流
         // 断开时不一定触发，残留租约会用 429 卡住该会话最长 15 分钟的等待工具。
-        activeWaits.clear();
+        // 用 cancelAllActiveWaitsV2 而不是 activeWaits.clear()：断开后挂着的 handler
+        // 还在轮询，不通知它就会一直睡到预算耗尽（最长 10 分钟）才返回。
+        cancelAllActiveWaitsV2();
       }
       if (framesThisStream > 0) {
         failureStreak = 0;
