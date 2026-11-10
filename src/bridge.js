@@ -4264,7 +4264,7 @@ function startConsoleServer() {
           voiceBudgetCheck, voiceBudgetCommit, listAudioFiles, shouldBlockSilentReply,
           // 二代仿真会话状态域（src/console/social-state.mjs）
           refreshAllDefaultWakeConfigsV2, socialV2, clearAllSocialV2Timers,
-          setupSleepTimerV2, scheduleProactiveCheckV2, setupIntervalTimerV2,
+          setupSleepTimerV2, scheduleProactiveCheckV2, setupIntervalTimerV2, checkProactiveThrottleV2,
           turboStatusV2, setTurboV2, turboActiveV2, turboFocusV2, mcModeActiveV2,
           ACTIVE_LEVELS, readActivityV2, readFeelV2, isConversationBusyV2,
           computeWakeSafetyV2, resetSocialV2AllStateV2,

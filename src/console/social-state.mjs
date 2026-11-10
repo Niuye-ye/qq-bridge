@@ -25,7 +25,7 @@ export async function handleSocialStateRoutes(ctx) {
     req, url, sendJson, readBody, log, path, ROOT, cfg,
     readConfigObject, atomicWriteJson, refreshAllDefaultWakeConfigsV2,
     socialV2, saveSocialV2State, clearAllSocialV2Timers,
-    setupSleepTimerV2, scheduleProactiveCheckV2, setupIntervalTimerV2,
+    setupSleepTimerV2, scheduleProactiveCheckV2, setupIntervalTimerV2, checkProactiveThrottleV2,
     turboStatusV2, setTurboV2, turboActiveV2, turboFocusV2, mcModeActiveV2,
     ACTIVE_LEVELS, readActivityV2, readFeelV2, isConversationBusyV2,
     getSocialV2State, computeWakeSafetyV2, agentTokenOk, v2SessionAllowed, v2ToolEnabled,
@@ -246,6 +246,24 @@ export async function handleSocialStateRoutes(ctx) {
       busy: isConversationBusyV2(selfKey, selfSt),
       lastAiReplyAt: selfSt.lastAiReplyAt || 0,
       unread: Array.isArray(selfSt.unread) ? selfSt.unread.length : 0,
+      // 主动开口的「今天还剩几次机会」：桌宠/手机页显示用；拿不到就 null（老桥/单测环境）
+      proactive: (() => {
+        try {
+          if (typeof checkProactiveThrottleV2 !== 'function') return null;
+          const pr = checkProactiveThrottleV2();
+          const p = cfg.socialV2?.proactive ?? {};
+          return {
+            enabled: p.enabled !== false,
+            todayCount: pr.todayCount,
+            maxPerDay: pr.maxPerDay,
+            minGapMs: pr.minGapMs,
+            gapLeftMs: pr.gapLeftMs,
+            checkMinMs: Number(p.checkIntervalMinMs) || 30 * 60 * 1000,
+            checkMaxMs: Number(p.checkIntervalMaxMs) || 90 * 60 * 1000,
+            probability: Number.isFinite(Number(p.probability)) ? Number(p.probability) : 0.4,
+          };
+        } catch { return null; }
+      })(),
       playing: t.on ? { focus: t.focus, focusLabel: t.focusLabel, remainMinutes: t.remainMinutes, everyMinutes: t.everyMinutes, costCny: t.costTurboCny, level: t.level } : null,
       mc: {
         alive,

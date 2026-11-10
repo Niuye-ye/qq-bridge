@@ -82,7 +82,7 @@ test('桌面上有的关键功能都给了入口（心情/好感/她在干嘛/�
   for (const label of ['心情', '好感', '她在干嘛', '想干的事', '玩手机', 'Minecraft', '活跃度', '暂停她', '跟她说句话']) {
     assert.ok(html.includes(label), '页面缺少「' + label + '」');
   }
-  for (const id of ['mood', 'aff', 'doing', 'goals', 'life', 'levels', 'pauseBtn', 'playPhone', 'playMc', 'playBoth', 'stopPlay', 'sayText', 'sayBtn']) {
+  for (const id of ['mood', 'aff', 'doing', 'goals', 'life', 'levels', 'pauseBtn', 'playPhone', 'playMc', 'playBoth', 'stopPlay', 'sayText', 'sayBtn', 'proSub']) {
     assert.ok(html.includes('id="' + id + '"'), '页面缺少元素 #' + id);
   }
 });
@@ -96,6 +96,13 @@ test('跟她说句话：只走 desk-message，key 取自 self 不写死', () => 
   assert.ok(html.includes('key:OWNER'), 'desk-message 必须带 OWNER');
   assert.ok(html.includes('sayBtn'), '缺少发送按钮绑定');
   assert.ok(html.includes('已送到'), '发送成功要有明确回执');
+});
+
+test('主动开口额度显示在页面上（今天几次 / 上限 / 还要等多久）', () => {
+  const html = PET_PAGE_HTML;
+  assert.ok(html.includes('s.proactive'), '页面要读 self.proactive');
+  assert.ok(html.includes('今天 '), '缺「今天 N/M 次」的文案');
+  assert.ok(html.includes('已关闭'), '主动开口被关掉时要说明');
 });
 
 test('手机可「添加到主屏幕」：带 web-app-capable meta，不依赖外部 manifest 文件', () => {

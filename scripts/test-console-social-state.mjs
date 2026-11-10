@@ -44,6 +44,7 @@ function makeEnv(overrides = {}) {
     setupSleepTimerV2: (key) => { calls.sleepTimers.push(key); },
     scheduleProactiveCheckV2: (key) => { calls.proactive.push(key); },
     setupIntervalTimerV2: (key) => { calls.intervalTimers.push(key); },
+    checkProactiveThrottleV2: () => ({ ok: false, reason: 'minGap', minGapMs: 1200000, maxPerDay: 16, todayCount: 3, gapLeftMs: 540000 }),
     turboStatusV2: () => ({ on: !!socialV2.turbo, remainMinutes: 12, focus: '', focusLabel: '', everyMinutes: 10, costTurboCny: 0.5 }),
     setTurboV2: (on, hours, by, intervalMinutes, focus) => {
       calls.turboArgs.push({ on, hours, by, intervalMinutes, focus });
@@ -225,6 +226,20 @@ test('GET self：聚合她在干嘛（含 mc 状态与在玩什么）', async ()
   assert.equal(body.playing.everyMinutes, 10);
   assert.equal(typeof body.mc.alive, 'boolean');
   assert.equal(typeof body.mc.queue, 'number');
+  // 手机桌宠页要显示「她主动找你」的额度：今天已开口几次 / 上限 / 还要等多久
+  assert.equal(body.key, 'private:1946431105', 'self 要回会话 key，页里不写死 QQ 号');
+  assert.equal(body.proactive.todayCount, 3);
+  assert.equal(body.proactive.maxPerDay, 16);
+  assert.equal(body.proactive.gapLeftMs, 540000);
+  assert.equal(body.proactive.enabled, true);
+});
+
+test('GET self：拿不到节流信息时 proactive 为 null，不抛异常', async () => {
+  const env = makeEnv();
+  delete env.ctx.checkProactiveThrottleV2;
+  await run(env.ctx, { pathname: '/api/socialV2/self' });
+  assert.equal(env.calls.sent.at(-1).body.ok, true);
+  assert.equal(env.calls.sent.at(-1).body.proactive, null);
 });
 
 test('GET mc-mode 与 reset', async () => {
