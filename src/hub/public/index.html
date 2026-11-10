@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1117">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>小鲸鱼</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icon.svg">
+<style>
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:#0f1117;color:#e6e8ef;font:15px/1.55 -apple-system,"PingFang SC","Noto Sans CJK SC",sans-serif;padding:12px 12px calc(16px + env(safe-area-inset-bottom))}
+.wrap{max-width:620px;margin:0 auto}
+.top{display:flex;align-items:center;gap:8px;margin:4px 2px 12px}
+.dot{width:9px;height:9px;border-radius:50%;background:#3a3f4b}
+.dot.on{background:#39d98a;box-shadow:0 0 0 3px rgba(57,217,138,.16)}
+.dot.warn{background:#f5a524;box-shadow:0 0 0 3px rgba(245,165,36,.16)}
+.title{font-size:17px;font-weight:600;letter-spacing:.02em}
+.grow{flex:1}
+.muted{color:#8b93a7;font-size:12px}
+.card{background:#171a22;border:1px solid #232734;border-radius:14px;padding:13px 14px;margin-bottom:10px}
+.card h2{margin:0 0 8px;font-size:11.5px;font-weight:600;color:#8b93a7;letter-spacing:.14em;text-transform:uppercase}
+.doing{font-size:17px;font-weight:500;white-space:pre-wrap}
+.note{color:#a7aebf;font-size:13px;margin-top:6px;white-space:pre-wrap}
+.row{display:flex;align-items:baseline;gap:8px;flex-wrap:wrap}
+.big{font-size:24px;font-weight:600}
+.aff{color:#ffb86b;font-size:13px}
+.pill{display:inline-flex;align-items:center;gap:6px;background:#1d2130;border:1px solid #2b3142;border-radius:999px;padding:5px 10px;font-size:12.5px;margin:4px 6px 0 0}
+.pill .d{width:7px;height:7px;border-radius:50%;background:#4a5163}
+.pill .d.on{background:#39d98a}
+.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.kv{background:#1b1f2a;border:1px solid #262b39;border-radius:11px;padding:10px 12px}
+.kv .k{color:#8b93a7;font-size:11.5px}
+.kv .v{font-size:18px;font-weight:600;margin-top:2px}
+ul.list{margin:6px 0 0;padding-left:18px;color:#c7ccd9;font-size:13.5px}
+ul.list li{margin:3px 0}
+button{background:#232734;color:#e6e8ef;border:1px solid #2e3444;border-radius:10px;padding:8px 12px;font-size:13.5px;cursor:pointer}
+button:active{transform:translateY(1px)}
+button.primary{background:#2b3a5a;border-color:#3a4f78}
+.btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+input{flex:1;min-width:180px;background:#1b1f2a;border:1px solid #262b39;border-radius:10px;color:#e6e8ef;padding:8px 10px;font-size:14px}
+.toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);background:#232734;border:1px solid #333a4d;color:#e6e8ef;padding:9px 14px;border-radius:12px;font-size:13px;opacity:0;pointer-events:none;transition:opacity .2s;max-width:88vw}
+.toast.show{opacity:1}
+a{color:#8ab4ff;text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <span class="dot" id="dot"></span>
+    <span class="title">小鲸鱼</span>
+    <span class="grow"></span>
+    <span class="muted" id="stamp">连接中…</span>
+  </div>
+  <div id="auth" class="card" hidden>
+    <h2>需要令牌</h2>
+    <div class="muted" id="authMsg">把后端 state/hub-token 里的令牌粘进来（只需要一次）。</div>
+    <div class="btns"><input id="tokIn" placeholder="令牌"><button class="primary" id="tokSave">保存</button></div>
+  </div>
+  <div id="body" hidden>
+    <div class="card">
+      <h2>她在干嘛</h2>
+      <div class="doing" id="doing">—</div>
+      <div class="note" id="note"></div>
+      <div class="row" style="margin-top:10px">
+        <span class="big" id="mood">—</span>
+        <span class="aff" id="aff"></span>
+      </div>
+      <div class="note" id="moodNote"></div>
+    </div>
+    <div class="card">
+      <h2>链路</h2>
+      <div id="pills"></div>
+    </div>
+    <div class="card">
+      <h2>记忆与日记</h2>
+      <div class="grid">
+        <div class="kv"><div class="k">长期记忆</div><div class="v" id="factsTotal">—</div></div>
+        <div class="kv"><div class="k">日记天数</div><div class="v" id="diaryDays">—</div></div>
+        <div class="kv"><div class="k">今天写了</div><div class="v" id="diaryToday">—</div></div>
+        <div class="kv"><div class="k">累计字数</div><div class="v" id="diaryTotal">—</div></div>
+      </div>
+    </div>
+    <div class="card" id="goalsCard" hidden>
+      <h2>她想干的事</h2>
+      <ul class="list" id="goals"></ul>
+    </div>
+    <div class="card" id="lifeCard" hidden>
+      <h2>今天早些时候</h2>
+      <ul class="list" id="life"></ul>
+    </div>
+    <div class="card">
+      <h2>去玩会儿</h2>
+      <div class="btns" id="playBtns"></div>
+      <h2 style="margin-top:12px">活跃度</h2>
+      <div class="btns" id="levelBtns"></div>
+    </div>
+    <div class="muted" style="text-align:center;margin:14px 0 4px">hub v<span id="ver">—</span> · 数据在后端那台机器上，这里只是屏幕</div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var TOKEN_KEY = 'hubToken';
+  var token = '';
+  function bootToken(){
+    var u = new URL(location.href);
+    var t = u.searchParams.get('token');
+    if (t) { token = t; try { localStorage.setItem(TOKEN_KEY, t); } catch(e){} u.searchParams.delete('token'); history.replaceState(null,'',u.pathname + (u.search? u.search:'') + u.hash); }
+    else { try { token = localStorage.getItem(TOKEN_KEY) || ''; } catch(e){ token=''; } }
+  }
+  function toast(msg){
+    var el = $('toast'); el.textContent = msg; el.classList.add('show');
+    clearTimeout(toast._t); toast._t = setTimeout(function(){ el.classList.remove('show'); }, 2400);
+  }
+  function api(path, opts){
+    opts = opts || {};
+    opts.headers = Object.assign({'accept':'application/json'}, opts.headers||{}, token? {'authorization':'Bearer '+token}:{});
+    return fetch(path, opts).then(function(r){
+      if (r.status === 401) { showAuth('令牌无效或已过期。'); throw new Error('unauthorized'); }
+      return r.json();
+    });
+  }
+  function showAuth(msg){
+    $('auth').hidden = false; $('body').hidden = true;
+    if (msg) $('authMsg').textContent = msg;
+  }
+  function esc(s){ return String(s==null?'':s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+  function ago(iso){
+    if (!iso) return '';
+    var t = Date.parse(iso); if (!isFinite(t)) return '';
+    var s = Math.max(0, Math.round((Date.now()-t)/1000));
+    if (s < 60) return s + ' 秒前';
+    if (s < 3600) return Math.round(s/60) + ' 分钟前';
+    if (s < 86400) return Math.round(s/3600) + ' 小时前';
+    return Math.round(s/86400) + ' 天前';
+  }
+  function render(s){
+    var her = s.her || {}, act = her.activity || {}, mood = her.mood, f = her.facts || {}, d = her.diary || {};
+    $('dot').className = 'dot ' + (s.upCount === s.total ? 'on' : 'warn');
+    $('stamp').textContent = '更新于 ' + new Date(s.at).toLocaleTimeString('zh-CN',{hour12:false});
+    $('doing').textContent = act.doing || '（她还没记）';
+    $('note').textContent = act.plan ? '打算：' + act.plan + (act.updatedAt ? '（' + ago(act.updatedAt) + '）' : '') : (act.updatedAt ? '记录于 ' + ago(act.updatedAt) : '');
+    if (mood) {
+      $('mood').textContent = mood.label || '说不清';
+      $('aff').textContent = mood.percent == null ? '' : '好感 ' + mood.percent + '%';
+      $('moodNote').textContent = mood.note || '';
+    } else { $('mood').textContent = '—'; $('aff').textContent = ''; $('moodNote').textContent = '还没有心情记录'; }
+    $('pills').innerHTML = (s.services||[]).map(function(x){
+      return '<span class="pill"><span class="d ' + (x.up?'on':'') + '"></span>' + esc(x.name) + ' <span class="muted">' + x.port + '</span></span>';
+    }).join('') || '<span class="muted">没有链路信息</span>';
+    $('factsTotal').textContent = f.total == null ? '—' : f.total;
+    $('diaryDays').textContent = d.days == null ? '—' : d.days;
+    $('diaryToday').textContent = d.todayChars == null ? '—' : d.todayChars + ' 字';
+    $('diaryTotal').textContent = d.totalChars == null ? '—' : d.totalChars + ' 字';
+    var g = her.goals || [];
+    $('goalsCard').hidden = !g.length;
+    $('goals').innerHTML = g.map(function(x){ return '<li>' + esc(x.text) + '</li>'; }).join('');
+    var l = her.life || [];
+    $('lifeCard').hidden = !l.length;
+    $('life').innerHTML = l.map(function(x){ return '<li><span class="muted">' + esc(x.t) + '</span> ' + esc(x.text) + '</li>'; }).join('');
+  }
+  function tick(){
+    if (!token) { showAuth(); return; }
+    api('/api/hub/snapshot').then(function(s){
+      $('auth').hidden = true; $('body').hidden = false; render(s);
+    }).catch(function(e){ if (e.message !== 'unauthorized') $('stamp').textContent = '连不上后端'; });
+  }
+  function act(name, body, label){
+    api('/api/hub/action', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({action:name, body:body})})
+      .then(function(r){ toast(r && r.ok ? (label || '好了') : ('失败：' + ((r && r.error) || '未知'))); tick(); })
+      .catch(function(){ toast('动作没发出去'); });
+  }
+  var PLAY = [['20 分钟',0.34],['1 小时',1],['2 小时',2],['收起',0]];
+  var LEVELS = [['摸鱼',30],['正常',10],['勤快',5],['亢奋',2],['狂暴',1]];
+  $('playBtns').innerHTML = PLAY.map(function(p,i){ return '<button data-play="' + i + '">' + p[0] + '</button>'; }).join('');
+  $('levelBtns').innerHTML = LEVELS.map(function(l,i){ return '<button data-level="' + i + '">' + l[0] + '</button>'; }).join('');
+  $('playBtns').onclick = function(e){ var b = e.target.closest('button'); if (!b) return; var p = PLAY[+b.dataset.play]; if (p[1] > 0) act('turbo', {on:true, hours:p[1]}, '让她去玩 ' + p[0]); else act('turbo', {on:false}, '收回去了'); };
+  $('levelBtns').onclick = function(e){ var b = e.target.closest('button'); if (!b) return; var l = LEVELS[+b.dataset.level]; act('level', {minutes:l[1]}, '活跃度 → ' + l[0] + '（每 ' + l[1] + ' 分钟）'); };
+  $('tokSave').onclick = function(){ var v = $('tokIn').value.trim(); if (!v) return; token = v; try{ localStorage.setItem(TOKEN_KEY, v); }catch(e){} $('auth').hidden = true; tick(); };
+  bootToken();
+  tick();
+  setInterval(function(){ if (!document.hidden) tick(); }, 8000);
+  document.addEventListener('visibilitychange', function(){ if (!document.hidden) tick(); });
+  fetch('/healthz').then(function(r){ return r.json(); }).then(function(h){ $('ver').textContent = h.version; }).catch(function(){});
+})();
+</script>
+</body>
+</html>
