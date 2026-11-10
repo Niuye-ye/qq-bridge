@@ -3,6 +3,7 @@
 // 页面只调允许的只读/控制接口，且不含任何令牌或 state 落盘路径。
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { handlePetRoutes, PET_PAGE_HTML } from '../src/console/pet.mjs';
 
 const SECURITY_HEADERS = { 'x-frame-options': 'SAMEORIGIN', 'x-content-type-options': 'nosniff' };
@@ -89,4 +90,19 @@ test('桌面上有的关键功能都给了入口（心情/好感/她在干嘛/�
 test('自动刷新有节流：15 秒一轮，不是死循环', () => {
   assert.ok(PET_PAGE_HTML.includes('setInterval(load,15000)'));
   assert.ok(PET_PAGE_HTML.includes('visibilitychange'));
+});
+
+// 令牌页契约（静态检查）：页面类 401 不能用 prompt()。
+// 手机浏览器（HyperOS 自带）会把 prompt 的输入框预填成上一次的输入（实测预填了 QQ 号），
+// 而且 prompt 对话框还会盖住页面、点「取消」不触发重载 —— 改用页面内表单 + localStorage。
+test('401 令牌页是页面内表单，不用 prompt()', () => {
+  const src = readFileSync(new URL('../src/bridge.js', import.meta.url), 'utf8');
+  assert.ok(!src.includes("prompt('请输\\u5165控制台访问令牌"), '不应再用 prompt 收集令牌');
+  assert.ok(src.includes('function tokenPageHtml('), '应有 tokenPageHtml 渲染函数');
+  const i = src.indexOf('function tokenPageHtml(');
+  const body = src.slice(i, i + 3000);
+  assert.ok(body.includes('localStorage.setItem("petToken"'), '进入后应把令牌存 localStorage');
+  assert.ok(!body.includes('localStorage.getItem("petToken")'), '不回填旧令牌（回填只会 401 回流）');
+  assert.ok(body.includes('location.replace('), '提交后应 location.replace 回原路径');
+  assert.ok(!/token=[A-Za-z0-9_-]{16,}/.test(body), '令牌不能硬编码进 HTML');
 });

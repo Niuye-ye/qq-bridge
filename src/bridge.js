@@ -3900,7 +3900,44 @@ const activeWaitCancels = new Map();
     log('控制台：二代 AI 状态已重置（会话、定时器、唤醒配置已清空，工具日志保留）');
   }
 
-  function startConsoleServer() {
+  // 页面类入口（/ 控制台、/pet 手机桌宠）的「输入令牌」页。
+//
+// 为什么不用 prompt()：手机浏览器（小米/HyperOS 自带）会把 prompt 的输入框预填成
+// 上一次的输入（实测预填了 QQ 号），而且 prompt 对话框会盖住页面、点「取消」也不会
+// 让页面重载 —— 主人得手动重开一次。改成页面内表单：一个密码框 + 一个按钮，
+// 令牌存 localStorage（pet 页本来就读它）；**这里不回填** —— 回填旧令牌只会 401 回流。
+// 令牌只由浏览器拼回同一个 path，不写进服务端渲染的 HTML 正文。
+function tokenPageHtml(pathname) {
+  const p = JSON.stringify(pathname);
+  return [
+    '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width,initial-scale=1">',
+    '<meta name="theme-color" content="#0f1117"><title>需要令牌</title>',
+    '<style>',
+    'body{margin:0;background:#0f1117;color:#e6e8ef;font:15px/1.6 -apple-system,"PingFang SC","Noto Sans CJK SC",sans-serif;padding:34px 18px}',
+    '.wrap{max-width:420px;margin:0 auto}',
+    'h1{font-size:17px;margin:0 0 6px}',
+    '.sub{color:#7d8598;font-size:13px;margin:0 0 18px}',
+    'input{width:100%;box-sizing:border-box;background:#171a22;border:1px solid #2e3444;border-radius:12px;padding:12px 14px;color:#e6e8ef;font-size:15px}',
+    'button{width:100%;margin-top:10px;background:#2b5cff;border:0;color:#fff;border-radius:12px;padding:12px;font-size:15px}',
+    '.err{color:#ff9a9a;font-size:13px;margin-top:10px;min-height:18px}',
+    '</style></head><body><div class="wrap">',
+    '<h1>需要控制台令牌</h1>',
+    '<p class="sub">令牌在桥的 state/console-token 文件里，粘贴一次就记住。</p>',
+    '<input id="t" type="password" placeholder="粘贴令牌" autocomplete="off" autocapitalize="off">',
+    '<button id="go">进入</button><div class="err" id="e"></div>',
+    '<script>',
+    'var P=' + p + ';var el=document.getElementById("t");',
+    'function go(){var t=el.value.trim();if(!t){document.getElementById("e").textContent="令牌不能为空";return}',
+    'try{localStorage.setItem("petToken",t)}catch(err){}',
+    'location.replace(P+"?token="+encodeURIComponent(t))}',
+    'document.getElementById("go").onclick=go;',
+    'el.addEventListener("keydown",function(ev){if(ev.key==="Enter")go()});',
+    '</script></div></body></html>',
+  ].join('');
+}
+
+function startConsoleServer() {
     // DSH 模型与思考强度域的路由工厂：只建一次（模型目录单飞缓存、失败日志去重 Set 要跨请求复用）
     const handleDshModelRoutes = createDshModelRoutes({ callUnary: (...args) => api.callUnary(...args) });
     const port = cfg.consolePort ?? 3100;
@@ -4061,7 +4098,7 @@ const activeWaitCancels = new Map();
         // 其余 API 仍是干净的 JSON 401。令牌只用来拼回同一个路径，不写进 HTML 正文。
         if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/pet')) {
           res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
-          res.end('<!doctype html><meta charset="utf-8"><title>需要令牌</title><script>const t=prompt(\'请输入控制台访问令牌\');if(t)location.href=' + JSON.stringify(url.pathname) + '+\'?token=\'+encodeURIComponent(t);</script>');
+          res.end(tokenPageHtml(url.pathname));
         } else {
           sendJson({ ok: false, error: '未授权：请提供控制台访问令牌' }, 401);
         }
