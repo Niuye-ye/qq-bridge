@@ -83,6 +83,22 @@ function findOneClick() {
   }
   return '';
 }
+
+// 统一 App（方案 M）的后端 hub：数据只有一份，跑在手机 Termux 里（127.0.0.1:8800），
+// PC 这边只是屏幕。地址和「打不开时怎么办」都写在 config.json 的 hub 段（gitignore，本机路径不进代码）：
+//   "hub": { "url": "http://127.0.0.1:8800", "ensureCmd": "powershell ... -File C:\\dsh\\bin\\hub-ensure.ps1" }
+// ensureCmd 干两件事：把手机的 8800 转发到本机（adb forward 会在手机断连后失效）、hub 挂了就拉起来。
+function findHubCfg() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(BRIDGE_CFG, 'utf8'));
+    const h = (cfg && typeof cfg.hub === 'object' && cfg.hub) || {};
+    return {
+      url: typeof h.url === 'string' && h.url.trim() ? h.url.trim() : '',
+      ensureCmd: typeof h.ensureCmd === 'string' ? h.ensureCmd.trim() : '',
+    };
+  } catch { return { url: '', ensureCmd: '' }; }
+}
+const HUB = findHubCfg();
 const ONECLICK = findOneClick();
 
 // VIEW = [-12, -8, 268, 272] → 280 x 280。窗口必须是正方形，理由见 桌宠改造-最终方案.md §2
@@ -682,6 +698,7 @@ function buildTray() {
   const menu = Menu.buildFromTemplate([
     { label: '显示小鲸鱼', click: () => showPet() },
     { label: '跟她说句话', click: () => openChat() },
+    { label: '打开主界面', click: () => openHub() },
     { type: 'separator' },
     { label: '藏起来', click: () => hideForGood() },
     { type: 'separator' },
@@ -752,6 +769,65 @@ function openPreview(file, title, kind) {
   } catch (e) { log('openPreview 失败', file, e.message); }
 }
 
+// ────────────────────────────── 统一 App 主界面 ──────────────────────────────
+// 方案 M：后端在手机（hub 8800），这里只开一个窗口把那份页面装进来。
+// 两个坑都在这函数里兜：adb forward 会因手机断连失效、hub 自己也可能挂（guard 还没轮到）——
+// 所以打开前先探 /healthz，不通就跑 config.hub.ensureCmd（幂等，见 bin\hub-ensure.ps1）。
+let hubWin = null;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function hubAlive(base, timeoutMs = 1500) {
+  try {
+    const ac = new AbortController();
+    const t = setTimeout(() => ac.abort(), timeoutMs);
+    const r = await fetch(base.replace(/\/$/, '') + '/healthz', { signal: ac.signal });
+    clearTimeout(t);
+    return !!r.ok;
+  } catch { return false; }
+}
+
+function hubErrorHtml(base, why) {
+  const h = (t) => String(t).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return '<!doctype html><meta charset="utf-8"><title>小鲸鱼</title>' +
+    '<body style="margin:0;background:#0f1117;color:#c9d3e3;font:15px/1.7 system-ui,Microsoft YaHei,sans-serif;padding:28px">' +
+    '<h2 style="color:#7fb2ff;margin:0 0 12px">主界面打不开</h2>' +
+    '<p>连不上后端 <b>' + h(base) + '</b></p>' +
+    '<p style="color:#8892a6">' + h(why) + '</p>' +
+    '<ol style="color:#8892a6">' +
+    '<li>手机连上了吗（USB / 同一 WiFi + 无线调试）</li>' +
+    '<li>手机上整条链路起了吗：面板 <b>127.0.0.1:8798</b> 点「启动全部」</li>' +
+    '<li>再看一眼手机 <b>$HOME/logs/hub.log</b></li>' +
+    '</ol>' +
+    '<p style="margin-top:18px"><a href="' + h(base) + '" style="color:#7fb2ff">重试</a></p>';
+}
+
+async function openHub() {
+  const base = HUB.url || 'http://127.0.0.1:8800';
+  if (hubWin && !hubWin.isDestroyed()) { hubWin.show(); hubWin.focus(); return; }
+  let alive = await hubAlive(base);
+  if (!alive && HUB.ensureCmd) {
+    log('hub 连不上，先跑保底命令：', HUB.ensureCmd);
+    try {
+      // shell:true + detached：保证不拖住桌宠主进程；windowsHide 不弹黑窗
+      spawn(HUB.ensureCmd, { shell: true, detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    } catch (e) { log('hub 保底命令起不来', e.message); }
+    for (let i = 0; i < 16 && !alive; i++) { await sleep(1500); alive = await hubAlive(base); }
+  }
+  const w = new BrowserWindow({
+    width: 460, height: 900, minWidth: 380, minHeight: 560,
+    title: '小鲸鱼', backgroundColor: '#0f1117', autoHideMenuBar: true, show: false,
+    webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true, spellcheck: false },
+  });
+  hubWin = w;
+  // 页面里的外链一律交给系统浏览器，别在这个窗口里开新窗
+  w.webContents.setWindowOpenHandler(({ url }) => { openUrl(url); return { action: 'deny' }; });
+  w.once('ready-to-show', () => { if (!w.isDestroyed()) { w.show(); w.focus(); } });
+  w.on('closed', () => { if (hubWin === w) hubWin = null; });
+  w.webContents.on('did-finish-load', () => log('主界面加载完成', w.webContents.getURL().slice(0, 120)));
+  w.webContents.on('did-fail-load', (_e, code, desc, u) => log('主界面加载失败', code, desc, String(u || '').slice(0, 120)));
+  if (alive) { w.loadURL(base); log('主界面已打开', base); }
+  else { w.loadURL('data:text/html;charset=utf-8,' + encodeURIComponent(hubErrorHtml(base, '保底命令跑过了还是不通。'))); log('主界面打不开，显示说明页', base); }
+}
 // 想用外部程序看的时候走记事本，别落到 IDE 上
 function openText(p) {
   try {
@@ -868,6 +944,7 @@ const menu = createMenu({
   getWin: () => win,
   getState: () => bridgeState,
   openChat,
+  openHub,
   feelMenuItems,
   trimTo,
   showActivity,
@@ -1373,6 +1450,12 @@ if (!app.requestSingleInstanceLock()) {
     }
     if (process.env.PET_TEST_ACT === 'activity') {
       setTimeout(() => { log('debug: 试一次「她在干嘛」'); showActivity(); }, 4000);
+    }
+    if (process.env.PET_TEST_HUB) {
+      // 自检：验证「打开主界面」这条路（hub 探活 → 保底命令 → 开窗），跑完自己退出
+      setTimeout(() => { log('[测试] 打开主界面'); openHub().catch((e) => log('[测试] openHub 失败', e.message)); }, 3000);
+      // app.exit 不触发 before-quit → 不会留 pet-quit 标记（那会把 pet-guard 弄成「用户主动退出」而收手）
+      setTimeout(() => { log('[测试] 退出'); app.exit(0); }, 16000);
     }
     if (process.env.PET_TEST_PREVIEW) {
       // 调试用：验证内置预览窗（diary=日记 / facts=长期记忆）

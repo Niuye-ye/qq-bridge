@@ -18,7 +18,7 @@ const REQUIRED_DEPS = [
   'todayDiary', 'openPreview', 'FACTS_JSON', 'PLAY_FOCUS', 'PLAY_PRESETS', 'playFor', 'toggleTurbo',
   'clock', 'lastPlayLine', 'levelNow', 'LEVEL_PRESETS', 'setLevel', 'togglePause', 'readPetState',
   'toggleAnim', 'SKINS', 'writePetState', 'send', 'log', 'MOTIONS', 'FACES', 'hideForGood',
-  'showLinkStatus', 'ONECLICK', 'oneClick', 'runOneClick', 'openPath', 'openUrl', 'BRIDGE', 'bridge', 'APP_LOG',
+  'showLinkStatus', 'ONECLICK', 'oneClick', 'runOneClick', 'openPath', 'openUrl', 'BRIDGE', 'bridge', 'APP_LOG', 'openHub',
   'onQuit', 'SIZE', 'SIZE_STEP', 'applySize',
 ];
 
@@ -38,10 +38,12 @@ function createMenu(deps) {
       PLAY_FOCUS, PLAY_PRESETS, playFor, toggleTurbo, clock, lastPlayLine, levelNow, LEVEL_PRESETS,
       setLevel, togglePause, readPetState, toggleAnim, SKINS, writePetState, send, log,
       SIZE, SIZE_STEP, applySize, MOTIONS, FACES, hideForGood, showLinkStatus, // applySize 2026-10-27 补回（曾漏传 → 更大/更小必炸）
-      ONECLICK, oneClick, runOneClick, openPath, openUrl, BRIDGE, bridge, APP_LOG, onQuit,
+      ONECLICK, oneClick, runOneClick, openPath, openUrl, BRIDGE, bridge, APP_LOG, onQuit, openHub,
     } = deps;
     return [
       { label: '跟她说句话…', click: () => openChatRef() },
+      // 统一 App（方案 M）：一个窗口装手机的 hub 页面，和手机上是同一份数据（2026-11-10）
+      { label: '打开主界面', click: () => openHub() },
       { type: 'separator' },
       {
         label: '她',
