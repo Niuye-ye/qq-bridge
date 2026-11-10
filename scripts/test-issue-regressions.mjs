@@ -6,6 +6,7 @@
 //   #11/#19/#23/#26 回合结束信号丢了 → 会话永久 busy —— 回合判忙改为「起始时间 + 15 分钟租约」，
 //       无起始时间的残留 collector 不再判忙；collector 保留，迟到回复照常 flush。
 //   #29 被 @ 了不理人 —— 机器人昵称/QQ 号必须写进唤醒 prompt（否则 agent 把 @自己 当 @别人）。
+//   #30 她不记事儿 —— 【记忆】指令必须挂在 base（每轮都带）；facts 为空时也不能消失。
 import assert from 'node:assert/strict';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
 
@@ -117,6 +118,31 @@ await test('#29 唤醒 prompt 必须写明机器人自己的昵称与 QQ 号', a
     h.setSelfIdentity('', '');
     assert.equal(h.selfIdentityTextV2(), '', '身份未知时不注入空行（不能写「你的昵称是（）」）');
     assert.doesNotMatch(h.buildWakePromptV2(KEY, 'timeout'), /【你的身份】/);
+  } finally { await h.close(); }
+});
+
+// ── #30 她不记事儿 —— 记忆指令必须每轮都在 prompt 里 ─────────────────────────
+// 背景：state/tool-calls.jsonl 全量统计里 qq_remember / qq_recall / qq_forget 调用都是 0 次。
+// 根因不是容量，是提示词从没教过她：facts 为空时【你记得的事】整段不注入，
+// 连「有 qq_remember 这个工具、什么时候该用」都不会出现在上下文里。
+// 所以这段指令必须挂在 base（每轮都带），不能塞进每 10 轮才补一次的 rulesLine。
+await test('#30 唤醒 prompt 每轮都带记忆指令（空记忆时也要有）', async () => {
+  const h = await bridgeHarness();
+  try {
+    for (const reason of ['atMention', 'timeout', 'replyCheck', 'bootstrap']) {
+      const prompt = h.buildWakePromptV2(KEY, reason);
+      assert.match(prompt, /【记忆】/, `${reason} 唤醒必须带【记忆】段（每轮都带）`);
+      assert.match(prompt, /qq_remember/, '要点名 qq_remember，否则她不知道自己能记');
+      assert.match(prompt, /tier=long/, '要说明长期记忆用 tier=long');
+      assert.match(prompt, /qq_recall/, '想不起以前的事要先 qq_recall 搜');
+    }
+    // facts 为空（新部署 / 手机侧）时依然要有：这正是「一条都没记过」的起点。
+    assert.match(h.buildWakePromptV2(KEY, 'timeout'), /【记忆】/, '空记忆时更需要这条指令');
+
+    // 控制台把工具关掉后不该再教她调（注册期已摘掉工具，教了只会 403）。
+    h.cfg.socialV2.tools.remember = false;
+    h.cfg.socialV2.tools.recall = false;
+    assert.doesNotMatch(h.buildWakePromptV2(KEY, 'timeout'), /【记忆】/, '工具关掉后不应再出现记忆指令');
   } finally { await h.close(); }
 });
 

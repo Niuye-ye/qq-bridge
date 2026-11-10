@@ -8,7 +8,9 @@
 //
 // 负责的路由（/api/socialV2/*）：
 //   GET/POST config     仿真配置读写（归一化 + 只在影响默认唤醒配置时刷新会话）
+//                       memory（记忆容量/注入条数）与 proactive 的 minGapMs/maxPerDay 也在这里夹取
 //   GET      self       「她在干嘛」聚合（活动/心情/想干的事/时间线/在玩什么/暂停/档位）
+//   GET      mood       心情/好感度只读快照（state/mood.json；桌宠与手机端共用这一个口径）
 //   GET/POST activity   暂停/恢复（暂停会顺带关掉超活跃模式并清定时器）
 //   GET/POST turbo      超活跃模式开关（时长 / 间隔 / 主题）
 //   GET      mc-mode    Minecraft 模式与队列
@@ -27,7 +29,7 @@ export async function handleSocialStateRoutes(ctx) {
     turboStatusV2, setTurboV2, turboActiveV2, turboFocusV2, mcModeActiveV2,
     ACTIVE_LEVELS, readActivityV2, readFeelV2, isConversationBusyV2,
     getSocialV2State, computeWakeSafetyV2, agentTokenOk, v2SessionAllowed, v2ToolEnabled,
-    resetSocialV2AllStateV2
+    resetSocialV2AllStateV2, applyFactsOpts
   } = ctx;
 
   if (req.method === 'GET' && url.pathname === '/api/socialV2/config') {
@@ -53,7 +55,7 @@ export async function handleSocialStateRoutes(ctx) {
     const current = fileV2 ?? ((cfg.socialV2 && typeof cfg.socialV2 === 'object') ? cfg.socialV2 : {});
     const merged = { ...current, ...body };
     // 子对象必须是非 null 对象；null/数组/基本类型会覆盖默认值导致工具开关被绕过，这里直接保留当前值。
-    for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'sticker', 'feedback', 'context']) {
+    for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'sticker', 'feedback', 'context', 'memory']) {
       if (body[sub] !== undefined && (body[sub] === null || typeof body[sub] !== 'object' || Array.isArray(body[sub]))) {
         merged[sub] = current[sub] ?? {};
       }
@@ -129,6 +131,28 @@ export async function handleSocialStateRoutes(ctx) {
       }
       if (merged.proactive.enabled !== undefined) merged.proactive.enabled = merged.proactive.enabled === true;
       if (merged.proactive.probability !== undefined) merged.proactive.probability = Math.min(1, Math.max(0, Number(merged.proactive.probability) || 0));
+      // 2026-11-10：全局节流（最小间隔 1 分钟~24 小时 / 每天 1~100 次）。非法或缺失回落当前值/默认。
+      // 注意 null / '' 要当「非法」处理：Number(null) === 0 会被当成 0 再夹到下限，
+      // 而调用方传 null 的意图通常是「清掉这个字段、回默认」。
+      const throttleNum = (raw) => (raw === null || raw === undefined || raw === '') ? Number.NaN : Number(raw);
+      if (merged.proactive.minGapMs !== undefined) {
+        const n = throttleNum(merged.proactive.minGapMs);
+        merged.proactive.minGapMs = Number.isFinite(n)
+          ? Math.min(24 * 60 * 60 * 1000, Math.max(60 * 1000, Math.round(n)))
+          : (Number(current.proactive?.minGapMs) || 30 * 60 * 1000);
+      }
+      if (merged.proactive.maxPerDay !== undefined) {
+        const n = throttleNum(merged.proactive.maxPerDay);
+        merged.proactive.maxPerDay = Number.isFinite(n)
+          ? Math.min(100, Math.max(1, Math.round(n)))
+          : (Number(current.proactive?.maxPerDay) || 12);
+      }
+    }
+    // memory：长期记忆的容量与每轮注入条数。applyFactsOpts 一边夹取一边改到运行中的 store
+    // （不用重启桥），返回的就是生效值，落盘也写它，保证「文件里看到的就是真在用的」。
+    if (body.memory && typeof body.memory === 'object') {
+      merged.memory = { ...(current.memory ?? {}), ...body.memory };
+      if (typeof applyFactsOpts === 'function') merged.memory = applyFactsOpts(merged.memory);
     }
     // sticker：表情包体系参数归一化
     if (body.sticker && typeof body.sticker === 'object') {
@@ -232,6 +256,21 @@ export async function handleSocialStateRoutes(ctx) {
       },
       paused: !!socialV2.paused,
       level: socialV2.level ? { ...socialV2.level } : null,
+    });
+    return true;
+  }
+  // 心情/好感度只读：桌宠、手机端、控制台都走这一个口径，别各自去读 state/mood.json。
+  // 只读不写 —— 心情是她自己的，控制台不代写。
+  if (req.method === 'GET' && url.pathname === '/api/socialV2/mood') {
+    const feel = readFeelV2();
+    sendJson({
+      ok: true,
+      mood: feel?.mood ?? '',
+      moodLabel: feel?.moodLabel ?? '',
+      affinity: Number.isFinite(Number(feel?.affinity)) ? Number(feel.affinity) : null,
+      note: feel?.note ?? '',
+      lastTalkAt: feel?.lastTalkAt ?? '',
+      lastDiaryAt: feel?.lastDiaryAt ?? '',
     });
     return true;
   }

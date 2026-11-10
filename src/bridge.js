@@ -120,6 +120,7 @@ import { handleSendRoutes } from './console/send.mjs';
 import { handleHistoryRoutes } from './console/history.mjs';
 import { handleToolsRoutes } from './console/tools.mjs';
 import { handleAdminRoutes } from './console/admin.mjs';
+import { handlePetRoutes } from './console/pet.mjs';
 // Minecraft 陪伴：轮询 Numen 模组内置 MCP 服务端的游戏内消息（纯 I/O + 队列，不碰会话状态机）
 import { dropMcMessages, flushMcQueue, mcAlive, mcBusyMs, mcQueueSize, mcStatus, peekMcMessages, startMcWatcher } from './mc-companion.js';
 import {
@@ -284,10 +285,8 @@ function atomicWriteJson(file, obj) {
   }
 }
 
-// 长期记忆数据层（src/memory-facts.mjs）。这里就地解构，是为了让原来那 54 处调用点一个字都不用改。
-// 注意：必须在任何一次调用之前求值 —— 最早的调用在 ~6675（facts 路由），所以放这里。
-const FACTS_STORE = createFactsStore({ root: ROOT, log, atomicWriteJson });
-const { readFactsV2, writeFactsV2, readForgottenFactsV2, writeForgottenFactsV2, factHalfLifeDaysV2, factExpiredV2, factDueV2, parseFactExpiresV2, factBaseStrengthV2, factStrengthV2, touchFactV2, archiveFactsV2, restoreFactV2, scoreFactV2, factNormTextV2, isSameByFillersV2, findSameFactV2, addFactV2, removeFactV2, searchFactsV2, reinforceFactsV2, formatFactsLineV2 } = FACTS_STORE;
+// 长期记忆数据层（src/memory-facts.mjs）在 main() 里构造：容量/注入条数要读 cfg.socialV2.memory，
+// 而 cfg 只在 main() 内可见。解构仍贴在构造处，原来那些调用点的写法一个字都不用改。
 // 原子写文本文件。
 function atomicWriteText(file, text) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -952,7 +951,11 @@ function loadConfig() {
         checkIntervalMinMs: 30 * 60 * 1000,
         checkIntervalMaxMs: 90 * 60 * 1000,
         idleThresholdMs: 15 * 60 * 1000,
-        probability: 0.3
+        probability: 0.3,
+        // 2026-11-10：全局节流（记在 state/proactive.json）。每个会话各跑一份定时器，
+        // 不限的话「私聊 + 几个群」半小时内能连着打扰好几次。
+        minGapMs: 30 * 60 * 1000,   // 两次主动开口最小间隔
+        maxPerDay: 12               // 每天主动开口上限（按本地自然日）
       },
       feedback: {
         maxLength: 500,
@@ -976,6 +979,13 @@ function loadConfig() {
         maxBytes: 8 * 1024 * 1024,
         maxPixels: 64_000_000,
         maxCount: 5
+      },
+      // 长期记忆的容量与每轮注入条数（2026-11-10）。数据层默认就是 80/4/2，
+      // 这里显式写出来，控制台/配置文件才有可见的落点；夹取见 clampMemoryOptsV2。
+      memory: {
+        maxFacts: 80,        // 记忆上限（20~500），满了淘汰最弱的进遗忘池
+        injectLong: 4,       // 每轮注入「长期记得的」条数（1~16）
+        injectNormal: 2      // 每轮注入「最近记得的」条数（0~16）
       },
       ...(file.socialV2 ?? {})
     }
@@ -1517,9 +1527,33 @@ const REJECT_WORDS = new Set(['拒绝', '不同意', '不允许', '驳回', 'no'
 // 未收紧时给出可复制的提权命令）。null = 还没跑/平台不适用。
 let stateDirHardened = null;
 
+/**
+ * cfg.socialV2.memory 的夹取（2026-11-10）：读不到/写错就回落默认 80/4/2。
+ * 为什么夹在桥这层而不是数据层：这三个值直接决定每轮 prompt 多长（成本）与淘汰频率，
+ * 属于运维策略；memory-facts.mjs 只保证「不传 opts 行为不变」，不背范围策略。
+ */
+function clampMemoryOptsV2(raw) {
+  const o = (raw && typeof raw === 'object') ? raw : {};
+  const int = (value, fallback, min, max) => {
+    const n = Math.floor(Number(value));
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+  };
+  return {
+    maxFacts: int(o.maxFacts, 80, 20, 500),
+    injectLong: int(o.injectLong, 4, 1, 16),
+    injectNormal: int(o.injectNormal, 2, 0, 16),
+  };
+}
+
 // ── 主流程 ──────────────────────────────────────────────────────────────────
 async function main() {
   const cfg = loadConfig();
+  // 长期记忆：容量与注入条数从 cfg.socialV2.memory 读（夹取见 clampMemoryOptsV2）。
+  // MEMORY_OPTS 按引用交给 memory-facts：控制台保存配置后改的就是这个对象 → 即时生效，不用重启。
+  const MEMORY_OPTS = clampMemoryOptsV2(cfg.socialV2?.memory);
+  const FACTS_STORE = createFactsStore({ root: ROOT, log, atomicWriteJson, opts: MEMORY_OPTS });
+  const { readFactsV2, writeFactsV2, readForgottenFactsV2, writeForgottenFactsV2, factHalfLifeDaysV2, factExpiredV2, factDueV2, parseFactExpiresV2, factBaseStrengthV2, factStrengthV2, touchFactV2, archiveFactsV2, restoreFactV2, scoreFactV2, factNormTextV2, isSameByFillersV2, findSameFactV2, addFactV2, removeFactV2, searchFactsV2, reinforceFactsV2, formatFactsLineV2 } = FACTS_STORE;
+  log('[facts] 容量上限 ' + MEMORY_OPTS.maxFacts + ' 条，每轮注入 long ' + MEMORY_OPTS.injectLong + ' + normal ' + MEMORY_OPTS.injectNormal);
   fs.mkdirSync(STATE_DIR, { recursive: true });
   hardenStateDirAcl();
   acquireLock();
@@ -4023,9 +4057,11 @@ const activeWaitCancels = new Map();
         return crypto.timingSafeEqual(a, b);
       })();
       if (consoleToken && !tokenMatches) {
-        if (req.method === 'GET' && url.pathname === '/') {
+        // 页面类入口（/ 控制台、/pet 手机桌宠）给一张「输入令牌」页：浏览器里输一次就能进；
+        // 其余 API 仍是干净的 JSON 401。令牌只用来拼回同一个路径，不写进 HTML 正文。
+        if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/pet')) {
           res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
-          res.end('<!doctype html><meta charset="utf-8"><title>需要令牌</title><script>const t=prompt(\'请输入控制台访问令牌\');if(t)location.href=\'/?token=\'+encodeURIComponent(t);</script>');
+          res.end('<!doctype html><meta charset="utf-8"><title>需要令牌</title><script>const t=prompt(\'请输入控制台访问令牌\');if(t)location.href=' + JSON.stringify(url.pathname) + '+\'?token=\'+encodeURIComponent(t);</script>');
         } else {
           sendJson({ ok: false, error: '未授权：请提供控制台访问令牌' }, 401);
         }
@@ -4160,7 +4196,7 @@ const activeWaitCancels = new Map();
         // 域模块不 import bridge.js（避免循环依赖），依赖一律从这里注入。
         const consoleCtx = {
           req, res, url, sendJson, readBody, log,
-          fs, ROOT, path,
+          fs, ROOT, path, SECURITY_HEADERS,
           // DSH 模型与思考强度域（src/console/dsh-model.mjs）
           withTimeout, unwrap, normalizeReasoningEffort,
           REASONING_EFFORT_OPTIONS, REASONING_EFFORT_DEFAULT,
@@ -4224,6 +4260,8 @@ const activeWaitCancels = new Map();
           // AI 工具域（src/console/tools.mjs）
           writeActivityV2, formatActivityLineV2, addGoalV2, closeGoalV2, appendLifeV2, formatGoalsLineV2, readGoalsV2, readLifeV2,
           addFactV2, removeFactV2, readFactsV2, readForgottenFactsV2, searchFactsV2, formatFactsLineV2,
+          // 记忆容量/注入条数：返回夹取后的生效值（同时改到运行中的 store，不用重启桥）
+          applyFactsOpts: (raw) => Object.assign(MEMORY_OPTS, clampMemoryOptsV2(raw)),
           // 管理端与杂项域（src/console/admin.mjs）
           ACTIVE_WAIT_LEASE_MS, FEEDBACK_FILE, PRESET_BACKUP_DIR, PRESET_NAMES, STATE_DIR,
           activeWaits, activeWaitCancels, allowed, api, appendFeedbackEntry, atomicWriteText,
@@ -4241,6 +4279,8 @@ const activeWaitCancels = new Map();
         };
         // ── 管理端与杂项域（status/presets/sessions/whitelist/security/social/prompt/initial-prompt/self-image/groups/screen/qzone/wait/feedback/authorize/send/group…） ──
         if (await handleAdminRoutes(consoleCtx)) return;
+        // ── 手机桌宠页（GET /pet，方案 B：手机只当显示器+遥控器，不跑悬浮窗 APK）──
+        if (await handlePetRoutes(consoleCtx)) return;
         // ── 模型 API Key 自助录入页（GET /llm-key）─────────────────────────────
         // 纯静态表单：没令牌也能打开看说明，提交时才需要控制台令牌（?token=）。
         // 只回 HTML，不读 state、不碰凭据文件。
@@ -7291,6 +7331,14 @@ const activeWaitCancels = new Map();
     const activityLine = activityText ? `${activityText}\n\n` : '';
     const factsText = formatFactsLineV2();
     const factsLine = factsText ? `${factsText}\n\n` : '';
+    // 【记忆】必须每轮带（放 base，不放 rulesLine）：state/tool-calls.jsonl 全量统计里
+    // qq_remember / qq_recall / qq_forget 的调用次数都是 0 —— 不是容量不够，是提示词
+    // 从没让她记过。facts 为空时【你记得的事】整段不注入（formatFactsLineV2 返回空），
+    // 连「他有这个工具」都不会出现，于是永远记不住第一条。
+    // 工具被控制台关掉就别再教她用（注册期已经摘掉了，教了只会 403）。
+    const memoryGuideLine = (v2ToolEnabled('remember') || v2ToolEnabled('recall'))
+      ? '【记忆】他说的话里有值得以后用的——他的偏好、说定的约定、重要事实、今天发生的事——就 qq_remember 记一条（kind=fact/pref/event/promise，值得长期记的加 tier=long）；一次最多记 1~2 条，别把聊天流水账塞进去。想不起以前的事，先用 qq_recall 搜关键词再回答，别直接说不知道；记错了用 qq_forget。\n\n'
+      : '';
     // ── 规则段分层注入 ────────────────────────────────────────────────
     // 【反AI味】【积极性】【表情策略】【沉睡前等待】【日记与心情】这五段是稳定的行为约束，
     // 内容每轮几乎完全一样（合计约 1400 字符）。DSH 会话是持久化的：第一轮讲清楚，
@@ -7304,7 +7352,7 @@ const activeWaitCancels = new Map();
     // 【首回复节奏】里带动态的剩余静默秒数，必须每轮带；其余（时间/状态/记忆/参与度）也都是变化项。
     const goalsLine = formatGoalsLineV2();
     const lifeLine = formatLifeLineV2();
-    const base = clockLine + roleLine + identityLine + tokenLine + initialPromptLine + activityLine + factsLine + goalsLine + lifeLine + rulesLine + replyLine + statusLine + wakeLine + memoryLine + participationLine;
+    const base = clockLine + roleLine + identityLine + tokenLine + initialPromptLine + activityLine + factsLine + memoryGuideLine + goalsLine + lifeLine + rulesLine + replyLine + statusLine + wakeLine + memoryLine + participationLine;
     if (reason === 'bootstrap') {
       return `${base}【引导唤醒】你已接入 QQ 会话 ${key}。\n当前是二代仿真模式：你的文本输出不会自动发送到 QQ，所有发言必须通过工具完成。\n请先调用 qq_get_prompt 查看角色、推荐值、可用工具和状态；有待回应的消息先按首回复节奏处理，最后才用 qq_set_wake_config 设置你希望如何被唤醒。`;
     }
@@ -7396,7 +7444,7 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
       return `${base}【桌宠窗口】${key}\n原因：主人坐在电脑前，在你桌面那个小窗口里直接打了字 —— 这不是 QQ 消息，是当面说话。\n他说：\n${dmText}\n\n想回就用 qq_send_message 发到他 QQ（他手机会收到，桌宠窗口也会显示你最近说的话）；不想回、或者不知道怎么回，也要收尾（qq_set_wake_config 或 qq_mark_read）。回的时候别提「桌宠」「窗口」这些词，就当面对面说话。`;
     }
     if (reason === 'proactiveCheck') {
-      return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
+      return `${base}【主动机会】${key}\n原因：群里已经安静了一段时间，这是一次你可以主动冒泡的机会。这是你自己的主动时间——想到什么就直接发给他，不用等他有事找你；没想说的就继续潜水。\n优先主动开个话题、追问上次没聊完的事、分享一个刚想到的想法；如果一时想不到，可以用 mcp__web-search-safe__web_search 搜一下当前热点/时事/网络热梗，再结合记忆里的群友兴趣挑一个自然角度。只要内容自然，就大胆开口；如果实在没话想说，再安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
     }
     if (reason === 'poke') {
       return `${base}【唤醒】${key}\n原因：有人拍了一拍（可能拍了你，也可能拍了别人）。\n先看未读/最近消息里的 [拍一拍] 事件：如果是拍你，可以自然回应一句，也可以用 qq_send_poke 回一个拍一拍；如果是拍别人，觉得有趣也可以接梗。除了回应，偶尔也可以主动戳一下正在聊的人/熟人，像真人手贱/提醒/逗一下，但别频繁。不想接就安静收尾（qq_mark_read 或 qq_set_wake_config）。`;
@@ -7420,7 +7468,7 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
     const st = getSocialV2State(key);
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
-    return `${roleLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
+    return `${roleLine}${identityLine}${tokenLine}【提醒】你还没有完成回合收尾。请调用 qq_set_wake_config 设置下一次唤醒条件（例如继续潜水多久、@/名字/关键词/提问/概率/指定成员等），或者调用 qq_mark_read 表示你看过且决定不接。这是为了防止你忘记收尾后进入“永眠”。收尾前顺手想一下：这轮聊到了值得记住的事没有（他的偏好、说定的约定、重要事实）？有就 qq_remember 记一条，别让这轮白聊。注意：设置潜水前先用 qq_wait_for_messages(timeoutMs=${preSleepMs}) 完成沉睡前观察；等待期间有人说话时查看 newMessages，判断不需要你参与即可收尾。`;
   }
 
   // ── 打断（2026-10-23，参考 Cortico 的 interrupt）────────────────────────────────
@@ -8185,6 +8233,78 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
     log(`[reserved2] 设置定时自醒 ${key}，每 ${mins} 分钟`);
   }
 
+  // ── 主动开口的全局节流（state/proactive.json，2026-11-10）─────────────────
+  // 为什么记文件：proactive 定时器是**每个会话各跑一份**，私聊 + 几个群各开一次口，
+  // 半小时内就能连着打扰好几次。而「别太烦人」是全局要求，不是单会话的。
+  // 存 ISO 时间戳数组；读的时候顺手把 7 天前的剪掉（保留当天 + 7 天）。
+  const PROACTIVE_STATE_PATH = path.join(ROOT, 'state', 'proactive.json');
+  const PROACTIVE_KEEP_MS = 7 * 86400000;
+
+  function readProactiveStateV2() {
+    try {
+      if (!fs.existsSync(PROACTIVE_STATE_PATH)) return { lastAt: [] };
+      const raw = fs.readFileSync(PROACTIVE_STATE_PATH, 'utf8').replace(/^\uFEFF/, '');
+      const obj = JSON.parse(raw);
+      const cutoff = Date.now() - PROACTIVE_KEEP_MS;
+      const lastAt = (Array.isArray(obj?.lastAt) ? obj.lastAt : [])
+        .map((t) => Date.parse(t))
+        .filter((t) => Number.isFinite(t) && t >= cutoff)
+        .sort((a, b) => a - b)
+        .map((t) => new Date(t).toISOString());
+      return { lastAt };
+    } catch (error) {
+      // 坏文件/权限问题按「没有记录」处理，但别阻断主动开口（下一轮写一份好的覆盖掉）。
+      log('[proactive] 读 state/proactive.json 失败，本轮按无记录处理：' + (error?.message ?? error));
+      return { lastAt: [] };
+    }
+  }
+
+  /** 每个上限按**本地自然日**算（不是 UTC，不然晚上 8 点前后会跳日）。 */
+  function proactiveDayKeyV2(ms) {
+    const d = new Date(ms);
+    return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
+  }
+
+  /** 两个节流参数的夹取：配置文件写错/超范围都拉回安全值（默认 30 分钟 / 12 次）。 */
+  function proactiveThrottleCfgV2() {
+    const p = cfg.socialV2?.proactive ?? {};
+    const int = (value, fallback, min, max) => {
+      const n = Math.floor(Number(value));
+      return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
+    };
+    return {
+      minGapMs: int(p.minGapMs, 30 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
+      maxPerDay: int(p.maxPerDay, 12, 1, 100),
+    };
+  }
+
+  /** 现在能不能开口？返回 {ok, reason, minGapMs, maxPerDay, todayCount, gapLeftMs}。 */
+  function checkProactiveThrottleV2(now = Date.now()) {
+    const { minGapMs, maxPerDay } = proactiveThrottleCfgV2();
+    const times = readProactiveStateV2().lastAt.map((t) => Date.parse(t)).filter((t) => Number.isFinite(t));
+    const last = times.length ? times[times.length - 1] : 0;
+    const gapLeftMs = last ? Math.max(0, minGapMs - (now - last)) : 0;
+    const today = proactiveDayKeyV2(now);
+    const todayCount = times.filter((t) => proactiveDayKeyV2(t) === today).length;
+    if (gapLeftMs > 0) return { ok: false, reason: 'minGap', minGapMs, maxPerDay, todayCount, gapLeftMs };
+    if (todayCount >= maxPerDay) return { ok: false, reason: 'maxPerDay', minGapMs, maxPerDay, todayCount, gapLeftMs: 0 };
+    return { ok: true, minGapMs, maxPerDay, todayCount, gapLeftMs: 0 };
+  }
+
+  /** 记一次主动开口。放在真正 sendWakePromptV2 之前，避免两个会话同一拍都放行。 */
+  function recordProactiveWakeV2(now = Date.now()) {
+    try {
+      const times = readProactiveStateV2().lastAt.map((t) => Date.parse(t)).filter((t) => Number.isFinite(t));
+      times.push(now);
+      const cutoff = now - PROACTIVE_KEEP_MS;
+      const lastAt = times.filter((t) => t >= cutoff).sort((a, b) => a - b).map((t) => new Date(t).toISOString());
+      atomicWriteJson(PROACTIVE_STATE_PATH, { lastAt });
+    } catch (error) {
+      // 记不下来也别把这次开口拖垮：这轮照发，下次可能重复打扰一次。
+      log('[proactive] 写 state/proactive.json 失败（本轮不节流）：' + (error?.message ?? error));
+    }
+  }
+
   function cancelProactiveCheckV2(key) {
     const st = socialV2.conversations.get(key);
     if (!st || !st.proactiveTimer) return;
@@ -8219,7 +8339,17 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
       const aiCount = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 60 * 60 * 1000).length;
       if (aiCount >= 5) prob *= 0.3;
       if (idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
-        void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
+        // 全局节流：最小间隔 + 每日上限，超了只记日志、不唤醒（不花钱）。
+        const gate = checkProactiveThrottleV2();
+        if (!gate.ok) {
+          log(gate.reason === 'minGap'
+            ? `[reserved2] 跳过主动开口 ${key}：距上次还差 ${Math.ceil(gate.gapLeftMs / 60000)} 分钟（minGapMs=${gate.minGapMs}）`
+            : `[reserved2] 跳过主动开口 ${key}：今天已 ${gate.todayCount} 次，到上限 maxPerDay=${gate.maxPerDay}`);
+        } else {
+          recordProactiveWakeV2();
+          log(`[reserved2] 主动开口 ${key}（今天第 ${gate.todayCount + 1} 次，上限 ${gate.maxPerDay}）`);
+          void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
+        }
       }
       scheduleProactiveCheckV2(key);
     }, delay);

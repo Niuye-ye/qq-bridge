@@ -1,5 +1,6 @@
 // src/memory-facts.mjs 的离线测试（架构第二步搬迁后的守门测试）。
 // 全部在临时目录里跑：createFactsStore({ root }) 只认入参，不认仓库位置。
+// 2026-11-10 起容量/注入条数可由 opts 覆盖：不传时行为必须与以前一字不差（下面三个用例守着）。
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -14,14 +15,14 @@ const atomicWriteJson = (file, obj) => {
   fs.renameSync(tmp, file);
 };
 
-function fresh({ files = {} } = {}) {
+function fresh({ files = {}, opts } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'facts-test-'));
   fs.mkdirSync(path.join(root, 'state'), { recursive: true });
   for (const [rel, content] of Object.entries(files)) {
     fs.writeFileSync(path.join(root, rel), typeof content === 'string' ? content : JSON.stringify(content));
   }
   const logs = [];
-  const store = createFactsStore({ root, log: (m) => logs.push(String(m)), atomicWriteJson });
+  const store = createFactsStore({ root, log: (m) => logs.push(String(m)), atomicWriteJson, opts });
   return { root, store, logs };
 }
 
@@ -108,4 +109,54 @@ test('过期约定：宽限期一过就归档，不再当约定', () => {
   store.archiveFactsV2(true);
   assert.equal(store.readFactsV2().length, 0);
   assert.equal(store.readForgottenFactsV2().length, 1);
+});
+
+// ── 2026-11-10：容量/注入条数可配（cfg.socialV2.memory → createFactsStore 的 opts）──
+test('opts 生效：容量阈值与注入条数都听 opts 的', () => {
+  const now = new Date().toISOString();
+  // 容量：maxFacts: 3 → 写第 4 条时淘汰最弱的一条
+  const cap = fresh({ opts: { maxFacts: 3 } }).store;
+  cap.writeFactsV2([
+    { id: 'x1', text: '旧事一', kind: 'fact', tier: 'normal', at: now, str: 0.9 },
+    { id: 'x2', text: '旧事二', kind: 'fact', tier: 'normal', at: now, str: 0.8 },
+    { id: 'x3', text: '旧事三', kind: 'fact', tier: 'normal', at: now, str: 0.05 },
+  ]);
+  cap.addFactV2('刚记住的新事', { kind: 'fact' });
+  const facts = cap.readFactsV2();
+  assert.equal(facts.length, 3);
+  assert.ok(!facts.some((f) => f.id === 'x3'), '最弱的被淘汰');
+  assert.ok(facts.some((f) => f.text === '刚记住的新事'), '刚写入的那条留下');
+
+  // 注入：injectLong: 1 / injectNormal: 1 → 只出 2 条
+  const inj = fresh({ opts: { injectLong: 1, injectNormal: 1 } }).store;
+  inj.writeFactsV2([
+    { id: 'l1', text: '长期记得的第一件', kind: 'fact', tier: 'long', at: now, str: 0.9 },
+    { id: 'l2', text: '长期记得的第二件', kind: 'fact', tier: 'long', at: now, str: 0.8 },
+    { id: 'n1', text: '最近记得的第一件', kind: 'event', tier: 'normal', at: now, str: 0.9 },
+    { id: 'n2', text: '最近记得的第二件', kind: 'event', tier: 'normal', at: now, str: 0.8 },
+  ]);
+  const items = inj.formatFactsLineV2().split('\n').filter((l) => l.startsWith('- '));
+  assert.equal(items.length, 2);
+});
+
+test('opts 非法或缺省 → 回落默认 80 / 4 / 2', () => {
+  const bad = fresh({ opts: { maxFacts: 'abc', injectLong: -3, injectNormal: Number.NaN } }).store;
+  assert.deepEqual(bad.getOptions(), { maxFacts: 80, injectLong: 4, injectNormal: 2 });
+  const none = fresh().store;
+  assert.deepEqual(none.getOptions(), { maxFacts: 80, injectLong: 4, injectNormal: 2 });
+});
+
+test('不传 opts 时行为与以前一致：long 4 条 + normal 2 条', () => {
+  const { store } = fresh();
+  const now = new Date().toISOString();
+  const seed = [];
+  for (let i = 0; i < 6; i += 1) {
+    seed.push({ id: 'L' + i, text: '长期第 ' + i + ' 件', kind: 'fact', tier: 'long', at: new Date(Date.now() - i * 86400000).toISOString(), str: 0.9 });
+    seed.push({ id: 'N' + i, text: '最近第 ' + i + ' 件', kind: 'event', tier: 'normal', at: now, str: 0.9 - i * 0.05 });
+  }
+  store.writeFactsV2(seed);
+  const items = store.formatFactsLineV2().split('\n').filter((l) => l.startsWith('- '));
+  assert.equal(items.length, 6);
+  assert.equal(items.filter((l) => l.includes('长期第')).length, 4);
+  assert.equal(items.filter((l) => l.includes('最近第')).length, 2);
 });

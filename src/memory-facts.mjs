@@ -15,11 +15,14 @@
  *     并发写会互相踩。
  *  3. `addFactV2` 淘汰一律「全局按 scoreFactV2 升序」，并且**排除刚写入的那条**；全 long 时也照删，文件不会无上限增长。
  *  4. 衰减/复习公式的参数（半衰期、复习间隔、6 小时闸、3 天宽限）全在本文件，别散回 bridge.js。
+ *  5. 容量与注入条数可由入参 `opts` = {maxFacts, injectLong, injectNormal} 覆盖（2026-11-10）。
+ *     不传 opts 时行为与搬出前一字不差（默认 80 / 4 / 2）；非法值在这一层回落默认，
+ *     「取值范围」（如 maxFacts 20~500）是桥的运维策略，不放在数据层。
  */
 import fs from 'node:fs';
 import path from 'node:path';
 
-export function createFactsStore({ root, log, atomicWriteJson }) {
+export function createFactsStore({ root, log, atomicWriteJson, opts } = {}) {
   if (typeof root !== 'string' || !root) throw new Error('createFactsStore: 缺少 root');
   if (typeof log !== 'function') throw new Error('createFactsStore: 缺少 log');
   if (typeof atomicWriteJson !== 'function') throw new Error('createFactsStore: 缺少 atomicWriteJson');
@@ -32,6 +35,21 @@ const FACTS_MAX = 80;
 // 4+2 仍能覆盖画像与近期见闻，长尾让 AI 用 qq_recall 按需翻。
 const FACTS_INJECT_LONG = 4;
 const FACTS_INJECT_NORMAL = 2;
+// 容量/注入条数可配（2026-11-10）：桥从 cfg.socialV2.memory 读出来传 opts。
+// opts 按**引用**保存，所以桥那边控制台保存配置后改同一个对象的字段就即时生效，不用重启。
+// 这里只做最低校验（整数、不小于下限），非法就回落默认 —— 默认值就是上面三个常量。
+const FACTS_OPTS = (opts && typeof opts === 'object') ? opts : null;
+function factOptIntV2(value, fallback, min) {
+  const n = Math.floor(Number(value));
+  return Number.isFinite(n) && n >= min ? n : fallback;
+}
+const factsMaxV2 = () => factOptIntV2(FACTS_OPTS?.maxFacts, FACTS_MAX, 1);
+const factsInjectLongV2 = () => factOptIntV2(FACTS_OPTS?.injectLong, FACTS_INJECT_LONG, 1);
+const factsInjectNormalV2 = () => factOptIntV2(FACTS_OPTS?.injectNormal, FACTS_INJECT_NORMAL, 0);
+// 当前生效的参数（启动日志与测试用）。
+function factsOptsV2() {
+  return { maxFacts: factsMaxV2(), injectLong: factsInjectLongV2(), injectNormal: factsInjectNormalV2() };
+}
 // 各 kind 的半衰期（天）：见闻掉得最快，约定最耐用。
 const FACT_HALF_LIFE_DAYS = { promise: 120, pref: 90, fact: 45, event: 12 };
 const FACT_LONG_HALF_LIFE_DAYS = 365;
@@ -396,12 +414,13 @@ function addFactV2(text, opts = {}) {
   };
   if (expiresAt) entry.expiresAt = expiresAt;
   facts.push(entry);
-  if (facts.length > FACTS_MAX) {
+  const maxFacts = factsMaxV2();
+  if (facts.length > maxFacts) {
     // 2026-10-27 修（审计 bridge-core P2）：原来只在 tier !== 'long' 里淘汰 —— 全被 long
     // 占满时一条都删不掉（文件无上限增长），而刚写进去的新条目可能当场被裁掉却仍以
     // 「成功」返回。现在全局按分数排（long 有 FACTS_LONG_FLOOR 兜底，不会先被淘汰），
     // 并显式排除刚写入的那条。
-    const overflow = facts.length - FACTS_MAX;
+    const overflow = facts.length - maxFacts;
     const victims = facts
       .filter((f) => f.id !== entry.id)
       .sort((a, b) => scoreFactV2(a) - scoreFactV2(b))
@@ -418,7 +437,7 @@ function addFactV2(text, opts = {}) {
       } catch (e) {
         log('[facts] 淘汰的记忆没能存进遗忘池：' + (e?.message ?? e));
       }
-      log('[facts] 超过上限 ' + FACTS_MAX + '，淘汰 ' + kill.size + ' 条最弱的记忆（已挪进遗忘池，可翻回）');
+      log('[facts] 超过上限 ' + maxFacts + '，淘汰 ' + kill.size + ' 条最弱的记忆（已挪进遗忘池，可翻回）');
     }
     writeFactsV2(facts.filter((f) => !kill.has(f.id)));
     return entry;
@@ -527,7 +546,7 @@ function reinforceFactsV2(text, maxTouch = 3) {
   }
 }
 
-// 每轮注入：long 取最近 4 条，normal 取强度最高 2 条；到期该复习的加权，别让老记忆永远排不上。
+// 每轮注入：long 取最近 N 条、normal 取强度最高 M 条（默认 4/2，可由 opts 覆盖）；到期该复习的加权，别让老记忆永远排不上。
 // 注入一次就算「想起一次」：排下一次复习、把半衰期拉长（间隔重复），常想起的忘得更慢。
 // 强度低的带「记不太清了」的口气 —— 她说话时自然会含糊，而不是背书。
 function formatFactsLineV2() {
@@ -545,11 +564,11 @@ function formatFactsLineV2() {
   const longs = tagged
     .filter((x) => x.f.tier === 'long')
     .sort((a, b) => (Date.parse(b.f.at || '') || 0) - (Date.parse(a.f.at || '') || 0))
-    .slice(0, FACTS_INJECT_LONG);
+    .slice(0, factsInjectLongV2());
   const normals = tagged
     .filter((x) => x.f.tier !== 'long')
     .sort((a, b) => b.score - a.score)
-    .slice(0, FACTS_INJECT_NORMAL);
+    .slice(0, factsInjectNormalV2());
   const picked = longs.concat(normals);
   // 复习：到点了、且距上次复习够久，才把间隔往后排并加固（不然一分钟一轮会刷爆）。
   let reviewed = 0;
@@ -599,6 +618,6 @@ function formatFactsLineV2() {
     + parts.join('\n') + tail;
 }
   return {
-    readFactsV2, writeFactsV2, readForgottenFactsV2, writeForgottenFactsV2, factHalfLifeDaysV2, factExpiredV2, factDueV2, parseFactExpiresV2, factBaseStrengthV2, factStrengthV2, touchFactV2, archiveFactsV2, restoreFactV2, scoreFactV2, factNormTextV2, isSameByFillersV2, findSameFactV2, addFactV2, removeFactV2, searchFactsV2, reinforceFactsV2, formatFactsLineV2,
+    readFactsV2, writeFactsV2, readForgottenFactsV2, writeForgottenFactsV2, factHalfLifeDaysV2, factExpiredV2, factDueV2, parseFactExpiresV2, factBaseStrengthV2, factStrengthV2, touchFactV2, archiveFactsV2, restoreFactV2, scoreFactV2, factNormTextV2, isSameByFillersV2, findSameFactV2, addFactV2, removeFactV2, searchFactsV2, reinforceFactsV2, formatFactsLineV2, getOptions: factsOptsV2,
   };
 }
