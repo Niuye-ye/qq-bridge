@@ -31,6 +31,7 @@ import * as roleCard from '../src/role-card.js';        // 纯解析，无 I/O
 import * as mcCompanion from '../src/mc-companion.js';  // 模块级只有队列，startMcWatcher 不调用就不轮询
 import * as rateLimit from '../src/rate-limit.mjs';      // 纯函数（窗口计数/预占/回滚），无 I/O
 import * as memoryFacts from '../src/memory-facts.mjs';  // 纯数据层，路径由 bridge 传入（harness 里 root=临时目录）
+import { errorText } from '../src/error-text.mjs';
 import * as consoleTelemetry from '../src/console/telemetry.mjs';
 // 控制台分域路由处理器：VM 里模块 import 被剥掉，必须在这里补进 sandbox。
 import * as consoleDshModel from '../src/console/dsh-model.mjs';
@@ -196,7 +197,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...stateStore,
-    ...roleCard, ...mcCompanion, ...rateLimit, ...memoryFacts, ...consoleTelemetry, ...consoleRoles, ...consoleDshModel, ...consoleSlang, ...consoleMemory, ...consoleVoice, ...consoleSocialState, ...consoleStickers, ...consoleInbox, ...consoleSend, ...consoleHistory, ...consoleTools, ...consoleAdmin, ...consolePet,
+    ...roleCard, ...mcCompanion, ...rateLimit, ...memoryFacts, errorText, ...consoleTelemetry, ...consoleRoles, ...consoleDshModel, ...consoleSlang, ...consoleMemory, ...consoleVoice, ...consoleSocialState, ...consoleStickers, ...consoleInbox, ...consoleSend, ...consoleHistory, ...consoleTools, ...consoleAdmin, ...consolePet,
     // snowluma-conn 会写 config.json / 磁盘上的 token 文件 —— VM 里绝不能真写，桩掉。
     discoverSnowLumaConnection: async () => null,
     persistSnowLumaEndpoint: async () => ({ ok: true, detail: 'stub' }),

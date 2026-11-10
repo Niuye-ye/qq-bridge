@@ -15,6 +15,7 @@
 // 这样换账号后无需手改任何配置，工具自动跟上。
 import fs from 'node:fs';
 import path from 'node:path';
+import { errorText } from './error-text.mjs';
 
 /**
  * SnowLuma 主目录候选：**只来自配置与环境变量**，不做默认路径探测
@@ -101,7 +102,7 @@ async function probe(baseUrl, token, timeoutMs) {
     if (body.status !== 'ok' || body.retcode !== 0) return { ok: false, status: res.status, retcode: body.retcode, wording: body.wording };
     return { ok: true, data: body.data };
   } catch (error) {
-    return { ok: false, error: error?.message ?? String(error) };
+    return { ok: false, error: errorText(error) };
   }
 }
 

@@ -103,6 +103,7 @@ const LLM_KEY_PAGE_HTML = [
 ].join('\n');
 
 // 控制台「人格管理」域路由（/api/role*），原 startConsoleServer 内联代码搬出
+import { errorText } from './error-text.mjs';
 import { handleRolesRoutes } from './console/roles.mjs';
 // 控制台「DSH 模型与思考强度」域路由（/api/dsh/model、/api/dsh/effort），原 startConsoleServer 内联代码搬出
 import { createDshModelRoutes } from './console/dsh-model.mjs';
@@ -3737,7 +3738,34 @@ const activeWaitCancels = new Map();
     goodCheckedAt: 0,
     degraded: false,      // 当前是否处于"已告警"状态（边沿触发，避免刷屏）
     reason: '',
+    connected: false,     // WS 是否连着（bot 的 open/close 维护）
+    offlineSince: 0,      // 最近一次断开的时间（用来算离线多久）
   };
+
+  /**
+   * QQ 通道是否可用。断线时**必须**停掉一切"叫她"的定时唤醒 ——
+   * 她醒来会花 token、写记忆、试图回话，而回复一条都发不出去（2026-11-10 实测：
+   * QQ 掉登录后桥仍每 24 分钟 proactive 唤醒，白烧钱还把她心情搞崩）。
+   */
+  function oneBotUpV2() {
+    return snowlumaHealth.connected === true;
+  }
+
+  /**
+   * 离线期日志节流。SDK 每 30 秒重连一次，close/error/token 自愈三条日志
+   * 会把 state/bridge.log 刷到 167KB/小时（2026-11-10 实测），既难查也伤闪存。
+   * 只在「刚断」和「每 5 分钟」各打一条，中间只累计次数。
+   */
+  const offlineLogState = { lastAt: 0, attempts: 0 };
+  function logOfflineThrottled(build) {
+    const now = Date.now();
+    offlineLogState.attempts += 1;
+    if (now - offlineLogState.lastAt < 5 * 60_000) return;
+    offlineLogState.lastAt = now;
+    const minutes = snowlumaHealth.offlineSince ? Math.round((now - snowlumaHealth.offlineSince) / 60_000) : 0;
+    log(build({ attempts: offlineLogState.attempts, minutes }));
+    offlineLogState.attempts = 0;
+  }
 
   /** 记录一次"上游还活着"的证据。任何来自 SnowLuma 的事件包都算（含心跳）。 */
   function noteUpstreamPacket(kind) {
@@ -3832,7 +3860,7 @@ const activeWaitCancels = new Map();
         if (typeof body.data?.online === 'boolean') snowlumaHealth.accountOnline = body.data.online;
       }
     } catch (error) {
-      snowlumaHealth.goodError = error?.message ?? String(error);
+      snowlumaHealth.goodError = errorText(error);
     }
     snowlumaHealth.goodCheckedAt = Date.now();
     reportSnowlumaHealth();
@@ -4621,7 +4649,7 @@ function startConsoleServer() {
         sendJson({ ok: false, error: 'not found' }, 404);
       } catch (error) {
         const status = Number(error?.statusCode) || 500;
-        sendJson({ ok: false, error: error?.message ?? String(error) }, status);
+        sendJson({ ok: false, error: errorText(error) }, status);
       }
     });
     server.listen(port, '127.0.0.1', () => {
@@ -8254,6 +8282,12 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
     st.intervalTimer = setTimeout(() => {
       st.intervalTimer = null;
       setupIntervalTimerV2(key); // 先续期，再唤醒
+      // 断线时叫醒她只会烧 token：回复发不出去，记忆/心情却被改写。
+      // 直接跳过这一拍，等通道回来（见 oneBotUpV2 的说明）。
+      if (!oneBotUpV2()) {
+        logOfflineThrottled(({ minutes }) => `[offline] QQ 未连接（约 ${minutes} 分钟），跳过定时自醒 ${key}`);
+        return;
+      }
       if (!turboActiveV2()) {
         void sendWakePromptV2(key, 'interval').catch((error) => log(`[reserved2] 定时自醒异常 ${key}:`, error?.message ?? error));
         return;
@@ -8375,7 +8409,9 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
       const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
       const aiCount = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 60 * 60 * 1000).length;
       if (aiCount >= 5) prob *= 0.3;
-      if (idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
+      if (!oneBotUpV2()) {
+        logOfflineThrottled(({ minutes }) => `[offline] QQ 未连接（约 ${minutes} 分钟），跳过主动开口检查 ${key}`);
+      } else if (idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
         // 全局节流：最小间隔 + 每日上限，超了只记日志、不唤醒（不花钱）。
         const gate = checkProactiveThrottleV2();
         if (!gate.ok) {
@@ -9381,6 +9417,14 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
   bot.on('open', () => {
     // 用实际连接地址（自愈后可能与 config 里的初值不同，别打印过期的那个）
     const connectedUrl = bot.url ?? cfg.snowluma.wsUrl;
+    // 重连成功：复位离线标记，并把「离线期间跳过唤醒」这件事记一笔（她不用知道细节，
+    // 但日志里要能一眼看出那段时间不是她不理人，是通道不在）。
+    if (snowlumaHealth.offlineSince) {
+      const mins = Math.round((Date.now() - snowlumaHealth.offlineSince) / 60_000);
+      if (mins >= 2) log(`QQ 通道恢复（离线约 ${mins} 分钟；期间已跳过所有定时/主动唤醒）`);
+      snowlumaHealth.offlineSince = 0;
+      offlineLogState.attempts = 0;
+    }
     snowlumaHealth.connected = true;
     log(`SnowLuma 已连接：${connectedUrl}`);
     // 「已连接」只说明与 SnowLuma 的 WebSocket 通了，**不说明 QQ 侧收得到消息** ——
@@ -9486,7 +9530,7 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
     try {
       const r = await discoverSnowLumaConnection({ cfg, timeoutMs: 4000 });
       if (!r.ok) {
-        log(`⚠️ token 自愈失败（${reason}）：${r.error}`);
+        logOfflineThrottled(({ attempts }) => `⚠️ token 自愈失败（${reason}）：${r.error}（第 ${attempts} 次）`);
         return;
       }
       await applyHealedTokens(r);
@@ -9498,7 +9542,8 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
 
   bot.on('close', (info) => {
     snowlumaHealth.connected = false;
-    log(`SnowLuma 连接断开（code=${info?.code ?? '?'}），重连中…`);
+    if (!snowlumaHealth.offlineSince) snowlumaHealth.offlineSince = Date.now();
+    logOfflineThrottled(({ attempts, minutes }) => `SnowLuma 连接断开（code=${info?.code ?? '?'}），重连中…（离线约 ${minutes} 分钟，第 ${attempts} 次重连；断线期间日志只看每 5 分钟一条）`);
     // 连不上时最常见的原因就是换了 QQ 账号 → token 变了；顺手自愈。
     // 注意 1006 在**每次启动**都可能出现一次：HTTP token 与 WS token 是两个不同的值，
     // config.json 里存的是前者，WS 需要用自愈发现的那个（详见 bot.connect() 处的说明）。
@@ -9511,7 +9556,7 @@ ${advice}别忘了你就是他自己的同伴：走过去的路上可以说一�
     const detail = error && typeof error === 'object'
       ? [error.code, error.message, error.reason, error.type].filter(Boolean).join(' | ') || JSON.stringify(error)
       : String(error ?? '');
-    log(`SnowLuma 错误：${detail || '(无详情)'}`);
+    logOfflineThrottled(({ attempts }) => `SnowLuma 错误：${detail || '(无详情)'}（第 ${attempts} 次）`);
     void healTokenIfStale(`error ${detail}`.trim().slice(0, 200));
   });
 

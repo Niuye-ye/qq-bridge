@@ -5,11 +5,13 @@
 // - 合并语义只写一遍（src/sync-merge.mjs），手机端不重复实现，避免两边规则漂移；
 // - 服务只监听 127.0.0.1，手机通过 `adb reverse tcp:8799 tcp:8799` 走 adb 隧道够到它，
 //   **不开局域网端口**（少一个暴露面），PC 不在线时手机侧自然失败，语义清晰；
+// - 设备地址默认现找（--dev auto）：手机走 DHCP，IP 换过一次（172.27.88.60 → 172.26.145.12），
+//   写死的结果是 adb reverse 永远失败、同步静默变单向；
 // - 每次请求都是「手机传自己的、PC 传自己的 → 合并 → 两边各自落地」，所以谁先谁后都不会丢。
 //
 // 用法：
 //   node scripts/sync-server.mjs --root F:/qq-bridge/state --diary F:/qq-bridge/diary \
-//        --token-file C:/dsh/state/sync-token --port 8799 [--adb C:/dsh/phone/platform-tools/adb.exe --dev 172.27.88.60:5555]
+//        --token-file C:/dsh/state/sync-token --port 8799 [--adb C:/dsh/phone/platform-tools/adb.exe --dev auto]
 //
 // 落盘容器：facts.json / facts-forgotten.json 都是 { facts: [...] }（memory-facts.mjs 的 readFactsV2 读的就是这个键），
 // 不能写裸数组 —— 写裸数组桥会读成空、等于把记忆清掉。
@@ -35,7 +37,11 @@ const DIARY = arg('diary', 'SYNC_DIARY');         // PC 的 qq-bridge/diary
 const TOKEN_FILE = arg('token-file', 'SYNC_TOKEN_FILE');
 const PORT = Number(arg('port', 'SYNC_PORT', '8799'));
 const ADB = arg('adb', 'SYNC_ADB');
-const DEV = arg('dev', 'SYNC_DEV');
+// 设备序列号：默认 'auto' = 每次现找（手机走 DHCP，IP 会变：172.27.88.60 → 172.26.145.12 实测）。
+// 显式传 --dev 1.2.3.4:5555 则固定用它。
+let DEV = arg('dev', 'SYNC_DEV');
+const DEV_AUTO = !DEV || DEV === 'auto';
+if (DEV_AUTO) DEV = '';
 const VERSION = '1.0.0';
 
 if (!STATE || !DIARY || !TOKEN_FILE) {
@@ -129,15 +135,61 @@ function doSync(body) {
   return { ok: true, at, stats, facts: { facts: facts.merged }, forgotten: { facts: forgotten.merged }, diary };
 }
 
-function reverseLoop() {
-  if (!ADB || !DEV) return;
-  const tick = () => {
-    execFile(ADB, ['-s', DEV, 'reverse', 'tcp:' + PORT, 'tcp:' + PORT], { timeout: 15000 }, (err) => {
-      if (err) log('adb reverse 失败（手机没连上？）：' + String(err.message || err).split('\n')[0]);
+const DEV_CACHE = path.join(path.dirname(TOKEN_FILE), 'phone-dev.txt');
+
+function execOut(file, args, timeout = 10000) {
+  return new Promise((resolve) => {
+    execFile(file, args, { timeout }, (err, stdout) => resolve(err ? '' : String(stdout || '')));
+  });
+}
+async function deviceReady(serial) {
+  if (!serial) return false;
+  return (await execOut(ADB, ['-s', serial, 'get-state'])).trim() === 'device';
+}
+function writeDevCache(s) { try { atomicWrite(DEV_CACHE, s + '\n'); } catch {} }
+
+/** 找设备：缓存 → adb devices → mdns 广播。找不到返回空串，60 秒后再来一轮（不阻塞服务）。 */
+async function discoverDev() {
+  if (DEV) return DEV;
+  let cached = '';
+  try { cached = fs.readFileSync(DEV_CACHE, 'utf8').trim(); } catch {}
+  if (cached && await deviceReady(cached)) { DEV = cached; log('设备（缓存）：' + DEV); return DEV; }
+  const online = [];
+  for (const line of (await execOut(ADB, ['devices'])).split(/\r?\n/).slice(1)) {
+    const [serial, state] = line.trim().split(/\s+/);
+    if (serial && state === 'device') online.push(serial);
+  }
+  const pick = online.find((s) => /^[\d.]+:\d+$/.test(s) && !s.startsWith('127.0.0.1:'))
+    || online.find((s) => !s.startsWith('emulator-') && !s.startsWith('127.0.0.1:'))
+    || online[0];
+  if (pick) { DEV = pick; writeDevCache(pick); log('设备（adb devices）：' + pick); return DEV; }
+  const cands = [];
+  for (const line of (await execOut(ADB, ['mdns', 'services'])).split(/\r?\n/)) {
+    const m = line.match(/_adb\._tcp\s+([\d.]+:\d+)/);
+    if (m) cands.push(m[1]);
+  }
+  for (const addr of cands) {
+    await execOut(ADB, ['connect', addr]);
+    if (await deviceReady(addr)) { DEV = addr; writeDevCache(addr); log('设备（mdns）：' + addr); return DEV; }
+  }
+  log('还没找到手机（adb devices 与 mdns 都是空的），60 秒后再找');
+  return '';
+}
+
+async function reverseLoop() {
+  if (!ADB) return;
+  const tick = async () => {
+    const dev = await discoverDev();
+    if (!dev) return;
+    execFile(ADB, ['-s', dev, 'reverse', 'tcp:' + PORT, 'tcp:' + PORT], { timeout: 15000 }, (err) => {
+      if (err) {
+        log('adb reverse 失败：' + String(err.message || err).split('\n')[0]);
+        if (DEV_AUTO) DEV = '';   // 掉线了别死守旧地址，下一轮重新找
+      }
     });
   };
-  tick();
-  setInterval(tick, 60000).unref?.();
+  await tick();
+  setInterval(() => { void tick(); }, 60000).unref?.();
 }
 
 function readBody(req, limit = 8 * 1024 * 1024) {

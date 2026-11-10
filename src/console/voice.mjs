@@ -1,3 +1,4 @@
+import { errorText } from '../error-text.mjs';
 // 控制台「语音域」路由（从 startConsoleServer 切出，行为逐字搬迁）。
 //
 // 契约：
@@ -56,7 +57,7 @@ export async function handleVoiceRoutes(ctx) {
     try {
       resolved = resolveVoicePathForOperator(body.file ?? body.path ?? '');
     } catch (error) {
-      sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
+      sendJson({ ok: false, error: errorText(error) }, 400);
       return true;
     }
     // 音量参数先校验（写错了当场告诉你，不要等到发的时候才炸）
@@ -131,7 +132,7 @@ export async function handleVoiceRoutes(ctx) {
         loudness: sent.loudness
       });
     } catch (error) {
-      sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+      sendJson({ ok: false, error: errorText(error) }, 500);
     }
     return true;
   }
@@ -163,7 +164,7 @@ export async function handleVoiceRoutes(ctx) {
     try {
       resolved = resolveVoicePathForV2(body.voice ?? body.file ?? '');
     } catch (error) {
-      sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
+      sendJson({ ok: false, error: errorText(error) }, 400);
       return true;
     }
     try {
@@ -197,7 +198,7 @@ export async function handleVoiceRoutes(ctx) {
       });
     } catch (error) {
       // 额度只在真正发出后才记账（voiceBudgetCommit），所以失败路径无需回滚。
-      sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+      sendJson({ ok: false, error: errorText(error) }, 500);
     }
     return true;
   }

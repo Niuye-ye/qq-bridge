@@ -1,3 +1,4 @@
+import { errorText } from '../error-text.mjs';
 // 控制台「发送域」路由（从 bridge.js 的 startConsoleServer 切出，2026-11-08，行为逐字搬迁）
 //
 // 职责：
@@ -159,7 +160,7 @@ export async function handleSendRoutes(ctx) {
       const failedCount = Math.max(0, messages.length - sentCount);
       rollbackQuota(st.sendTimes, failedCount);
       saveSocialV2State();
-      sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+      sendJson({ ok: false, error: errorText(error) }, 500);
     }
     return true;
   }
@@ -299,7 +300,7 @@ export async function handleSendRoutes(ctx) {
       const failedCount = Math.max(0, messages.length - sentCount);
       rollbackQuota(st.sendTimes, failedCount);
       saveSocialV2State();
-      sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+      sendJson({ ok: false, error: errorText(error) }, 500);
     }
     return true;
   }

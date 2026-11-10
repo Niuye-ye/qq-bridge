@@ -29,6 +29,7 @@
  *   - 返回 false 表示「不是本域路由」；不得回包后再返回 false。
  *   - 主函数在 consoleCtx 构造完成后挂一次即可（各路由 pathname 互不重叠，顺序无关）。
  */
+import { errorText } from '../error-text.mjs';
 import fs from 'node:fs';
 import { text } from '@snowluma/sdk';
 import path from 'node:path';
@@ -482,7 +483,7 @@ export async function handleAdminRoutes(ctx) {
       }
     } catch (error) {
       if (popSilent) popSilent();
-      sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+      sendJson({ ok: false, error: errorText(error) }, 500);
     }
     return true;
   }
@@ -1130,7 +1131,7 @@ export async function handleAdminRoutes(ctx) {
       const failedCount = Math.max(0, 1 - sentCount);
       rollbackQuota(st.sendTimes, failedCount);
       saveSocialV2State();
-      sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+      sendJson({ ok: false, error: errorText(error) }, 500);
     }
     return true;
   }
