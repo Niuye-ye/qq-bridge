@@ -98,6 +98,14 @@ test('跟她说句话：只走 desk-message，key 取自 self 不写死', () => 
   assert.ok(html.includes('已送到'), '发送成功要有明确回执');
 });
 
+test('「系统」卡片：换模型 Key 与桥控制台都走带 token 的跳转', () => {
+  const html = PET_PAGE_HTML;
+  assert.ok(html.includes('id="llmKey"'), '缺「换模型 API Key」按钮');
+  assert.ok(html.includes('id="consoleBtn"'), '缺「打开桥控制台」按钮');
+  assert.ok(html.includes('u("/llm-key")'), '换 Key 要走 u() 带 token，不能裸链接');
+  assert.ok(!html.includes('href="#"'), '按钮不该是空锚点');
+});
+
 test('主动开口额度显示在页面上（今天几次 / 上限 / 还要等多久）', () => {
   const html = PET_PAGE_HTML;
   assert.ok(html.includes('s.proactive'), '页面要读 self.proactive');
