@@ -10,6 +10,7 @@
 //
 // 需要活体服务的套件在 E2E_REQUIRE 里声明依赖；依赖没就绪就 SKIP（并写明缺什么），
 // 不算失败。加新测试时：只要它连真 DSH / 真 SnowLuma / 真桥 / 浏览器，就在表里登记一下。
+// 2026-11-10: test-sync-merge.mjs 是纯函数套件（零依赖、无 I/O），由下面 readdir 自动纳入，不用登记。
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
