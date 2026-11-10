@@ -20,6 +20,7 @@ import { execFile, execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { spawnSafe } from '../safe-spawn.mjs';
+import { probeVideoEnv, videoUnavailableText } from './media-preflight.mjs';
 
 const __dirname = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
 // Termux 里的 node 是 android 构建（process.platform === 'android'），文案要说「手机」而不是「模拟器」。
@@ -101,6 +102,56 @@ function pickFfmpeg() {
     }
   } catch { /* ignore */ }
   return null;
+}
+
+// ---------- 视频环境预检（2026-11-10） ----------
+// 手机上 Termux 没有 Pillow / edge-tts 时，以前是「派发 -> 白跑几分钟 -> Traceback」。
+// 现在先探一遍，缺什么直接回一句人话，她就不会死磕。探测结果缓存 10 分钟（装完依赖不用重启 MCP）。
+let VIDEO_ENV_CACHE = { at: 0, value: null };
+const VIDEO_ENV_TTL_MS = 10 * 60 * 1000;
+
+function whichFfmpeg() {
+  const abs = pickFfmpeg();
+  if (abs) return abs;
+  // PC 上 ffmpeg 也可能只在 PATH 里（脚本自己会 shutil.which 找），别误判成缺失
+  try {
+    execFileSync(ON_ANDROID ? 'ffmpeg' : 'ffmpeg.exe', ['-version'], { timeout: 4000, stdio: 'ignore' });
+    return 'ffmpeg';
+  } catch { return null; }
+}
+
+function runPythonImport(py, code) {
+  try {
+    return execFileSync(py, ['-c', code], { timeout: 15000, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) {
+    return { status: typeof e?.status === 'number' ? e.status : 1, stderr: String(e?.stderr || e?.message || '') };
+  }
+}
+
+/** 返回空串 = 能干；否则是一句可以直接说给她听的话。fail-open：探测自己出错就放行。 */
+async function videoEnvIssue() {
+  const now = Date.now();
+  if (VIDEO_ENV_CACHE.value !== null && now - VIDEO_ENV_CACHE.at < VIDEO_ENV_TTL_MS) return VIDEO_ENV_CACHE.value;
+  let text = '';
+  try {
+    const res = probeVideoEnv({
+      whichFfmpeg,
+      python: pickPython(),
+      scriptPath: VIDEO_SCRIPT,
+      exists: (p) => fs.existsSync(p),
+      runPython: (code) => {
+        const r = runPythonImport(pickPython(), code);
+        if (typeof r === 'string') return { status: 0, stderr: '' };
+        return { status: r.status, stderr: r.stderr };
+      },
+    });
+    if (!res.ok) text = videoUnavailableText(res.missing, { style: ON_ANDROID ? 'phone' : 'pc' });
+  } catch (e) {
+    console.error('[video] 环境预检失败（按能干处理）: ' + (e?.message ?? e));
+    text = '';
+  }
+  VIDEO_ENV_CACHE = { at: now, value: text };
+  return text;
 }
 
 // 读日志尾巴时最多读这么多字节（ffmpeg 的输出几分钟就能到几 MB）。
@@ -189,6 +240,10 @@ server.tool(
       }
       if (!fs.existsSync(VIDEO_SCRIPT)) {
         return { content: [{ type: 'text', text: `找不到渲染脚本：${VIDEO_SCRIPT}` }], isError: true };
+      }
+      const envIssue = await videoEnvIssue();
+      if (envIssue) {
+        return { content: [{ type: 'text', text: envIssue }], isError: true };
       }
       fs.mkdirSync(VIDEO_JOBS, { recursive: true });
       fs.mkdirSync(VIDEO_DIR, { recursive: true });
