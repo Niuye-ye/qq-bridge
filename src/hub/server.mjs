@@ -83,6 +83,13 @@ function tokenOk(got) {
   }
 }
 
+// 同机直连（127.0.0.1 / ::1）免令牌：手机浏览器开 127.0.0.1:8800 时本来就只有自己能访问，
+// 没必要让主人先去文件里抄 32 位令牌。局域网/穿透进来的（remoteAddress 是真实内网 IP）仍然要令牌。
+function isLoopback(req) {
+  const a = String((req.socket && req.socket.remoteAddress) || '');
+  return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
+}
+
 function needToken(req, url) {
   const h = String(req.headers.authorization || '');
   if (h.startsWith('Bearer ')) return h.slice(7).trim();
@@ -229,7 +236,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   const got = needToken(req, url);
-  if (!tokenOk(got)) {
+  if (!tokenOk(got) && !isLoopback(req)) {
     return send(res, 401, { ok: false, error: '令牌无效：用 ?token=… 或 Authorization: Bearer …' });
   }
 
