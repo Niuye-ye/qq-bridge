@@ -237,6 +237,8 @@ export async function handleSocialStateRoutes(ctx) {
     const t = turboStatusV2();
     sendJson({
       ok: true,
+      // 会话 key：手机桌宠页用它把「跟她说句话」投到正确的会话（私有会话 = 主人 QQ）
+      key: selfKey,
       activity: readActivityV2(),
       feel: readFeelV2(),
       goals: goalsList.slice(-6).map((g) => String(g?.text ?? '').slice(0, 80)).filter(Boolean),

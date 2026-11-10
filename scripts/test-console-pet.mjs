@@ -54,7 +54,7 @@ test('只接管 GET /pet，其他方法/路径一律 return false 且不写响�
 
 test('页面数据源只用 self + mood，控制动作只用 turbo/level/activity', () => {
   const html = PET_PAGE_HTML;
-  for (const p of ['/api/socialV2/self', '/api/socialV2/mood', '/api/socialV2/turbo', '/api/socialV2/level', '/api/socialV2/activity']) {
+  for (const p of ['/api/socialV2/self', '/api/socialV2/mood', '/api/socialV2/turbo', '/api/socialV2/level', '/api/socialV2/activity', '/api/socialV2/desk-message']) {
     assert.ok(html.includes(p), '页面缺少 ' + p);
   }
   // 不允许偷偷扩权：不碰管理端、不碰人格/记忆/发送、不直接读 state 文件。
@@ -79,12 +79,30 @@ test('页面把外部文本都过一遍转义，避免心情/待办里的字符�
 
 test('桌面上有的关键功能都给了入口（心情/好感/她在干嘛/想干的事/去玩/活跃度/暂停）', () => {
   const html = PET_PAGE_HTML;
-  for (const label of ['心情', '好感', '她在干嘛', '想干的事', '玩手机', 'Minecraft', '活跃度', '暂停她']) {
+  for (const label of ['心情', '好感', '她在干嘛', '想干的事', '玩手机', 'Minecraft', '活跃度', '暂停她', '跟她说句话']) {
     assert.ok(html.includes(label), '页面缺少「' + label + '」');
   }
-  for (const id of ['mood', 'aff', 'doing', 'goals', 'life', 'levels', 'pauseBtn', 'playPhone', 'playMc', 'playBoth', 'stopPlay']) {
+  for (const id of ['mood', 'aff', 'doing', 'goals', 'life', 'levels', 'pauseBtn', 'playPhone', 'playMc', 'playBoth', 'stopPlay', 'sayText', 'sayBtn']) {
     assert.ok(html.includes('id="' + id + '"'), '页面缺少元素 #' + id);
   }
+});
+
+// 「跟她说句话」契约：会话 key 只能来自 /api/socialV2/self 的 key 字段，
+// 页面里不许写死 QQ 号（换号/多会话时会投错人），也不许绕过 desk-message 直接调发送接口。
+test('跟她说句话：只走 desk-message，key 取自 self 不写死', () => {
+  const html = PET_PAGE_HTML;
+  assert.ok(html.includes('OWNER=s.key||OWNER'), '会话 key 应取自 self.key');
+  assert.ok(!/\b1\d{8,11}\b/.test(html), '页面里不能写死 QQ 号');
+  assert.ok(html.includes('key:OWNER'), 'desk-message 必须带 OWNER');
+  assert.ok(html.includes('sayBtn'), '缺少发送按钮绑定');
+  assert.ok(html.includes('已送到'), '发送成功要有明确回执');
+});
+
+test('手机可「添加到主屏幕」：带 web-app-capable meta，不依赖外部 manifest 文件', () => {
+  const html = PET_PAGE_HTML;
+  assert.ok(html.includes('name=\"mobile-web-app-capable\"'), '缺少 mobile-web-app-capable');
+  assert.ok(html.includes('name=\"apple-mobile-web-app-capable\"'), '缺少 apple 版');
+  assert.ok(!html.includes('rel=\"manifest\"'), '不引外部 manifest（401 鉴权会让它加载失败）');
 });
 
 test('自动刷新有节流：15 秒一轮，不是死循环', () => {
